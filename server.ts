@@ -4,10 +4,11 @@ import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { fileDb } from "./src/db/fileDb.ts";
-import { executePg, isPgConfigured } from "./src/db/dbExecutor.ts";
+import { executePg, executePgStrict, isConnectionLevelError, isPgConfigured, probePgConnection } from "./src/db/dbExecutor.ts";
 import { initializeDatabaseSchema } from "./src/db/init.ts";
 import { cleanupDuplicateEntities } from "./src/db/cleanupDuplicates.ts";
 import { normalizeEntityName } from "./src/lib/nameHelpers.ts";
+import { DEFAULT_REPS, INITIAL_FUNDS, INITIAL_EMPLOYEES } from "./src/data/initialContracts.ts";
 let globalSyncVersion: number = Date.now();
 export function bumpSyncVersion() {
   globalSyncVersion = Date.now();
@@ -23,6 +24,181 @@ export function bumpSyncVersion() {
 }
 import fs from "fs";
 import webpush from "web-push";
+
+const UPSTREAM_SERVER_URL = (process.env.UPSTREAM_SERVER_URL ?? "http://72.62.158.128:3000").trim().replace(/\/+$/, "");
+let lastUpstreamCheckAt = 0;
+let lastUpstreamSyncVersion: string | number | null = null;
+let upstreamConnected = false;
+let inFlightUpstreamSync: Promise<boolean> | null = null;
+
+function buildCustomersFromContracts(contractsList: any[], existingCustomers: any[] = []): any[] {
+  const existingByName = new Map<string, any>();
+  const existingById = new Map<string, any>();
+  for (const cu of existingCustomers) {
+    if (cu?.id) existingById.set(String(cu.id), cu);
+    if (cu?.name) existingByName.set(String(cu.name).trim().toLowerCase(), cu);
+  }
+  const custMap = new Map<string, any>();
+  for (const c of contractsList) {
+    const name = (c?.customerName || c?.customer_name || "").trim();
+    if (!name) continue;
+    const id = c.customerId || c.customer_id || `cust-${Buffer.from(name).toString("base64").replace(/=/g, "")}`;
+    const existing = existingById.get(id) || existingByName.get(name.toLowerCase());
+    if (!custMap.has(id)) {
+      custMap.set(id, {
+        id,
+        name,
+        phone: c.customerPhone || c.customer_phone || existing?.phone || "",
+        address: c.customerAddress || c.customer_address || existing?.address || "",
+        listId: c.listId || c.list_id || existing?.listId || "",
+        listName: c.listName || c.list_name || existing?.listName || "",
+        status: c.status || existing?.status || "active",
+        totalPurchases: Number(c.totalPrice || c.total_price) || 0,
+        totalPaid: Number(c.totalPaid || c.total_paid) || 0,
+        remainingBalance: Number(c.remainingBalance ?? c.remaining_balance) || 0,
+        latitude: c.latitude ?? existing?.latitude ?? null,
+        longitude: c.longitude ?? existing?.longitude ?? null,
+        location_address: c.locationAddress ?? existing?.location_address ?? null,
+        location_updated_at: c.locationUpdatedAt ?? existing?.location_updated_at ?? null,
+      });
+    } else {
+      const prev = custMap.get(id);
+      prev.totalPurchases += Number(c.totalPrice || c.total_price) || 0;
+      prev.totalPaid += Number(c.totalPaid || c.total_paid) || 0;
+      prev.remainingBalance += Number(c.remainingBalance ?? c.remaining_balance) || 0;
+    }
+  }
+  return Array.from(custMap.values());
+}
+
+async function fetchJsonWithTimeout(url: string, timeoutMs = 8000): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal, headers: { Accept: "application/json" } });
+    if (!res.ok) return null;
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("text/html")) return null;
+    return await res.json().catch(() => null);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function syncFromUpstreamServer(force = false): Promise<boolean> {
+  if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true") return false;
+  if (isPgConfigured()) return false;
+
+  const currentContracts = fileDb.get<any>("contracts") || [];
+  const needsUrgentSeed = currentContracts.length <= 2;
+
+  if (!force && !needsUrgentSeed && Date.now() - lastUpstreamCheckAt < 10_000) {
+    return upstreamConnected;
+  }
+  if (inFlightUpstreamSync) {
+    return inFlightUpstreamSync;
+  }
+
+  inFlightUpstreamSync = (async () => {
+    try {
+      lastUpstreamCheckAt = Date.now();
+      const verRes = await fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/sync/version`, 3500);
+      if (!verRes || verRes.syncVersion === undefined) {
+        upstreamConnected = false;
+        return false;
+      }
+      upstreamConnected = true;
+
+      if (!force && !needsUrgentSeed && lastUpstreamSyncVersion !== null && String(verRes.syncVersion) === String(lastUpstreamSyncVersion)) {
+        return true;
+      }
+
+      const [
+        contracts,
+        payments,
+        customerLists,
+        funds,
+        inventory,
+        reps,
+        employees,
+        appointments,
+        fundTransactions,
+        employeeTransactions,
+        paymentConflicts,
+      ] = await Promise.all([
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/contracts`, 12000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payments`, 12000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/customer-lists`, 8000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/funds`, 8000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/inventory`, 8000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/reps`, 8000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employees`, 8000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/appointments`, 8000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/fund-transactions`, 12000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employee-transactions`, 8000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payment-conflicts`, 8000),
+      ]);
+
+      let updatedAny = false;
+      if (Array.isArray(contracts) && (contracts.length > 2 || currentContracts.length <= 2)) {
+        fileDb.setAll("contracts", contracts);
+        const existingCustomers = fileDb.get<any>("customers") || [];
+        fileDb.setAll("customers", buildCustomersFromContracts(contracts, existingCustomers));
+        updatedAny = true;
+      }
+      if (Array.isArray(payments) && payments.length > 0) {
+        fileDb.setAll("payments", payments);
+        updatedAny = true;
+      }
+      if (Array.isArray(customerLists) && customerLists.length > 0) {
+        fileDb.setAll("customer_lists", customerLists);
+      }
+      if (Array.isArray(funds) && funds.length > 0) {
+        fileDb.setAll("cash_funds", funds);
+        fileDb.setAll("funds", funds);
+      }
+      if (Array.isArray(inventory) && inventory.length > 0) {
+        fileDb.setAll("inventory_items", inventory);
+      }
+      if (Array.isArray(reps) && reps.length > 0) {
+        fileDb.setAll("reps", preserveRealRepCodes(reps));
+      }
+      if (Array.isArray(employees) && employees.length > 0) {
+        fileDb.setAll("employees", employees);
+      }
+      if (Array.isArray(appointments)) {
+        fileDb.setAll("appointments", appointments);
+      }
+      if (Array.isArray(fundTransactions) && fundTransactions.length > 0) {
+        fileDb.setAll("fund_transactions", fundTransactions);
+      }
+      if (Array.isArray(employeeTransactions)) {
+        fileDb.setAll("employee_transactions", employeeTransactions);
+      }
+      if (Array.isArray(paymentConflicts)) {
+        fileDb.setAll("payment_conflicts", paymentConflicts);
+      }
+
+      if (updatedAny) {
+        lastUpstreamSyncVersion = verRes.syncVersion;
+        globalSyncVersion = Date.now();
+        console.log(`[Upstream Sync] Synced live data from ${UPSTREAM_SERVER_URL}: contracts=${Array.isArray(contracts) ? contracts.length : 0}, payments=${Array.isArray(payments) ? payments.length : 0}`);
+      } else {
+        lastUpstreamSyncVersion = verRes.syncVersion;
+      }
+      return true;
+    } catch (e) {
+      upstreamConnected = false;
+      return false;
+    } finally {
+      inFlightUpstreamSync = null;
+    }
+  })();
+
+  return inFlightUpstreamSync;
+}
 
 function mapContractRow(r: any) {
   const totalPrice = Number(r.total_price ?? r.totalPrice) || 0;
@@ -129,6 +305,39 @@ function mapRepRow(r: any) {
     allowedListIds: isDhia ? ['all'] : allowed,
     avatarUrl: r.avatar_url ?? r.avatarUrl ?? '',
   };
+}
+
+function preserveRealRepCodes(incomingReps: any[]): any[] {
+  if (!Array.isArray(incomingReps)) return [];
+  const existingReps = fileDb.get<any>("reps") || [];
+  const lookupExisting = (r: any) =>
+    existingReps.find(
+      (e: any) =>
+        (e?.id && r?.id && e.id === r.id) ||
+        (e?.name && r?.name && e.name.trim() === r.name.trim())
+    );
+  const lookupDefault = (r: any) =>
+    DEFAULT_REPS.find(
+      (d) =>
+        (d.id && r?.id && d.id === r.id) ||
+        (d.name && r?.name && d.name.trim() === r.name.trim())
+    );
+
+  return incomingReps.map((r: any) => {
+    const incomingCode = String(r?.code ?? "").trim();
+    if (!incomingCode || incomingCode === "0000") {
+      const existing = lookupExisting(r);
+      const existingCode = String(existing?.code ?? "").trim();
+      if (existingCode && existingCode !== "0000") {
+        return { ...r, code: existingCode };
+      }
+      const def = lookupDefault(r);
+      if (def?.code && def.code !== "0000") {
+        return { ...r, code: def.code };
+      }
+    }
+    return r;
+  });
 }
 
 function mapAppointmentRow(r: any) {
@@ -1010,11 +1219,92 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Clean up any stale in-memory contracts if cleared
+  // Seed fileDb from initial_snapshot.json if contracts are missing, empty, or only demo contracts
+  try {
+    const existingContracts = fileDb.get("contracts") || [];
+    const isOnlyDemoOrEmpty =
+      existingContracts.length <= 1 ||
+      (existingContracts.length <= 2 &&
+        existingContracts.every((c: any) => c?.id === "contract-1" || c?.id === "contract-2"));
+    if (isOnlyDemoOrEmpty) {
+      const snapPath = path.join(process.cwd(), "public", "initial_snapshot.json");
+      if (fs.existsSync(snapPath)) {
+        const snapData = JSON.parse(fs.readFileSync(snapPath, "utf-8"));
+        if (snapData) {
+          if (Array.isArray(snapData.contracts) && snapData.contracts.length > 0) {
+            fileDb.setAll("contracts", snapData.contracts);
+            console.log(`[FileDB Seed] Seeded ${snapData.contracts.length} contracts from initial_snapshot.json`);
 
-  // Run DB schema init & initial sync & deduplication in background so server listens immediately
-  initializeDatabaseSchema()
-    .then(async () => {
+            const custMap = new Map();
+            snapData.contracts.forEach((c: any) => {
+              const name = c.customerName || c.customer_name;
+              if (name) {
+                const id = c.customerId || c.customer_id || `cust-${Buffer.from(name).toString("base64").replace(/=/g, "")}`;
+                if (!custMap.has(id)) {
+                  custMap.set(id, {
+                    id,
+                    name,
+                    phone: c.customerPhone || c.customer_phone || "",
+                    address: c.customerAddress || c.customer_address || "",
+                    listId: c.listId || c.list_id || "",
+                    listName: c.listName || c.list_name || "",
+                    status: "active",
+                    totalPurchases: Number(c.totalPrice || c.total_price) || 0,
+                    totalPaid: Number(c.totalPaid || c.total_paid) || 0,
+                    remainingBalance: Number(c.remainingBalance || c.remaining_balance) || 0,
+                  });
+                }
+              }
+            });
+            const seededCustomers = Array.from(custMap.values());
+            fileDb.setAll("customers", seededCustomers);
+            console.log(`[FileDB Seed] Seeded ${seededCustomers.length} customers from contracts snapshot`);
+          }
+          if (Array.isArray(snapData.payments) && snapData.payments.length > 0 && (fileDb.get("payments") || []).length === 0) {
+            fileDb.setAll("payments", snapData.payments);
+          }
+          if (Array.isArray(snapData.appointments) && snapData.appointments.length > 0) {
+            fileDb.setAll("appointments", snapData.appointments);
+          }
+          if (Array.isArray(snapData.customerLists) && snapData.customerLists.length > 0) {
+            fileDb.setAll("customer_lists", snapData.customerLists);
+          }
+          if (Array.isArray(snapData.funds) && snapData.funds.length > 0) {
+            fileDb.setAll("cash_funds", snapData.funds);
+            fileDb.setAll("funds", snapData.funds);
+          }
+          if (Array.isArray(snapData.reps) && snapData.reps.length > 0) {
+            fileDb.setAll("reps", snapData.reps);
+          }
+          if (Array.isArray(snapData.inventory) && snapData.inventory.length > 0) {
+            fileDb.setAll("inventory_items", snapData.inventory);
+          }
+          if (Array.isArray(snapData.employees) && snapData.employees.length > 0) {
+            fileDb.setAll("employees", snapData.employees);
+          }
+        }
+      }
+    }
+
+    if ((fileDb.get("cash_funds") || []).length === 0 && INITIAL_FUNDS.length > 0) {
+      fileDb.setAll("cash_funds", INITIAL_FUNDS);
+      fileDb.setAll("funds", INITIAL_FUNDS);
+    }
+    if ((fileDb.get("employees") || []).length === 0 && INITIAL_EMPLOYEES.length > 0) {
+      fileDb.setAll("employees", INITIAL_EMPLOYEES);
+    }
+  } catch (seedErr) {
+    console.warn("[FileDB Seed] Notice:", seedErr);
+  }
+
+  // Probe PostgreSQL availability before listening so routes know whether direct PG or FileDB/upstream is active
+  const pgOkAtStartup = await probePgConnection().catch(() => false);
+  if (!pgOkAtStartup) {
+    console.log("[DB] Direct PostgreSQL unreachable; syncing from upstream server / FileDB mode.");
+    syncFromUpstreamServer(true).catch(() => {});
+  } else {
+    (async () => {
+      await initializeDatabaseSchema();
       if (isPgConfigured()) {
         await executePg(`
           CREATE INDEX IF NOT EXISTS idx_payments_contract_id ON payments (contract_id);
@@ -1056,9 +1346,8 @@ async function startServer() {
       await recalculateAllFundBalancesInPg().catch((e) => console.warn("Recalculate balances notice:", e));
       await initVapidKeys().catch((e) => console.warn("Vapid init notice:", e));
       await initPushSubscriptionsTable().catch((e) => console.warn("Push subs table notice:", e));
-      return;
-    })
-    .catch((err) => console.warn("Background DB initialization notice:", err));
+    })().catch((err) => console.warn("Background DB initialization notice:", err));
+  }
 
   console.log("SERVER DB CONFIG:", isPgConfigured() ? "PostgreSQL + FileDB" : "Local FileDB Engine");
 
@@ -1114,15 +1403,19 @@ async function startServer() {
       if (isPgConfigured()) {
         const dRes = await executePg("SELECT COUNT(*) as count FROM deleted_records").catch(() => []);
         if (dRes && dRes[0]?.count) deletedCount = Number(dRes[0].count);
+      } else {
+        await syncFromUpstreamServer(false).catch(() => {});
       }
     } catch (e) {}
 
     res.json({
       status: "ok",
-      database: isPgConfigured() ? "postgresql" : "filedb",
+      database: isPgConfigured() ? "postgresql" : (upstreamConnected ? "upstream-postgresql" : "filedb"),
+      upstreamConnected,
       persistent: true,
       syncVersion: globalSyncVersion,
       deletedCount,
+      contractsCount: (fileDb.get("contracts") || []).length,
       timestamp: Date.now(),
     });
   });
@@ -1266,17 +1559,21 @@ async function startServer() {
     try {
       if (isPgConfigured()) {
         try {
-          const rows = await executePg(`
+          const rows = await executePgStrict(`
             SELECT * FROM inventory_items 
             WHERE (id LIKE 'item_%' OR (id NOT LIKE 'emp_%' AND id NOT LIKE 'pay_%' AND id NOT LIKE 'contract_%' AND id NOT LIKE 'ft_%' AND id NOT LIKE 'emptx_%' AND id NOT LIKE 'conflict_%'))
               AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = inventory_items.id AND (dr.table_name = 'inventory_items' OR dr.table_name = 'inventory' OR dr.table_name = 'unknown'))
             ORDER BY name ASC
           `);
           const items = (rows || []).map(mapInventoryRow);
-          fileDb.setAll("inventory_items", items);
+          if (items.length > 0 || (fileDb.get("inventory_items") || []).length === 0) {
+            fileDb.setAll("inventory_items", items);
+          }
           return res.json(items);
         } catch (pgErr) {
-          console.warn("Postgres fetch inventory error, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch inventory error, fallback to fileDb:", pgErr);
+          }
         }
       }
       const raw = fileDb.get("inventory_items") || [];
@@ -1618,15 +1915,23 @@ async function startServer() {
               AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = c.id AND (dr.table_name IN ('sales', 'contracts') OR dr.table_name IS NULL))
             ORDER BY c.created_at ASC, c.id ASC
           `;
-          const rows = await executePg(sql);
+          const rows = await executePgStrict(sql);
           let contracts = (rows || []).map(mapContractRow).filter(c => c && c.id && !c.id.startsWith('pay_') && !c.id.startsWith('ft_') && !c.id.startsWith('emptx_'));
-          fileDb.setAll("contracts", contracts);
+          if (contracts.length > 0 || (fileDb.get("contracts") || []).length === 0) {
+            fileDb.setAll("contracts", contracts);
+          }
           return res.json(contracts);
         } catch (pgErr) {
-          console.warn("Postgres fetch contracts error, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch contracts error, fallback to fileDb:", pgErr);
+          }
         }
       }
-      
+
+      if (!isPgConfigured()) {
+        await syncFromUpstreamServer(false).catch(() => {});
+      }
+
       let allContracts = (fileDb.get("contracts") || []).filter((c: any) => c && c.id && !String(c.id).startsWith('pay_') && !String(c.id).startsWith('ft_') && !String(c.id).startsWith('emptx_') && !String(c.id).startsWith('conflict_'));
       const allPayments = fileDb.get("payments") || [];
       const contracts = allContracts.map((c: any) => {
@@ -1636,17 +1941,19 @@ async function startServer() {
         );
         const paymentsSum = cPayments.reduce((sum: number, p: any) => sum + (Number(p.amountPaid ?? p.amount ?? p.amount_paid) || 0), 0);
         const net = Math.max(0, (Number(c.totalPrice) || 0) - (Number(c.advancePayment) || 0));
-        const totalPaid = net > 0 ? Math.min(net, paymentsSum) : paymentsSum;
-        const excessAmount = Math.max(0, paymentsSum - net);
-        const remainingBalance = Math.max(0, net - paymentsSum);
-        const status = (remainingBalance === 0 && (net === 0 || paymentsSum > 0)) ? 'completed' : 'active';
+        const existingPaid = Number(c.rawTotalPaid ?? c.totalPaid ?? 0) || 0;
+        const effectivePaidSum = (cPayments.length === 0 && allPayments.length === 0 && existingPaid > 0) ? existingPaid : paymentsSum;
+        const totalPaid = net > 0 ? Math.min(net, effectivePaidSum) : effectivePaidSum;
+        const excessAmount = Math.max(0, effectivePaidSum - net);
+        const remainingBalance = Math.max(0, net - effectivePaidSum);
+        const status = (remainingBalance === 0 && (net === 0 || effectivePaidSum > 0)) ? 'completed' : 'active';
         const sorted = [...cPayments].sort((a: any, b: any) => new Date(b.paymentDate).getTime() - new Date(a.paymentDate).getTime());
-        const lastPaymentDate = sorted[0]?.paymentDate || null;
+        const lastPaymentDate = sorted[0]?.paymentDate || c.lastPaymentDate || null;
         return {
           ...c,
           totalPaid,
           excessAmount,
-          rawTotalPaid: paymentsSum,
+          rawTotalPaid: effectivePaidSum,
           remainingBalance,
           status,
           lastPaymentDate,
@@ -2105,7 +2412,7 @@ async function startServer() {
     try {
       if (isPgConfigured()) {
         try {
-          const rows = await executePg(`
+          const rows = await executePgStrict(`
             SELECT p.*, COALESCE(NULLIF(p.customer_name, ''), c.customer_name, '') AS resolved_customer_name
             FROM payments p
             LEFT JOIN contracts c ON p.contract_id = c.id
@@ -2113,10 +2420,14 @@ async function startServer() {
             ORDER BY p.payment_date DESC, p.created_at DESC, p.id DESC
           `);
           const payments = (rows || []).map(mapPaymentRow).filter((p: any) => p.amountPaid > 0);
-          fileDb.setAll("payments", payments);
+          if (payments.length > 0 || (fileDb.get("payments") || []).length === 0) {
+            fileDb.setAll("payments", payments);
+          }
           return res.json(payments);
         } catch (pgErr) {
-          console.warn("Postgres fetch payments error, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch payments error, fallback to fileDb:", pgErr);
+          }
         }
       }
       const filePayments = (fileDb.get("payments") || []).map(mapPaymentRow).filter((p: any) => (p.amountPaid ?? p.amount ?? 0) > 0);
@@ -2687,12 +2998,17 @@ async function startServer() {
     try {
       if (isPgConfigured()) {
         try {
-          const rows = await executePg("SELECT * FROM cash_funds ORDER BY COALESCE(order_index, 0) ASC, created_at ASC, id ASC");
+          const rows = await executePgStrict("SELECT * FROM cash_funds ORDER BY COALESCE(order_index, 0) ASC, created_at ASC, id ASC");
           const funds = (rows || []).map(mapFundRow);
-          fileDb.setAll("cash_funds", funds);
+          if (funds.length > 0 || (fileDb.get("cash_funds") || []).length === 0) {
+            fileDb.setAll("cash_funds", funds);
+            fileDb.setAll("funds", funds);
+          }
           return res.json(funds);
         } catch (pgErr) {
-          console.warn("Postgres fetch funds error, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch funds error, fallback to fileDb:", pgErr);
+          }
         }
       }
       const fileFunds = (fileDb.get("cash_funds") || fileDb.get("funds") || []).map(mapFundRow).sort(compareEntitiesByOrderIndex);
@@ -2959,12 +3275,16 @@ async function startServer() {
     try {
       if (isPgConfigured()) {
         try {
-          const rows = await executePg("SELECT * FROM customer_lists cl WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = cl.id AND (dr.table_name = 'customer_lists' OR dr.table_name = 'unknown')) ORDER BY COALESCE(cl.order_index, 0) ASC, cl.created_at ASC, cl.id ASC");
+          const rows = await executePgStrict("SELECT * FROM customer_lists cl WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = cl.id AND (dr.table_name = 'customer_lists' OR dr.table_name = 'unknown')) ORDER BY COALESCE(cl.order_index, 0) ASC, cl.created_at ASC, cl.id ASC");
           const lists = (rows || []).map(mapCustomerListRow);
-          fileDb.setAll("customer_lists", lists);
+          if (lists.length > 0 || (fileDb.get("customer_lists") || []).length === 0) {
+            fileDb.setAll("customer_lists", lists);
+          }
           return res.json(lists);
         } catch (pgErr) {
-          console.warn("Postgres fetch customer-lists error, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch customer-lists error, fallback to fileDb:", pgErr);
+          }
         }
       }
       const fileLists = (fileDb.get("customer_lists") || []).map(mapCustomerListRow).sort(compareEntitiesByOrderIndex);
@@ -3128,28 +3448,59 @@ async function startServer() {
   // --- Customers API (جدول الزبائن) ---
   app.get("/api/customers", async (req, res) => {
     try {
-      if (isPgConfigured()) {
-        try {
-          const rows = await executePg(`
-            SELECT 
-              c.*,
-              (SELECT COUNT(*) FROM sales s WHERE s.customer_name = c.name OR s.customer_id = c.id) as sales_count
-            FROM customers c
-            WHERE NOT EXISTS (
-              SELECT 1 FROM deleted_records dr 
-              WHERE dr.record_id = c.id AND (dr.table_name = 'customers' OR dr.table_name = 'unknown')
-            )
-            ORDER BY c.name ASC
-          `);
-          if (rows && rows.length > 0) {
-            return res.json(rows);
-          }
-          return res.json([]);
-        } catch (pgErr) {
-          console.warn("Postgres fetch customers error:", pgErr);
+      let rows: any[] = [];
+      try {
+        rows = await executePg(`
+          SELECT 
+            c.*,
+            (SELECT COUNT(*) FROM sales s WHERE s.customer_name = c.name OR s.customer_id = c.id) as sales_count
+          FROM customers c
+          WHERE NOT EXISTS (
+            SELECT 1 FROM deleted_records dr 
+            WHERE dr.record_id = c.id AND (dr.table_name = 'customers' OR dr.table_name = 'unknown')
+          )
+          ORDER BY c.name ASC
+        `);
+      } catch (pgErr) {}
+
+      const fileCustomers = fileDb.get("customers") || [];
+      const fileContracts = fileDb.get("contracts") || fileDb.get("sales") || [];
+      
+      const map = new Map<string, any>();
+      for (const fc of fileCustomers) {
+        if (fc && fc.name) {
+          map.set(String(fc.id || fc.name), { ...fc });
         }
       }
-      res.json([]);
+      for (const r of rows) {
+        if (r && r.name) {
+          map.set(String(r.id || r.name), { ...r });
+        }
+      }
+      for (const c of fileContracts) {
+        const cName = c.customerName || c.customer_name;
+        if (cName) {
+          const cId = c.customerId || c.customer_id || `cust-${Buffer.from(cName).toString('hex')}`;
+          if (!map.has(cId) && !Array.from(map.values()).some((x: any) => x.name === cName)) {
+            map.set(cId, {
+              id: cId,
+              name: cName,
+              phone: c.customerPhone || c.customer_phone || '',
+              address: c.customerAddress || c.customer_address || '',
+              listId: c.listId || c.list_id || '',
+              listName: c.listName || c.list_name || '',
+              totalPurchases: Number(c.totalPrice || c.total_price) || 0,
+              totalPaid: Number(c.totalPaid || c.total_paid) || 0,
+              remainingBalance: Number(c.remainingBalance || c.remaining_balance) || 0,
+              status: 'active',
+              sales_count: 1
+            });
+          }
+        }
+      }
+
+      const allCusts = Array.from(map.values()).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+      return res.json(allCusts);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -3325,7 +3676,7 @@ async function startServer() {
             ON CONFLICT (id) DO UPDATE SET name = 'ضياء المحاسب', role = 'admin', can_edit = true, can_delete = true, can_move_customer = true, can_sell = true, allowed_list_ids = '["all"]'
           `).catch(() => {});
 
-          const rows = await executePg("SELECT * FROM reps r WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = r.id AND dr.record_id != 'rep-1' AND (dr.table_name = 'reps' OR dr.table_name = 'unknown')) ORDER BY r.name ASC");
+          const rows = await executePgStrict("SELECT * FROM reps r WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = r.id AND dr.record_id != 'rep-1' AND (dr.table_name = 'reps' OR dr.table_name = 'unknown')) ORDER BY r.name ASC");
           if (rows && rows.length > 0) {
             const reps = rows.map(mapRepRow);
             // Ensure ضياء is present
@@ -3348,16 +3699,18 @@ async function startServer() {
             return res.json(reps);
           }
         } catch (pgErr) {
-          console.warn("Postgres fetch reps error, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch reps error, fallback to fileDb:", pgErr);
+          }
         }
       }
-      let reps = fileDb.get("reps");
+      let reps = preserveRealRepCodes(fileDb.get("reps") || []);
       if (!reps.some((r: any) => r.id === 'rep-1' || (r.name && r.name.includes('ضياء')))) {
         reps.unshift({
           id: 'rep-1',
           name: 'ضياء المحاسب',
           phone: '07801112233',
-          code: '4444',
+          code: '7351',
           role: 'admin',
           canEdit: true,
           canDelete: true,
@@ -3530,7 +3883,9 @@ async function startServer() {
           `);
           return res.json(rows || []);
         } catch (pgErr) {
-          console.warn("Postgres fetch rep_locations error:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch rep_locations error:", pgErr);
+          }
         }
       }
       const locs = fileDb.get<any>("rep_locations") || [];
@@ -3653,7 +4008,9 @@ async function startServer() {
           `, [repId]);
           return res.json(rows || []);
         } catch (pgErr) {
-          console.warn("Postgres fetch rep_location_logs error:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch rep_location_logs error:", pgErr);
+          }
         }
       }
       res.json([]);
@@ -3667,12 +4024,16 @@ async function startServer() {
     try {
       if (isPgConfigured()) {
         try {
-          const rows = await executePg("SELECT * FROM fund_transactions ORDER BY created_at DESC");
+          const rows = await executePgStrict("SELECT * FROM fund_transactions ORDER BY created_at DESC");
           const txs = (rows || []).map(mapFundTxRow);
-          fileDb.setAll("fund_transactions", txs);
+          if (txs.length > 0 || (fileDb.get("fund_transactions") || []).length === 0) {
+            fileDb.setAll("fund_transactions", txs);
+          }
           return res.json(txs);
         } catch (pgErr) {
-          console.warn("Postgres fetch fund-transactions error, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch fund-transactions error, fallback to fileDb:", pgErr);
+          }
         }
       }
       res.json(fileDb.get("fund_transactions"));
@@ -3780,12 +4141,16 @@ async function startServer() {
     try {
       if (isPgConfigured()) {
         try {
-          const rows = await executePg("SELECT * FROM employees ORDER BY name ASC");
+          const rows = await executePgStrict("SELECT * FROM employees ORDER BY name ASC");
           const emps = (rows || []).map(mapEmployeeRow);
-          fileDb.setAll("employees", emps);
+          if (emps.length > 0 || (fileDb.get("employees") || []).length === 0) {
+            fileDb.setAll("employees", emps);
+          }
           return res.json(emps);
         } catch (pgErr) {
-          console.warn("Postgres fetch employees error, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch employees error, fallback to fileDb:", pgErr);
+          }
         }
       }
       res.json(fileDb.get("employees"));
@@ -3967,12 +4332,16 @@ async function startServer() {
     try {
       if (isPgConfigured()) {
         try {
-          const rows = await executePg("SELECT * FROM employee_transactions ORDER BY created_at DESC");
+          const rows = await executePgStrict("SELECT * FROM employee_transactions ORDER BY created_at DESC");
           const txs = (rows || []).map(mapEmpTxRow);
-          fileDb.setAll("employee_transactions", txs);
+          if (txs.length > 0 || (fileDb.get("employee_transactions") || []).length === 0) {
+            fileDb.setAll("employee_transactions", txs);
+          }
           return res.json(txs);
         } catch (pgErr) {
-          console.warn("Postgres fetch employee-transactions error, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch employee-transactions error, fallback to fileDb:", pgErr);
+          }
         }
       }
       res.json(fileDb.get("employee_transactions"));
@@ -4179,12 +4548,16 @@ async function startServer() {
     try {
       if (isPgConfigured()) {
         try {
-          const rows = await executePg("SELECT * FROM payment_conflicts ORDER BY created_at DESC");
+          const rows = await executePgStrict("SELECT * FROM payment_conflicts ORDER BY created_at DESC");
           const conflicts = (rows || []).map(mapConflictRow);
-          fileDb.setAll("payment_conflicts", conflicts);
+          if (conflicts.length > 0 || (fileDb.get("payment_conflicts") || []).length === 0) {
+            fileDb.setAll("payment_conflicts", conflicts);
+          }
           return res.json(conflicts);
         } catch (pgErr) {
-          console.warn("Postgres fetch payment-conflicts error, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("Postgres fetch payment-conflicts error, fallback to fileDb:", pgErr);
+          }
         }
       }
       res.json(fileDb.get("payment_conflicts"));
@@ -4341,16 +4714,20 @@ async function startServer() {
     try {
       if (isPgConfigured()) {
         try {
-          const rows = await executePg(`
+          const rows = await executePgStrict(`
             SELECT * FROM appointments
             WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = appointments.id AND (dr.table_name = 'appointments' OR dr.table_name = 'unknown'))
             ORDER BY created_at DESC
           `);
           const items = (rows || []).map(mapAppointmentRow);
-          fileDb.setAll("appointments", items);
+          if (items.length > 0 || (fileDb.get("appointments") || []).length === 0) {
+            fileDb.setAll("appointments", items);
+          }
           return res.json(items);
         } catch (pgErr) {
-          console.warn("PostgreSQL fetch appointments warning, fallback to fileDb:", pgErr);
+          if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
+            console.warn("PostgreSQL fetch appointments warning, fallback to fileDb:", pgErr);
+          }
         }
       }
       const records = fileDb.get("appointments") || [];
@@ -4946,8 +5323,8 @@ async function startServer() {
       // Fallback for FileDB Engine
       const allContracts = fileDb.get("contracts") || [];
       const allPayments = fileDb.get("payments") || [];
-      const allFunds = fileDb.get("funds") || [];
-      const allInventory = fileDb.get("inventory") || [];
+      const allFunds = fileDb.get("cash_funds") || fileDb.get("funds") || [];
+      const allInventory = fileDb.get("inventory_items") || fileDb.get("inventory") || [];
       const allEmployees = fileDb.get("employees") || [];
       const allReps = fileDb.get("reps") || [];
 
@@ -6242,7 +6619,8 @@ async function startServer() {
   // Comprehensive atomic full-sync endpoint for 100% perfect matching between Web & Android APK
   app.get("/api/sync/all", async (req, res) => {
     try {
-      if (isPgConfigured()) {
+      const pgOk = await probePgConnection();
+      if (pgOk && isPgConfigured()) {
         await cleanupDuplicateEntities().catch(() => {});
         await syncCustomersTableInPg().catch(() => {});
         if (req.query.audit === 'true' || req.query.force_recalc === 'true') {
@@ -6463,14 +6841,19 @@ async function startServer() {
         });
       }
 
+      if (!isPgConfigured()) {
+        await syncFromUpstreamServer(false).catch(() => {});
+      }
+
       // Fallback
       res.json({
         success: true,
         serverTimestamp: new Date().toISOString(),
         contracts: fileDb.get("contracts") || [],
+        customers: fileDb.get("customers") || [],
         payments: fileDb.get("payments") || [],
-        inventory: fileDb.get("inventory") || [],
-        reps: fileDb.get("reps") || [],
+        inventory: fileDb.get("inventory_items") || fileDb.get("inventory") || [],
+        reps: preserveRealRepCodes(fileDb.get("reps") || []),
         funds: (fileDb.get("cash_funds") || fileDb.get("funds") || []).map(mapFundRow).sort(compareEntitiesByOrderIndex),
         customerLists: (fileDb.get("customer_lists") || []).map(mapCustomerListRow).sort(compareEntitiesByOrderIndex),
         employees: fileDb.get("employees") || [],
@@ -6925,12 +7308,15 @@ async function startServer() {
             if (itemDelIds.length > 0) {
               await executePg(`INSERT INTO deleted_records (record_id, table_name) SELECT unnest($1::text[]), 'inventory' ON CONFLICT (record_id) DO NOTHING`, [itemDelIds]).catch(() => {});
               await executePg(`DELETE FROM inventory_items WHERE id = ANY($1)`, [itemDelIds]).catch(() => {});
-              for (const dId of itemDelIds) fileDb.delete("inventory", dId);
+              for (const dId of itemDelIds) fileDb.delete("inventory_items", dId);
             }
             if (fundDelIds.length > 0) {
               await executePg(`INSERT INTO deleted_records (record_id, table_name) SELECT unnest($1::text[]), 'cash_funds' ON CONFLICT (record_id) DO NOTHING`, [fundDelIds]).catch(() => {});
               await executePg(`DELETE FROM cash_funds WHERE id = ANY($1)`, [fundDelIds]).catch(() => {});
-              for (const dId of fundDelIds) fileDb.delete("funds", dId);
+              for (const dId of fundDelIds) {
+                fileDb.delete("cash_funds", dId);
+                fileDb.delete("funds", dId);
+              }
             }
             if (listDelIds.length > 0) {
               await executePg(`INSERT INTO deleted_records (record_id, table_name) SELECT unnest($1::text[]), 'customer_lists' ON CONFLICT (record_id) DO NOTHING`, [listDelIds]).catch(() => {});
@@ -6968,7 +7354,14 @@ async function startServer() {
         }
       };
 
-      await processBulk(payload.contracts, 'CREATE_CONTRACT');
+      const incomingContracts = Array.isArray(payload.contracts) ? payload.contracts : [];
+      const existingServerContracts = fileDb.get<any>("contracts") || [];
+      const isIncomingDemoOnly =
+        incomingContracts.length <= 2 &&
+        incomingContracts.every((c: any) => c?.id === "contract-1" || c?.id === "contract-2");
+      if (!(isIncomingDemoOnly && existingServerContracts.length > 2)) {
+        await processBulk(incomingContracts, 'CREATE_CONTRACT');
+      }
       await processBulk(payload.payments, 'CREATE_PAYMENT');
       await processBulk(payload.inventory, 'CREATE_INVENTORY');
       await processBulk(payload.reps, 'CREATE_REP');
@@ -7071,9 +7464,9 @@ async function startServer() {
       // Check fileDb backup as well if pg was temporarily cold
       const fileDbContracts = new Set((fileDb.get<any>("contracts") || []).map((c: any) => String(c.id)));
       const fileDbPayments = new Set((fileDb.get<any>("payments") || []).map((p: any) => String(p.id)));
-      const fileDbInventory = new Set((fileDb.get<any>("inventory") || []).map((i: any) => String(i.id)));
+      const fileDbInventory = new Set((fileDb.get<any>("inventory_items") || fileDb.get<any>("inventory") || []).map((i: any) => String(i.id)));
       const fileDbReps = new Set((fileDb.get<any>("reps") || []).map((r: any) => String(r.id)));
-      const fileDbFunds = new Set((fileDb.get<any>("funds") || []).map((f: any) => String(f.id)));
+      const fileDbFunds = new Set((fileDb.get<any>("cash_funds") || fileDb.get<any>("funds") || []).map((f: any) => String(f.id)));
       const fileDbCustomerLists = new Set((fileDb.get<any>("customer_lists") || []).map((cl: any) => String(cl.id)));
       const fileDbEmployees = new Set((fileDb.get<any>("employees") || []).map((e: any) => String(e.id)));
 
@@ -7182,11 +7575,14 @@ async function startServer() {
             globalSyncVersion = v;
           }
         }
+      } else {
+        await syncFromUpstreamServer(false).catch(() => {});
       }
     } catch (e) {}
     res.json({
       success: true,
       syncVersion: globalSyncVersion,
+      upstreamConnected,
       timestamp: Date.now(),
     });
   });

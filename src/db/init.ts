@@ -689,8 +689,11 @@ export async function initializeDatabaseSchema() {
     } finally {
       client.release();
     }
-  } catch (err) {
-    console.warn('PostgreSQL Schema Initialization warning:', err);
+  } catch (err: any) {
+    const msg = (err?.message || '').toLowerCase();
+    if (!msg.includes('pg_hba.conf') && !msg.includes('rejects connection') && !msg.includes('econnrefused') && !msg.includes('etimedout') && !msg.includes('timeout')) {
+      console.warn('PostgreSQL Schema Initialization notice:', err?.message || err);
+    }
   }
 }
 

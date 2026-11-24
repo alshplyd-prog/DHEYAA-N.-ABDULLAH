@@ -4,15 +4,16 @@ import { Capacitor } from '@capacitor/core';
  * Centralized API & Server Endpoint Resolver for Web and Android APK
  */
 
-export const HOSTINGER_DEFAULT_SERVER = 'http://72.62.158.128:3000';
+export const HOSTINGER_DEFAULT_SERVER = 'https://ais-dev-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app';
 
 export const CANDIDATE_SERVERS: string[] = [
+  'https://ais-dev-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app',
+  'https://ais-pre-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app',
   'http://72.62.158.128:3000',
-  'https://ais-dev-5x4c6bq6p4ul7njqnkzon5-947254878994.europe-west2.run.app',
-  'https://ais-pre-5x4c6bq6p4ul7njqnkzon5-947254878994.europe-west2.run.app',
+  'http://72.62.158.128',
 ];
 
-const DEFAULT_REMOTE_SERVER = 'http://72.62.158.128:3000';
+const DEFAULT_REMOTE_SERVER = 'https://ais-dev-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app';
 const SERVER_URL_STORAGE_KEY = 'alkarrar_backend_server_url';
 
 export function getCustomServerUrl(): string {

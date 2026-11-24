@@ -38,8 +38,8 @@ export const createPool = () => {
     ssl: { rejectUnauthorized: false },
     max: 10,
     idleTimeoutMillis: 10000,
-    connectionTimeoutMillis: 10000,
-    statement_timeout: 20000,
+    connectionTimeoutMillis: 2500,
+    statement_timeout: 10000,
     keepAlive: true,
     keepAliveInitialDelayMillis: 5000,
   });

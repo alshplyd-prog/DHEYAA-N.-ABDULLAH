@@ -1033,8 +1033,13 @@ export default function App() {
           }
 
           // Check if security PIN code was changed by admin
-          // Only trigger if both have valid normalized codes and they genuinely differ
-          if (prevCode && matchCode && prevCode !== matchCode) {
+          // Ignore masked '0000' from upstream sync and rep-1 default alias codes ('4444' vs '7351')
+          const isDhiaDefaultAlias =
+            (prev.id === 'rep-1' || (prev.name && prev.name.includes('ضياء'))) &&
+            (prevCode === '4444' || prevCode === '7351' || prevCode === '0000') &&
+            (matchCode === '4444' || matchCode === '7351' || matchCode === '0000');
+
+          if (prevCode && matchCode && matchCode !== '0000' && prevCode !== matchCode && !isDhiaDefaultAlias) {
             // PIN changed! Force immediate logout on this device
             setIsPinUnlocked(false);
             try {
@@ -1057,7 +1062,7 @@ export default function App() {
           const updated = {
             ...prev,
             ...match,
-            code: matchCode ? match.code : prev.code,
+            code: (matchCode && matchCode !== '0000' && !isDhiaDefaultAlias) ? match.code : prev.code,
           };
           try {
             localStorage.setItem(REP_STORAGE_KEY, JSON.stringify(updated));
@@ -1354,13 +1359,15 @@ export default function App() {
       });
       const paymentsSum = cPayments.reduce((sum, p) => sum + (Number(p.amountPaid ?? p.amount ?? p.amount_paid) || 0), 0);
       const net = Math.max(0, (Number(c.totalPrice) || 0) - (Number(c.advancePayment) || 0));
-      const totalPaid = net > 0 ? Math.min(net, paymentsSum) : paymentsSum;
-      const excessAmount = Math.max(0, paymentsSum - net);
-      let remainingBalance = Math.max(0, net - paymentsSum);
-      if (remainingBalance > 0 && remainingBalance <= 2 && (Number(c.remainingBalance || 0) <= 5 || paymentsSum >= net - 2)) {
+      const existingPaid = Number((c as any).rawTotalPaid ?? c.totalPaid ?? 0) || 0;
+      const effectivePaidSum = (cPayments.length === 0 && payments.length === 0 && existingPaid > 0) ? existingPaid : paymentsSum;
+      const totalPaid = net > 0 ? Math.min(net, effectivePaidSum) : effectivePaidSum;
+      const excessAmount = Math.max(0, effectivePaidSum - net);
+      let remainingBalance = Math.max(0, net - effectivePaidSum);
+      if (remainingBalance > 0 && remainingBalance <= 2 && (Number(c.remainingBalance || 0) <= 5 || effectivePaidSum >= net - 2)) {
         remainingBalance = 0;
       }
-      const status: 'active' | 'completed' = (remainingBalance === 0 && paymentsSum > 0 && net > 0) ? 'completed' : 'active';
+      const status: 'active' | 'completed' = (remainingBalance === 0 && effectivePaidSum > 0 && net > 0) ? 'completed' : 'active';
 
       // Fallback coordinate resolution from customers state or payments
       let lat = c.latitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0 ? Number(c.latitude) : undefined;

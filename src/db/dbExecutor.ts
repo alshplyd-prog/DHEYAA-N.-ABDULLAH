@@ -1,15 +1,81 @@
 import { createPool, resetPool } from './index.ts';
 import { fileDb } from './fileDb.ts';
-import { initializeDatabaseSchema } from './init.ts';
 
-let pgUnavailable = false;
+let pgReachable: boolean | null = null;
+let lastPgFailureAt = 0;
+let lastFailureCooldownMs = 60_000;
+let activeProbePromise: Promise<boolean> | null = null;
+const PG_RETRY_COOLDOWN_MS = 60_000;
+const PG_AUTH_RETRY_COOLDOWN_MS = 30 * 60_000;
 
-export const isPgConfigured = () => {
-  if (pgUnavailable || process.env.USE_LOCAL_DB === 'true') {
+function isAuthOrAclError(err: any): boolean {
+  const msg = String(err?.message || err || '').toLowerCase();
+  const code = String(err?.code || '').toUpperCase();
+  return (
+    code === '28000' ||
+    code === '28P01' ||
+    msg.includes('pg_hba.conf') ||
+    msg.includes('rejects connection') ||
+    msg.includes('password authentication failed')
+  );
+}
+
+export function isConnectionLevelError(err: any): boolean {
+  const msg = String(err?.message || err || '').toLowerCase();
+  const code = String(err?.code || '').toUpperCase();
+  return (
+    code === 'ECONNREFUSED' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ENOTFOUND' ||
+    code === 'EHOSTUNREACH' ||
+    code === 'ECONNRESET' ||
+    code === '28000' ||
+    code === '28P01' ||
+    msg.includes('pg_hba.conf') ||
+    msg.includes('rejects connection') ||
+    msg.includes('timeout') ||
+    msg.includes('connection terminated') ||
+    msg.includes('econnrefused') ||
+    msg.includes('etimedout') ||
+    msg.includes('ehostunreach') ||
+    msg.includes('postgresql unavailable') ||
+    msg.includes('connect')
+  );
+}
+
+export const isPgConfigured = (): boolean => {
+  return pgReachable === true;
+};
+
+export async function probePgConnection(): Promise<boolean> {
+  if (pgReachable === true) return true;
+  if (pgReachable === false && Date.now() - lastPgFailureAt < lastFailureCooldownMs) {
     return false;
   }
-  return true;
-};
+  if (activeProbePromise) return activeProbePromise;
+
+  activeProbePromise = (async () => {
+    try {
+      const currentPool = createPool();
+      await Promise.race([
+        currentPool.query('SELECT 1'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('PG probe timeout')), 2500)),
+      ]);
+      pgReachable = true;
+      return true;
+    } catch (err: any) {
+      pgReachable = false;
+      lastPgFailureAt = Date.now();
+      lastFailureCooldownMs = isAuthOrAclError(err) ? PG_AUTH_RETRY_COOLDOWN_MS : PG_RETRY_COOLDOWN_MS;
+      resetPool();
+      return false;
+    } finally {
+      activeProbePromise = null;
+    }
+  })();
+
+  return activeProbePromise;
+}
 
 class AsyncSemaphore {
   private tasks: (() => void)[] = [];
@@ -39,97 +105,47 @@ class AsyncSemaphore {
 
 const pgSemaphore = new AsyncSemaphore(8);
 
+export async function executePgStrict(sql: string, params: any[] = []): Promise<any[]> {
+  if (!isPgConfigured()) {
+    throw new Error('PostgreSQL unavailable - using local fileDb');
+  }
+  await pgSemaphore.acquire();
+  try {
+    const currentPool = createPool();
+    const res = await currentPool.query(sql, params);
+    pgReachable = true;
+    return res.rows || [];
+  } catch (e: any) {
+    if (isConnectionLevelError(e)) {
+      pgReachable = false;
+      lastPgFailureAt = Date.now();
+      lastFailureCooldownMs = isAuthOrAclError(e) ? PG_AUTH_RETRY_COOLDOWN_MS : PG_RETRY_COOLDOWN_MS;
+      resetPool();
+    }
+    throw e;
+  } finally {
+    pgSemaphore.release();
+  }
+}
+
 export async function executePg(sql: string, params: any[] = []): Promise<any[]> {
-  if (pgUnavailable) {
+  if (!isPgConfigured()) {
     return [];
   }
   await pgSemaphore.acquire();
   try {
-    let attempts = 0;
-    const maxAttempts = 2;
-    while (attempts < maxAttempts) {
-      try {
-        const currentPool = createPool();
-        const res = await currentPool.query(sql, params);
-        return res.rows || [];
-      } catch (e: any) {
-        attempts++;
-        const errStr = (e?.message || '').toLowerCase();
-        const isConnError = errStr.includes('econnreset') || 
-                            errStr.includes('etimedout') || 
-                            errStr.includes('timeout') || 
-                            errStr.includes('terminated') || 
-                            errStr.includes('closed') || 
-                            errStr.includes('connection') ||
-                            errStr.includes('pg_hba.conf') ||
-                            errStr.includes('rejects connection');
-        const isMaxConn = errStr.includes('emaxconnsession') || 
-                          errStr.includes('too many clients') || 
-                          errStr.includes('connection limit');
-
-        if (isConnError || isMaxConn) {
-          resetPool();
-          pgUnavailable = true;
-          return [];
-        }
-
-        if (e.message && e.message.includes('does not exist')) {
-          try {
-            if (e.message.includes('employee_name')) {
-              const currentPool = createPool();
-              await currentPool.query('ALTER TABLE employee_transactions ADD COLUMN IF NOT EXISTS employee_name TEXT;').catch(() => {});
-              const resRetry = await currentPool.query(sql, params);
-              return resRetry.rows || [];
-            }
-            if (e.message.includes('avatar_url') && e.message.includes('reps')) {
-              const currentPool = createPool();
-              await currentPool.query('ALTER TABLE reps ADD COLUMN IF NOT EXISTS avatar_url TEXT;').catch(() => {});
-              const resRetry = await currentPool.query(sql, params);
-              return resRetry.rows || [];
-            }
-            if (e.message.includes('latitude') || e.message.includes('longitude') || e.message.includes('location_address') || e.message.includes('location_updated_at')) {
-              const currentPool = createPool();
-              await currentPool.query(`
-                ALTER TABLE sales ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
-                ALTER TABLE sales ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
-                ALTER TABLE sales ADD COLUMN IF NOT EXISTS location_address TEXT;
-                ALTER TABLE sales ADD COLUMN IF NOT EXISTS location_updated_at TEXT;
-                ALTER TABLE customers ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION;
-                ALTER TABLE customers ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION;
-                ALTER TABLE customers ADD COLUMN IF NOT EXISTS location_address TEXT;
-                DROP VIEW IF EXISTS contracts CASCADE;
-                CREATE VIEW contracts AS 
-                SELECT 
-                  id, customer_id, customer_name, customer_phone, customer_address,
-                  latitude, longitude, location_address, location_updated_at,
-                  item_id, item_name, item_quantity, purchase_price,
-                  list_id, list_name, total_price, advance_payment,
-                  remaining_balance, daily_installment, start_date, notes,
-                  status, last_payment_date, total_paid, rep_name,
-                  created_at, completed_at, updated_at, is_edited
-                FROM sales;
-              `).catch(() => {});
-              const resRetry = await currentPool.query(sql, params);
-              return resRetry.rows || [];
-            }
-            if (e.message.includes('funds') && (e.message.includes('relation') || e.message.includes('table'))) {
-              const currentPool = createPool();
-              await currentPool.query('CREATE OR REPLACE VIEW funds AS SELECT * FROM cash_funds;').catch(() => {});
-              const resRetry = await currentPool.query(sql, params);
-              return resRetry.rows || [];
-            }
-            await initializeDatabaseSchema();
-            const currentPool = createPool();
-            const res2 = await currentPool.query(sql, params);
-            return res2.rows || [];
-          } catch (innerErr) {}
-        }
-
-        if (attempts >= maxAttempts) {
-          return [];
-        }
-      }
+    const currentPool = createPool();
+    const res = await currentPool.query(sql, params);
+    pgReachable = true;
+    return res.rows || [];
+  } catch (e: any) {
+    if (isConnectionLevelError(e)) {
+      pgReachable = false;
+      lastPgFailureAt = Date.now();
+      lastFailureCooldownMs = isAuthOrAclError(e) ? PG_AUTH_RETRY_COOLDOWN_MS : PG_RETRY_COOLDOWN_MS;
+      resetPool();
     }
+    // Silently return empty array on connection or query error to allow local fileDb fallback
     return [];
   } finally {
     pgSemaphore.release();

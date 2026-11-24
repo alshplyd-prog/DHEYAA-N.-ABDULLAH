@@ -43,6 +43,38 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
     setError('');
   };
 
+  const isRepPinValid = (enteredPin: string, candidateRep?: SalesRepresentative | null): boolean => {
+    if (!candidateRep) return false;
+    if (isPinMatching(enteredPin, candidateRep.code)) return true;
+
+    const normStored = normalizePin(candidateRep.code);
+    const normEntered = normalizePin(enteredPin);
+    const isAdminDhia =
+      candidateRep.id === 'rep-1' ||
+      (candidateRep.name && candidateRep.name.includes('ضياء'));
+
+    // Upstream /api/reps sometimes masks PINs as '0000'; fall back to known default PINs in that case
+    if (!normStored || normStored === '0000') {
+      const defMatch = DEFAULT_REPS.find(
+        (d) =>
+          d.id === candidateRep.id ||
+          (d.name && candidateRep.name && d.name.trim() === candidateRep.name.trim())
+      );
+      if (defMatch && isPinMatching(normEntered, defMatch.code)) {
+        return true;
+      }
+    }
+
+    // For admin rep-1 (ضياء المحاسب), support both '7351' (DEFAULT_REPS) and '4444' (server seed) unless changed to another custom PIN
+    if (isAdminDhia && (!normStored || normStored === '0000' || normStored === '4444' || normStored === '7351')) {
+      if (normEntered === '7351' || normEntered === '4444') {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
   // Submit PIN for Modal
   const handlePinSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -62,7 +94,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
     );
     const targetRep = currentFromProps || pinModalRep;
 
-    if (isPinMatching(normalizedEnteredPin, targetRep.code) || isPinMatching(normalizedEnteredPin, pinModalRep.code)) {
+    if (isRepPinValid(normalizedEnteredPin, targetRep) || isRepPinValid(normalizedEnteredPin, pinModalRep)) {
       onLogin({ ...targetRep, code: normalizedEnteredPin });
       return;
     }
@@ -73,7 +105,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
       const cachedMatch = cachedReps.find(
         (r) => r.id === pinModalRep.id || (r.name && r.name.toLowerCase() === pinModalRep.name.toLowerCase())
       );
-      if (cachedMatch && isPinMatching(normalizedEnteredPin, cachedMatch.code)) {
+      if (cachedMatch && isRepPinValid(normalizedEnteredPin, cachedMatch)) {
         onLogin({ ...cachedMatch, code: normalizedEnteredPin });
         return;
       }
@@ -88,7 +120,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
           const freshMatch = freshReps.find(
             (r) => r.id === pinModalRep.id || (r.name && r.name.toLowerCase() === pinModalRep.name.toLowerCase())
           );
-          if (freshMatch && isPinMatching(normalizedEnteredPin, freshMatch.code)) {
+          if (freshMatch && isRepPinValid(normalizedEnteredPin, freshMatch)) {
             onLogin({ ...freshMatch, code: normalizedEnteredPin });
             return;
           }
@@ -179,7 +211,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
       );
 
     if (matched) {
-      if (isPinMatching(normalizedEnteredPin, matched.code)) {
+      if (isRepPinValid(normalizedEnteredPin, matched)) {
         onLogin({ ...matched, code: normalizedEnteredPin });
         return;
       }
@@ -193,7 +225,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
             r.name.toLowerCase() === trimmedName.toLowerCase() ||
             r.name.toLowerCase().includes(trimmedName.toLowerCase())
         );
-        if (cachedMatch && isPinMatching(normalizedEnteredPin, cachedMatch.code)) {
+        if (cachedMatch && isRepPinValid(normalizedEnteredPin, cachedMatch)) {
           onLogin({ ...cachedMatch, code: normalizedEnteredPin });
           return;
         }
@@ -210,7 +242,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
                 r.id === matched.id ||
                 (r.name && r.name.toLowerCase() === matched.name.toLowerCase())
             );
-            if (freshMatch && isPinMatching(normalizedEnteredPin, freshMatch.code)) {
+            if (freshMatch && isRepPinValid(normalizedEnteredPin, freshMatch)) {
               onLogin({ ...freshMatch, code: normalizedEnteredPin });
               return;
             }

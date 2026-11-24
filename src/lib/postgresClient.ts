@@ -73,7 +73,7 @@ try {
   });
 } catch (e) {}
 
-// Auto-clear old customer cache once to match current server state
+// Auto-clear old demo/empty cache once to match current server state without wiping unsynced user edits
 try {
   if (typeof window !== 'undefined' && localStorage) {
     const CLEARED_KEY = 'alkarrar_cust_cleared_v5_empty';
@@ -87,6 +87,29 @@ try {
       localStorage.setItem('sami_cache_contracts', '[]');
       localStorage.setItem('sami_cache_payments', '[]');
       localStorage.setItem(CLEARED_KEY, 'true');
+    }
+
+    const DEMO_FIX_KEY = 'alkarrar_fix_demo_cache_v6';
+    if (!localStorage.getItem(DEMO_FIX_KEY)) {
+      const pendingRaw = localStorage.getItem('sami_pending_queue');
+      const pendingArr = pendingRaw ? JSON.parse(pendingRaw) : [];
+      const hasPendingContract = Array.isArray(pendingArr) && pendingArr.some((a: any) =>
+        a && a.status !== 'synced' && (a.type === 'CREATE_CONTRACT' || a.type === 'UPDATE_CONTRACT' || a.type === 'CREATE_PAYMENT')
+      );
+      if (!hasPendingContract) {
+        const rawContracts = localStorage.getItem('sami_cache_contracts');
+        const parsed = rawContracts ? JSON.parse(rawContracts) : [];
+        const isOnlyDemoOrEmpty = !Array.isArray(parsed) || parsed.length === 0 || (
+          parsed.length <= 2 && parsed.every((c: any) => c?.id === 'contract-1' || c?.id === 'contract-2')
+        );
+        if (isOnlyDemoOrEmpty) {
+          localStorage.removeItem('sami_cache_contracts');
+          localStorage.removeItem('sami_cache_payments');
+          localStorage.removeItem('sami_cache_appointments');
+          localStorage.removeItem('sami_last_sync_version');
+        }
+      }
+      localStorage.setItem(DEMO_FIX_KEY, 'true');
     }
   }
 } catch (e) {}
@@ -301,10 +324,10 @@ function mergeRemoteWithPendingLocal<T extends { id?: string; name?: string }>(t
         }
       }
 
-      // 2. Preserve active local items missing from server ONLY if not deleted
+      // 2. Preserve active local items missing from server ONLY if pending offline creation/sync
       if (Array.isArray(existingLocal)) {
         for (const item of existingLocal) {
-          if (item && item.id && (item.id === 'rep-1' || (!pendingDeleteIds.has(item.id) && !deletedSet.has(item.id)))) {
+          if (item && item.id && (item.id === 'rep-1' || pendingCreateIds.has(item.id) || ((item as any)._unsynced === true && !pendingDeleteIds.has(item.id) && !deletedSet.has(item.id)))) {
             if (!map.has(item.id)) {
               map.set(item.id, item);
             }
@@ -596,8 +619,10 @@ export function recalculateAllContractsFromPayments(
         0
       );
 
-      // Authoritative total paid: calculated directly from active payments
-      const rawAuthoritativePaid = paymentsSum;
+      // Authoritative total paid: calculated from active payments, preserving snapshot/server totals when no payment rows exist
+      const rawAuthoritativePaid = (uniquePayments.length === 0 && activePayments.length === 0 && serverPaid > 0)
+        ? serverPaid
+        : paymentsSum;
       const authoritativePaid = netFinanced > 0 ? Math.min(netFinanced, rawAuthoritativePaid) : rawAuthoritativePaid;
       const excessAmount = Math.max(0, rawAuthoritativePaid - netFinanced);
       // The authoritative remaining balance (الباقي)
@@ -796,16 +821,16 @@ export function getLocalCache<T>(tableName: string): T[] {
     }
   } catch (e) {}
 
-  // Auto-seed initial fallback data if cache is empty or missing (essential for published / APK builds)
+  // Auto-seed initial metadata fallback if cache is empty (never inject 2 demo contracts into production cache)
   let fallback: any[] = [];
   if (tableName === 'reps') fallback = DEFAULT_REPS;
   else if (tableName === 'funds') fallback = INITIAL_FUNDS;
   else if (tableName === 'customer_lists') fallback = INITIAL_CUSTOMER_LISTS;
-  else if (tableName === 'contracts') fallback = INITIAL_CONTRACTS;
+  else if (tableName === 'contracts') fallback = [];
   else if (tableName === 'payments') fallback = INITIAL_PAYMENTS;
   else if (tableName === 'inventory') fallback = INITIAL_INVENTORY;
   else if (tableName === 'employees') fallback = INITIAL_EMPLOYEES;
-  else if (tableName === 'appointments') fallback = INITIAL_APPOINTMENTS;
+  else if (tableName === 'appointments') fallback = [];
 
   if (fallback.length > 0) {
     try {
@@ -939,7 +964,12 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
     });
 
     const snapshot = item?.payload || item?.snapshot;
-    if (snapshot && typeof snapshot === 'object') {
+    const snapshotHasRealContracts =
+      snapshot &&
+      Array.isArray(snapshot.contracts) &&
+      snapshot.contracts.length > 2;
+
+    if (snapshot && typeof snapshot === 'object' && snapshotHasRealContracts) {
       if (Array.isArray(snapshot.payments)) {
         const merged = mergeRemoteWithPendingLocal('payments', snapshot.payments);
         setLocalCache('payments', merged);
@@ -950,11 +980,11 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
         const recalculated = recalculateAllContractsFromPayments(merged, currentPayments, false);
         setLocalCache('contracts', recalculated);
       }
-      if (Array.isArray(snapshot.inventory)) setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', snapshot.inventory));
-      if (Array.isArray(snapshot.reps)) setLocalCache('reps', mergeRemoteWithPendingLocal('reps', snapshot.reps));
-      if (Array.isArray(snapshot.funds)) setLocalCache('funds', mergeRemoteWithPendingLocal('funds', snapshot.funds));
-      if (Array.isArray(snapshot.customerLists)) setLocalCache('customer_lists', mergeRemoteWithPendingLocal('customer_lists', snapshot.customerLists));
-      if (Array.isArray(snapshot.employees)) setLocalCache('employees', mergeRemoteWithPendingLocal('employees', snapshot.employees));
+      if (Array.isArray(snapshot.inventory) && snapshot.inventory.length > 0) setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', snapshot.inventory));
+      if (Array.isArray(snapshot.reps) && snapshot.reps.length > 0) setLocalCache('reps', mergeRemoteWithPendingLocal('reps', snapshot.reps));
+      if (Array.isArray(snapshot.funds) && snapshot.funds.length > 0) setLocalCache('funds', mergeRemoteWithPendingLocal('funds', snapshot.funds));
+      if (Array.isArray(snapshot.customerLists) && snapshot.customerLists.length > 0) setLocalCache('customer_lists', mergeRemoteWithPendingLocal('customer_lists', snapshot.customerLists));
+      if (Array.isArray(snapshot.employees) && snapshot.employees.length > 0) setLocalCache('employees', mergeRemoteWithPendingLocal('employees', snapshot.employees));
       if (Array.isArray(snapshot.fundTx)) setLocalCache('fund_transactions', mergeRemoteWithPendingLocal('fund_transactions', snapshot.fundTx));
       if (Array.isArray(snapshot.empTx)) setLocalCache('employee_transactions', mergeRemoteWithPendingLocal('employee_transactions', snapshot.empTx));
       if (Array.isArray(snapshot.appointments)) setLocalCache('appointments', mergeRemoteWithPendingLocal('appointments', snapshot.appointments));
@@ -963,27 +993,41 @@ export async function loadSnapshotFromIndexedDbIfAvailable(): Promise<boolean> {
       return true;
     }
 
-    // Fallback: If IndexedDB snapshot was empty (e.g. freshly installed APK on mobile),
-    // load bundled initial snapshot so Customer Locations and Appointments are NEVER empty/zeroed on launch!
+    // Fallback: If IndexedDB snapshot was empty or only had demo contracts,
+    // load bundled initial snapshot so real contracts/customers are immediately available!
     try {
       const snapRes = await fetch('/initial_snapshot.json').catch(() => null);
       if (snapRes && snapRes.ok) {
         const bundled = await snapRes.json().catch(() => null);
         if (bundled && typeof bundled === 'object') {
-          if (Array.isArray(bundled.contracts) && getLocalCache('contracts').length === 0) {
+          const curContracts = getLocalCache<any>('contracts');
+          const isDemoOrEmpty =
+            curContracts.length === 0 ||
+            (curContracts.length <= 2 &&
+              curContracts.every((c: any) => c?.id === 'contract-1' || c?.id === 'contract-2'));
+          if (Array.isArray(bundled.payments) && bundled.payments.length > 0 && getLocalCache('payments').length === 0) {
+            setLocalCache('payments', bundled.payments);
+          }
+          if (Array.isArray(bundled.contracts) && bundled.contracts.length > 0 && isDemoOrEmpty) {
             setLocalCache('contracts', bundled.contracts);
           }
-          if (Array.isArray(bundled.appointments) && getLocalCache('appointments').length === 0) {
+          if (Array.isArray(bundled.appointments) && bundled.appointments.length > 0 && getLocalCache('appointments').length <= 2) {
             setLocalCache('appointments', bundled.appointments);
           }
-          if (Array.isArray(bundled.customerLists) && getLocalCache('customer_lists').length === 0) {
+          if (Array.isArray(bundled.customerLists) && bundled.customerLists.length > 0) {
             setLocalCache('customer_lists', bundled.customerLists);
           }
-          if (Array.isArray(bundled.funds) && getLocalCache('funds').length === 0) {
+          if (Array.isArray(bundled.funds) && bundled.funds.length > 0 && getLocalCache('funds').length === 0) {
             setLocalCache('funds', bundled.funds);
           }
-          if (Array.isArray(bundled.reps) && getLocalCache('reps').length === 0) {
+          if (Array.isArray(bundled.reps) && bundled.reps.length > 0) {
             setLocalCache('reps', bundled.reps);
+          }
+          if (Array.isArray(bundled.inventory) && bundled.inventory.length > 0) {
+            setLocalCache('inventory', bundled.inventory);
+          }
+          if (Array.isArray(bundled.employees) && bundled.employees.length > 0 && getLocalCache('employees').length === 0) {
+            setLocalCache('employees', bundled.employees);
           }
           notifySubscribersRefresh();
           return true;
@@ -1687,12 +1731,15 @@ export async function reconcileAllLocalWithDatabase(options?: {
       } catch (verErr) {}
     }
 
-    // 1.5. Push entire local cache whenever force is true or forcePushAll is true
-    // This ensures that when the user clicks 'Sync' or does a reconciliation, the server
-    // database (contracts, payments, customers, etc.) is directly updated with local records!
-    if (options?.force || options?.forcePushAll) {
+    // 1.5. Push entire local cache ONLY when forcePushAll is true (explicit admin sync),
+    // and never push demo-only contracts (contract-1 / contract-2) over real server records.
+    if (options?.forcePushAll) {
       try {
-        const localContracts = getLocalCache<any>('contracts');
+        const rawLocalContracts = getLocalCache<any>('contracts');
+        const isOnlyDemoContracts =
+          rawLocalContracts.length <= 2 &&
+          rawLocalContracts.every((c: any) => c?.id === 'contract-1' || c?.id === 'contract-2');
+        const localContracts = isOnlyDemoContracts ? [] : rawLocalContracts;
         const localPayments = getLocalCache<any>('payments');
         const localInventory = getLocalCache<any>('inventory');
         const localReps = getLocalCache<any>('reps');
@@ -2272,11 +2319,11 @@ function createSubscriber<T extends { id?: string }>(tableName: string, apiEndpo
         if (tableName === 'reps') initialFallback = DEFAULT_REPS;
         else if (tableName === 'funds') initialFallback = INITIAL_FUNDS;
         else if (tableName === 'customer_lists') initialFallback = INITIAL_CUSTOMER_LISTS;
-        else if (tableName === 'contracts') initialFallback = INITIAL_CONTRACTS;
+        else if (tableName === 'contracts') initialFallback = [];
         else if (tableName === 'payments') initialFallback = INITIAL_PAYMENTS;
         else if (tableName === 'inventory') initialFallback = INITIAL_INVENTORY;
         else if (tableName === 'employees') initialFallback = INITIAL_EMPLOYEES;
-        else if (tableName === 'appointments') initialFallback = INITIAL_APPOINTMENTS;
+        else if (tableName === 'appointments') initialFallback = [];
         if (initialFallback.length > 0) {
           setLocalCache(tableName, initialFallback as T[]);
           emitIfChanged(initialFallback as T[]);
@@ -2312,7 +2359,7 @@ function createSubscriber<T extends { id?: string }>(tableName: string, apiEndpo
       if (isOnline && apiEndpoint) {
         // First attempt: Central PostgreSQL Server API endpoint with fallback for APK
         try {
-          const res = await fetchWithFallback(`/api/${apiEndpoint}`, undefined, 4000);
+          const res = await fetchWithFallback(`/api/${apiEndpoint}`, undefined, 8000);
           if (res && res.ok) {
             const contentType = res.headers.get('content-type') || '';
             if (!contentType.includes('text/html')) {
