@@ -87,6 +87,97 @@ async function fetchJsonWithTimeout(url: string, timeoutMs = 8000): Promise<any>
   }
 }
 
+const UPSTREAM_OUTBOX_KEY = "upstream_outbox";
+let isFlushingUpstreamOutbox = false;
+
+function isRequestMatchingUpstream(req: express.Request): boolean {
+  if (req.headers["x-alkarrar-forwarded"] === "1") return true;
+  try {
+    const upHost = new URL(UPSTREAM_SERVER_URL).hostname;
+    const reqHost = req.hostname || "";
+    if (upHost && reqHost && upHost === reqHost) return true;
+  } catch (e) {}
+  return false;
+}
+
+async function sendMutationToUpstream(item: { method: string; url: string; body?: any }): Promise<boolean> {
+  if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true") return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    const cleanUrl = item.url.startsWith("/") ? item.url : `/${item.url}`;
+    const hasBody = item.method !== "DELETE" && item.method !== "GET" && item.body !== undefined;
+    const res = await fetch(`${UPSTREAM_SERVER_URL}${cleanUrl}`, {
+      method: item.method,
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "x-alkarrar-forwarded": "1",
+      },
+      body: hasBody ? JSON.stringify(item.body) : undefined,
+    });
+    if (!res.ok) return false;
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    if (ct.includes("text/html")) return false;
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function flushUpstreamOutbox(): Promise<number> {
+  if (isPgConfigured() || !UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true") return 0;
+  if (isFlushingUpstreamOutbox) return 0;
+  isFlushingUpstreamOutbox = true;
+  let flushed = 0;
+  try {
+    const outbox = fileDb.get<any>(UPSTREAM_OUTBOX_KEY) || [];
+    if (!Array.isArray(outbox) || outbox.length === 0) return 0;
+
+    const remaining: any[] = [];
+    let upstreamDead = false;
+    for (let i = 0; i < outbox.length; i++) {
+      const entry = outbox[i];
+      if (!entry || !entry.method || !entry.url) continue;
+      if (upstreamDead) {
+        remaining.push(entry);
+        continue;
+      }
+      const ok = await sendMutationToUpstream(entry);
+      if (ok) {
+        flushed++;
+        upstreamConnected = true;
+      } else {
+        upstreamDead = true;
+        remaining.push(entry);
+      }
+    }
+    fileDb.setAll(UPSTREAM_OUTBOX_KEY, remaining);
+    return flushed;
+  } finally {
+    isFlushingUpstreamOutbox = false;
+  }
+}
+
+function enqueueAndForwardUpstreamMutation(method: string, url: string, body?: any) {
+  if (isPgConfigured() || !UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true") return;
+  try {
+    const outbox = fileDb.get<any>(UPSTREAM_OUTBOX_KEY) || [];
+    outbox.push({
+      id: `up_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      method,
+      url,
+      body,
+      timestamp: Date.now(),
+    });
+    fileDb.setAll(UPSTREAM_OUTBOX_KEY, outbox.slice(-1000));
+    void flushUpstreamOutbox();
+  } catch (e) {}
+}
+
 async function syncFromUpstreamServer(force = false): Promise<boolean> {
   if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true") return false;
   if (isPgConfigured()) return false;
@@ -110,6 +201,14 @@ async function syncFromUpstreamServer(force = false): Promise<boolean> {
         return false;
       }
       upstreamConnected = true;
+
+      // Flush queued local writes to upstream BEFORE pulling updates
+      await flushUpstreamOutbox().catch(() => 0);
+      const pendingOutbox = fileDb.get<any>(UPSTREAM_OUTBOX_KEY) || [];
+      if (pendingOutbox.length > 0) {
+        // Wait until outbox drains before overwriting local state from upstream
+        return true;
+      }
 
       if (!force && !needsUrgentSeed && lastUpstreamSyncVersion !== null && String(verRes.syncVersion) === String(lastUpstreamSyncVersion)) {
         return true;
@@ -1355,7 +1454,7 @@ async function startServer() {
   app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization, Range");
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization, Range, x-alkarrar-forwarded");
     res.header("Access-Control-Expose-Headers", "Content-Length, Content-Range");
     if (req.method === "OPTIONS") {
       return res.sendStatus(200);
@@ -1396,6 +1495,31 @@ async function startServer() {
     next();
   });
 
+  // Mirror successful local write mutations to upstream Hostinger server when direct PostgreSQL is unavailable
+  app.use((req, res, next) => {
+    if (
+      req.path.startsWith("/api/") &&
+      ["POST", "PUT", "PATCH", "DELETE"].includes(req.method) &&
+      !req.path.startsWith("/api/push/") &&
+      !req.path.startsWith("/api/upstream/") &&
+      !req.path.startsWith("/api/seed")
+    ) {
+      res.on("finish", () => {
+        if (
+          !isPgConfigured() &&
+          UPSTREAM_SERVER_URL &&
+          process.env.DISABLE_UPSTREAM_SYNC !== "true" &&
+          res.statusCode >= 200 &&
+          res.statusCode < 300 &&
+          !isRequestMatchingUpstream(req)
+        ) {
+          enqueueAndForwardUpstreamMutation(req.method, req.originalUrl, req.body);
+        }
+      });
+    }
+    next();
+  });
+
   // Health check API route
   app.get("/api/health", async (req, res) => {
     let deletedCount = 0;
@@ -1412,12 +1536,91 @@ async function startServer() {
       status: "ok",
       database: isPgConfigured() ? "postgresql" : (upstreamConnected ? "upstream-postgresql" : "filedb"),
       upstreamConnected,
+      pgConfigured: isPgConfigured(),
+      upstreamOutboxPending: (fileDb.get<any>(UPSTREAM_OUTBOX_KEY) || []).length,
       persistent: true,
       syncVersion: globalSyncVersion,
       deletedCount,
       contractsCount: (fileDb.get("contracts") || []).length,
       timestamp: Date.now(),
     });
+  });
+
+  // Server-side upstream reachability probe (avoids HTTPS->HTTP mixed content block in web browsers)
+  app.get("/api/upstream/test", async (req, res) => {
+    const rawUrl = typeof req.query.url === "string" && req.query.url.trim()
+      ? req.query.url.trim().replace(/\/+$/, "")
+      : UPSTREAM_SERVER_URL;
+    const start = Date.now();
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return res.status(400).json({ ok: false, latencyMs: 0, error: "Invalid protocol" });
+      }
+      const host = parsed.hostname.toLowerCase();
+      const isPrivateOrLocal =
+        host === "localhost" ||
+        host === "127.0.0.1" ||
+        host === "0.0.0.0" ||
+        host.startsWith("169.254.") ||
+        host.startsWith("10.") ||
+        host.startsWith("192.168.") ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+      if (isPrivateOrLocal && rawUrl !== UPSTREAM_SERVER_URL) {
+        return res.status(400).json({ ok: false, latencyMs: 0, error: "Disallowed local/private host" });
+      }
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const upRes = await fetch(`${rawUrl}/api/health`, {
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
+      });
+      clearTimeout(timer);
+      const latencyMs = Date.now() - start;
+      if (!upRes.ok) {
+        return res.json({
+          ok: false,
+          latencyMs,
+          error: `HTTP ${upRes.status}: ${upRes.statusText}`,
+        });
+      }
+      const ct = (upRes.headers.get("content-type") || "").toLowerCase();
+      if (ct.includes("text/html")) {
+        return res.json({
+          ok: false,
+          latencyMs,
+          error: "الخادم أرجع صفحة HTML بدلاً من API JSON",
+        });
+      }
+      const data = await upRes.json().catch(() => null);
+      if (!data || typeof data !== "object") {
+        return res.json({ ok: false, latencyMs, error: "استجابة JSON غير صالحة من السيرفر" });
+      }
+      if (rawUrl === UPSTREAM_SERVER_URL) {
+        upstreamConnected = true;
+      }
+      return res.json({
+        ok: true,
+        status: data.status || "ok",
+        database: data.database || "postgresql",
+        contractsCount: data.contractsCount,
+        latencyMs,
+      });
+    } catch (err: any) {
+      const latencyMs = Date.now() - start;
+      if (rawUrl === UPSTREAM_SERVER_URL) {
+        upstreamConnected = false;
+      }
+      return res.json({
+        ok: false,
+        latencyMs,
+        error:
+          err?.name === "AbortError"
+            ? `انتهت مهلة الاتصال بالسيرفر (${rawUrl}) - تحقق أن السيرفر يعمل ومنفذ 3000 مفتوح`
+            : err?.message || "تعذر الوصول إلى السيرفر",
+      });
+    }
   });
 
   // Welcome message settings API

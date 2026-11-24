@@ -233,7 +233,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLogin, reps, lang, onVie
 
       // Live verification with server before rejecting (works on APK via fetchWithFallback)
       try {
-        const res = await fetchWithFallback('reps', undefined, 3500);
+        const res = await fetchWithFallback('/api/reps', undefined, 3500);
         if (res && res.ok) {
           const freshReps: SalesRepresentative[] = await res.json();
           if (Array.isArray(freshReps)) {

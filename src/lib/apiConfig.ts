@@ -277,8 +277,20 @@ export async function universalApiFetch(
 
 export async function checkServerHealth(url?: string): Promise<{ ok: boolean; status?: string; database?: string; latencyMs: number; error?: string }> {
   const start = Date.now();
+  const isNative = isNativeOrApkEnvironment();
   const baseUrl = url ? url.trim().replace(/\/+$/, '') : getApiBaseUrl();
-  const targetUrl = baseUrl ? `${baseUrl}/api/health` : '/api/health';
+
+  // In HTTPS web browser mode, checking an http:// VPS URL directly triggers Mixed Content blocking;
+  // proxy the check through the current backend's /api/upstream/test endpoint instead.
+  const isHttpsPageTestingHttpTarget =
+    !isNative &&
+    typeof window !== 'undefined' &&
+    window.location?.protocol === 'https:' &&
+    baseUrl.startsWith('http://');
+
+  const targetUrl = isHttpsPageTestingHttpTarget
+    ? `/api/upstream/test?url=${encodeURIComponent(baseUrl)}`
+    : (baseUrl ? `${baseUrl}/api/health` : '/api/health');
 
   try {
     const controller = new AbortController();
@@ -307,11 +319,27 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
           error: 'تعذر قراءة بيانات فحص السيرفر',
         };
       }
+      if (isHttpsPageTestingHttpTarget && data.ok === false) {
+        return {
+          ok: false,
+          latencyMs: data.latencyMs || latencyMs,
+          error: data.error || 'تعذر الاتصال بالسيرفر',
+        };
+      }
+      if (!isNative && !url && data.database === 'filedb' && data.upstreamConnected === false && data.pgConfigured === false) {
+        return {
+          ok: false,
+          status: 'local-only',
+          database: 'filedb',
+          latencyMs,
+          error: 'الموقع يعمل حالياً بالذاكرة المحلية فقط لأن السيرفر الرئيسي (72.62.158.128:3000) غير متصل',
+        };
+      }
       return {
         ok: true,
         status: data.status || 'ok',
         database: data.database || 'postgresql',
-        latencyMs,
+        latencyMs: data.latencyMs || latencyMs,
       };
     } else {
       return {

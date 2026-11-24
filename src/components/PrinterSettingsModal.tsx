@@ -182,6 +182,22 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
     setIsKeepAliveOn(isKeepAliveModeEnabled());
   };
 
+  React.useEffect(() => {
+    if (!isOpen) return;
+    const urlToCheck = getHostingerServerUrl();
+    setHostingerUrlInput(urlToCheck);
+    checkServerHealth(urlToCheck).then((health) => {
+      setServerHealth({
+        tested: true,
+        ok: health.ok,
+        latencyMs: health.latencyMs,
+        message: health.ok
+          ? (isAr ? `متصل بالسيرفر بنجاح (${health.latencyMs}ms) 🟢` : `Connected (${health.latencyMs}ms)`)
+          : (isAr ? `غير متصل بالسيرفر: ${health.error}` : `Disconnected: ${health.error}`),
+      });
+    }).catch(() => {});
+  }, [isOpen, isAr]);
+
   const handleToggleKeepAlive = async () => {
     setIsTogglingKeepAlive(true);
     try {
@@ -957,7 +973,7 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
                 className={`text-[11px] font-bold px-2.5 py-1.5 rounded-xl ${
                   serverHealth.ok
                     ? 'text-emerald-700 bg-emerald-50 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800'
-                    : 'text-sky-700 bg-sky-50 dark:bg-sky-950/60 dark:text-sky-300 border border-sky-200 dark:border-sky-800'
+                    : 'text-rose-700 bg-rose-50 dark:bg-rose-950/60 dark:text-rose-300 border border-rose-200 dark:border-rose-800'
                 }`}
               >
                 {serverHealth.message}
@@ -971,8 +987,18 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
                   <Globe className="w-4 h-4 text-indigo-600" />
                   {isAr ? 'رابط استضافة هوستجر (Hostinger Server Link):' : 'Hostinger Server Link:'}
                 </span>
-                <span className="text-[10px] font-extrabold text-emerald-700 bg-emerald-100 dark:bg-emerald-950 px-2 py-0.5 rounded-full border border-emerald-300 dark:border-emerald-800">
-                  {isAr ? 'مستضيف ومربوط' : 'Hostinger Connected'}
+                <span className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full border ${
+                  serverHealth?.tested
+                    ? serverHealth.ok
+                      ? 'text-emerald-700 bg-emerald-100 dark:bg-emerald-950 border-emerald-300 dark:border-emerald-800'
+                      : 'text-rose-700 bg-rose-100 dark:bg-rose-950 border-rose-300 dark:border-rose-800'
+                    : 'text-amber-700 bg-amber-100 dark:bg-amber-950 border-amber-300 dark:border-amber-800'
+                }`}>
+                  {serverHealth?.tested
+                    ? serverHealth.ok
+                      ? (isAr ? 'متصل بالسيرفر ✓' : 'Connected ✓')
+                      : (isAr ? 'غير متصل بالسيرفر ✕' : 'Disconnected ✕')
+                    : (isAr ? 'جاري فحص الاتصال...' : 'Checking...')}
                 </span>
               </div>
               <div className="flex items-center gap-2 dir-ltr">
@@ -1000,8 +1026,16 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
               <span className="font-bold text-slate-600 dark:text-slate-400">
                 {isAr ? 'خادم المزامنة التلقائي:' : 'Auto Sync Server:'}
               </span>
-              <span className="text-[10px] font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 px-2 py-0.5 rounded-full border border-emerald-200 dark:border-emerald-800">
-                {isAr ? 'مربوط بمستضيف هوستجر (100%)' : 'Hostinger Connected (100%)'}
+              <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                serverHealth?.tested && !serverHealth.ok
+                  ? 'text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/60 border-rose-200 dark:border-rose-800'
+                  : 'text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 border-emerald-200 dark:border-emerald-800'
+              }`}>
+                {serverHealth?.tested
+                  ? serverHealth.ok
+                    ? (isAr ? `متصل بـ ${hostingerUrlInput}` : `Connected to ${hostingerUrlInput}`)
+                    : (isAr ? 'السيرفر غير متاح حالياً (وضع محلي)' : 'Server Unreachable (Local Mode)')
+                  : (isAr ? 'يتم التحقق من السيرفر...' : 'Checking server...')}
               </span>
             </div>
 
