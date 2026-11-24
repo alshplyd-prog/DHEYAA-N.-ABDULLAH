@@ -4,23 +4,49 @@ import { Capacitor } from '@capacitor/core';
  * Centralized API & Server Endpoint Resolver for Web and Android APK
  */
 
-export const HOSTINGER_DEFAULT_SERVER = 'https://ais-dev-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app';
+export const HOSTINGER_DEFAULT_SERVER = 'http://72.62.158.128:3000';
 
 export const CANDIDATE_SERVERS: string[] = [
-  'https://ais-dev-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app',
-  'https://ais-pre-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app',
   'http://72.62.158.128:3000',
   'http://72.62.158.128',
+  'https://ais-pre-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app',
 ];
 
-const DEFAULT_REMOTE_SERVER = 'https://ais-dev-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app';
+const DEFAULT_REMOTE_SERVER = 'http://72.62.158.128:3000';
 const SERVER_URL_STORAGE_KEY = 'alkarrar_backend_server_url';
+
+function isAiStudioTempOrDeadUrl(url: string): boolean {
+  if (!url) return false;
+  const lower = url.toLowerCase();
+  return (
+    lower.includes('5x4c6bq6p4ul7njqnkzon5') ||
+    lower.includes('ais-dev-') ||
+    lower.includes('ais-pre-')
+  );
+}
+
+function isLocalhostUrl(url: string): boolean {
+  if (!url) return false;
+  const lower = url.toLowerCase();
+  return (
+    lower.includes('localhost') ||
+    lower.includes('127.0.0.1') ||
+    lower.startsWith('capacitor://') ||
+    lower.startsWith('file://')
+  );
+}
 
 export function getCustomServerUrl(): string {
   try {
     const custom = localStorage.getItem(SERVER_URL_STORAGE_KEY);
     if (custom && (custom.startsWith('http://') || custom.startsWith('https://'))) {
-      return custom.replace(/\/+$/, '');
+      const clean = custom.trim().replace(/\/+$/, '');
+      if (isAiStudioTempOrDeadUrl(clean)) {
+        // Auto-clear previously cached temporary AI Studio preview/dev URLs so APK reconnects to production server
+        localStorage.removeItem(SERVER_URL_STORAGE_KEY);
+        return '';
+      }
+      return clean;
     }
   } catch (e) {}
   return '';
@@ -50,11 +76,11 @@ let activeWorkingServer = '';
 
 export function setActiveWorkingServer(url: string) {
   if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
-    const clean = url.replace(/\/+$/, '');
+    const clean = url.trim().replace(/\/+$/, '');
+    if (isLocalhostUrl(clean) || clean.includes('ais-dev-') || clean.includes('5x4c6bq6p4ul7njqnkzon5')) {
+      return;
+    }
     activeWorkingServer = clean;
-    try {
-      localStorage.setItem(SERVER_URL_STORAGE_KEY, activeWorkingServer);
-    } catch (e) {}
   }
 }
 
@@ -80,18 +106,16 @@ export function isNativeOrApkEnvironment(): boolean {
 export function getApiBaseUrl(): string {
   const isNative = isNativeOrApkEnvironment();
   let base = '';
-  if (!isNative && typeof window !== 'undefined' && window.location.origin && 
-      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) && 
-      !window.location.origin.includes('localhost') && 
-      !window.location.origin.includes('127.0.0.1') && 
-      !window.location.origin.includes('file://')) {
+  if (!isNative && typeof window !== 'undefined' && window.location.origin &&
+      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) &&
+      !isLocalhostUrl(window.location.origin)) {
     base = window.location.origin;
-  } else if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
-    base = activeWorkingServer;
   } else {
     const custom = getCustomServerUrl();
-    if (custom && !custom.includes('localhost') && !custom.includes('127.0.0.1')) {
+    if (custom && !isLocalhostUrl(custom)) {
       base = custom;
+    } else if (activeWorkingServer && !isLocalhostUrl(activeWorkingServer) && !activeWorkingServer.includes('ais-dev-')) {
+      base = activeWorkingServer;
     } else {
       base = DEFAULT_REMOTE_SERVER;
     }
@@ -101,18 +125,15 @@ export function getApiBaseUrl(): string {
 
 export function getPublicShareBaseUrl(): string {
   const custom = getCustomServerUrl();
-  if (custom && !custom.includes('localhost') && !custom.includes('127.0.0.1')) {
+  if (custom && !isLocalhostUrl(custom)) {
     return custom.replace(/\/+$/, '');
   }
-  if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
+  if (activeWorkingServer && !isLocalhostUrl(activeWorkingServer)) {
     return activeWorkingServer.replace(/\/+$/, '');
   }
-  if (typeof window !== 'undefined' && window.location.origin && 
-      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) && 
-      !window.location.origin.includes('localhost') && 
-      !window.location.origin.includes('127.0.0.1') && 
-      !window.location.origin.includes('capacitor://') && 
-      !window.location.origin.includes('file://')) {
+  if (typeof window !== 'undefined' && window.location.origin &&
+      (window.location.origin.startsWith('http://') || window.location.origin.startsWith('https://')) &&
+      !isLocalhostUrl(window.location.origin)) {
     return window.location.origin.replace(/\/+$/, '');
   }
   return DEFAULT_REMOTE_SERVER;
@@ -155,28 +176,20 @@ export async function fetchWithFallback(
 
   if (isNative) {
     // In native APK / Capacitor environment, NEVER try localhost or relative URLs because there is no API server on the device!
-    // Immediately target the remote cloud servers!
-    if (activeWorkingServer && !activeWorkingServer.includes('localhost') && !activeWorkingServer.includes('127.0.0.1')) {
-      const activeUrl = `${activeWorkingServer}${cleanEndpoint}`;
-      if (!urlsToTry.includes(activeUrl)) urlsToTry.push(activeUrl);
-    }
     const custom = getCustomServerUrl();
-    if (custom && !custom.includes('localhost') && !custom.includes('127.0.0.1')) {
+    if (custom && !isLocalhostUrl(custom)) {
       const customUrl = `${custom}${cleanEndpoint}`;
       if (!urlsToTry.includes(customUrl)) urlsToTry.push(customUrl);
+    }
+    if (activeWorkingServer && !isLocalhostUrl(activeWorkingServer) && !activeWorkingServer.includes('ais-dev-')) {
+      const activeUrl = `${activeWorkingServer}${cleanEndpoint}`;
+      if (!urlsToTry.includes(activeUrl)) urlsToTry.push(activeUrl);
     }
     for (const server of CANDIDATE_SERVERS) {
       const candidateUrl = `${server}${cleanEndpoint}`;
       if (!urlsToTry.includes(candidateUrl)) {
         urlsToTry.push(candidateUrl);
       }
-    }
-    if (typeof window !== 'undefined' && window.location.origin && window.location.origin.startsWith('http')) {
-      const originUrl = `${window.location.origin}${cleanEndpoint}`;
-      if (!urlsToTry.includes(originUrl)) urlsToTry.push(originUrl);
-    }
-    if (!urlsToTry.includes(cleanEndpoint)) {
-      urlsToTry.push(cleanEndpoint);
     }
   } else {
     // 1. If in browser / web mode, try relative and origin URLs first
@@ -216,7 +229,7 @@ export async function fetchWithFallback(
   for (const url of urlsToTry) {
     try {
       const controller = new AbortController();
-      const perUrlTimeout = timeoutMs || (isNative ? 7000 : 5000);
+      const perUrlTimeout = timeoutMs || (isNative ? 8000 : 5000);
       const timer = setTimeout(() => controller.abort(), perUrlTimeout);
       const res = await fetch(url, {
         ...options,
@@ -230,10 +243,12 @@ export async function fetchWithFallback(
       clearTimeout(timer);
 
       if (res.ok) {
-        // Verify that it is not an HTML fallback page (e.g. index.html) for an API route
-        const contentType = res.headers.get('content-type') || '';
+        // Verify that it is not an HTML fallback page or Google Auth redirect for an API route
+        if (res.url && res.url.includes('accounts.google.com')) {
+          continue;
+        }
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
         if (contentType.includes('text/html')) {
-          // If the endpoint is an API route and got HTML back, this server did not match the API route
           continue;
         }
 
@@ -264,10 +279,10 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
   const start = Date.now();
   const baseUrl = url ? url.trim().replace(/\/+$/, '') : getApiBaseUrl();
   const targetUrl = baseUrl ? `${baseUrl}/api/health` : '/api/health';
-  
+
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
+    const timer = setTimeout(() => controller.abort(), 7000);
     const res = await fetch(targetUrl, {
       signal: controller.signal,
       headers: { 'Accept': 'application/json' }
@@ -276,7 +291,22 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
     const latencyMs = Date.now() - start;
 
     if (res.ok) {
-      const data = await res.json().catch(() => ({}));
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('text/html') || (res.url && res.url.includes('accounts.google.com'))) {
+        return {
+          ok: false,
+          latencyMs,
+          error: 'استجابة السيرفر غير صالحة (تم إرجاع صفحة HTML بدلاً من JSON)',
+        };
+      }
+      const data = await res.json().catch(() => null);
+      if (!data || typeof data !== 'object') {
+        return {
+          ok: false,
+          latencyMs,
+          error: 'تعذر قراءة بيانات فحص السيرفر',
+        };
+      }
       return {
         ok: true,
         status: data.status || 'ok',

@@ -119,7 +119,18 @@ async function removeProcessedFromIndexedDB(processedIds) {
 // Helper: Get candidate sync batch endpoint URLs
 async function getCandidateServerOrigins() {
   const origins = [];
-  if (self.location && self.location.origin && self.location.origin !== 'null') {
+  const isStaleOrFakeLocal = (o) => {
+    if (!o || typeof o !== 'string') return true;
+    const low = o.toLowerCase();
+    return (
+      low === 'https://localhost' ||
+      low === 'capacitor://localhost' ||
+      low.includes('ais-dev-') ||
+      low.includes('5x4c6bq6p4ul7njqnkzon5')
+    );
+  };
+
+  if (self.location && self.location.origin && self.location.origin !== 'null' && !isStaleOrFakeLocal(self.location.origin)) {
     origins.push(self.location.origin);
   }
 
@@ -133,31 +144,31 @@ async function getCandidateServerOrigins() {
       req.onerror = () => resolve(null);
     });
     if (meta && meta.payload) {
+      if (meta.payload.serverUrl && typeof meta.payload.serverUrl === 'string') {
+        try {
+          const u = new URL(meta.payload.serverUrl, self.location.origin);
+          if (u && u.origin && !isStaleOrFakeLocal(u.origin) && !origins.includes(u.origin)) origins.push(u.origin);
+        } catch (e) {}
+      }
       if (Array.isArray(meta.payload.origins)) {
         for (const o of meta.payload.origins) {
           if (o && typeof o === 'string') {
             const clean = o.trim().replace(/\/+$/, '');
-            if (clean && !origins.includes(clean)) origins.push(clean);
+            if (clean && !isStaleOrFakeLocal(clean) && !origins.includes(clean)) origins.push(clean);
           }
         }
-      }
-      if (meta.payload.serverUrl && typeof meta.payload.serverUrl === 'string') {
-        try {
-          const u = new URL(meta.payload.serverUrl, self.location.origin);
-          if (u && u.origin && !origins.includes(u.origin)) origins.push(u.origin);
-        } catch (e) {}
       }
     }
   } catch (e) {}
 
-  // Fallback candidate origins for Cloud PostgreSQL server, local dev and Android
+  // Fallback candidate origins with Production VPS first
   const defaults = [
-    'https://ais-pre-5x4c6bq6p4ul7njqnkzon5-947254878994.europe-west2.run.app',
-    'https://ais-dev-5x4c6bq6p4ul7njqnkzon5-947254878994.europe-west2.run.app',
+    'http://72.62.158.128:3000',
+    'http://72.62.158.128',
+    'https://ais-pre-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app',
     'http://localhost:3000',
     'http://127.0.0.1:3000',
-    'http://10.0.2.2:3000',
-    'http://72.62.158.128:3000'
+    'http://10.0.2.2:3000'
   ];
   for (const d of defaults) {
     if (!origins.includes(d)) origins.push(d);
@@ -311,8 +322,8 @@ async function uploadSingleActionViaRest(action, origins) {
       });
       clearTimeout(timer);
       if (res && res.ok && res.status >= 200 && res.status < 300) {
-        const ct = res.headers ? res.headers.get('content-type') || '' : '';
-        if (ct.includes('application/json') && !ct.includes('text/html')) {
+        const ct = (res.headers ? res.headers.get('content-type') || '' : '').toLowerCase();
+        if (!ct.includes('text/html')) {
           const data = await res.json().catch(() => null);
           if (data && !data.error) return true;
         }
@@ -363,15 +374,16 @@ async function flushPendingActionsInBackground() {
           });
           clearTimeout(timer);
           if (attempt && attempt.ok && attempt.status >= 200 && attempt.status < 300) {
-            const ct = attempt.headers ? attempt.headers.get('content-type') || '' : '';
-            if (ct.includes('application/json') && !ct.includes('text/html')) {
-              const data = await attempt.json().catch(() => ({}));
-              if (Array.isArray(data.processedIds)) {
+            const ct = (attempt.headers ? attempt.headers.get('content-type') || '' : '').toLowerCase();
+            if (!ct.includes('text/html')) {
+              const data = await attempt.json().catch(() => null);
+              if (data && Array.isArray(data.processedIds)) {
                 processedIds.push(...data.processedIds);
-              } else if (data.success) {
+                chunkDone = true;
+              } else if (data && data.success) {
                 processedIds.push(...chunkActions.map((a) => a.id));
+                chunkDone = true;
               }
-              chunkDone = true;
             }
           }
         } catch (err) {}
@@ -498,8 +510,8 @@ async function reconcileDatabaseInBackground() {
           headers: { 'Content-Type': 'application/json' },
         });
         if (res && res.ok && res.status >= 200 && res.status < 300) {
-          const ct = res.headers ? res.headers.get('content-type') || '' : '';
-          if (ct.includes('application/json')) {
+          const ct = (res.headers ? res.headers.get('content-type') || '' : '').toLowerCase();
+          if (!ct.includes('text/html')) {
             const json = await res.json().catch(() => null);
             if (json && json.success) {
               serverData = json;

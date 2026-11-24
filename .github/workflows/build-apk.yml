@@ -45,7 +45,9 @@ jobs:
           npm install @tailwindcss/oxide-linux-x64-gnu --no-save || true
 
       - name: Build Web Project
-        run: npx vite build
+        run: |
+          node scripts/bundle_initial_snapshot.cjs
+          npx vite build
 
       - name: Re-apply Android Project Configuration
         run: |
@@ -55,6 +57,7 @@ jobs:
           cp android/variables.gradle /tmp/variables.gradle.bak || true
           cp android/gradle.properties /tmp/gradle.properties.bak || true
           cp android/app/src/main/AndroidManifest.xml /tmp/AndroidManifest.xml.bak || true
+          cp android/app/src/main/res/xml/network_security_config.xml /tmp/network_security_config.xml.bak || true
           cp android/capacitor-cordova-android-plugins/build.gradle /tmp/cordova.build.gradle.bak || true
           cp android/gradle/wrapper/gradle-wrapper.jar /tmp/gradle-wrapper.jar.bak || true
           cp android/gradle/wrapper/gradle-wrapper.properties /tmp/gradle-wrapper.properties.bak || true
@@ -67,6 +70,8 @@ jobs:
           cp /tmp/variables.gradle.bak android/variables.gradle || true
           cp /tmp/gradle.properties.bak android/gradle.properties || true
           cp /tmp/AndroidManifest.xml.bak android/app/src/main/AndroidManifest.xml || true
+          mkdir -p android/app/src/main/res/xml
+          cp /tmp/network_security_config.xml.bak android/app/src/main/res/xml/network_security_config.xml || true
           cp /tmp/cordova.build.gradle.bak android/capacitor-cordova-android-plugins/build.gradle || true
           cp /tmp/gradle-wrapper.jar.bak android/gradle/wrapper/gradle-wrapper.jar || true
           cp /tmp/gradle-wrapper.properties.bak android/gradle/wrapper/gradle-wrapper.properties || true

@@ -130,12 +130,15 @@ export async function getActionsFromIndexedDb(): Promise<PendingAction[]> {
 
 // Helper: Generate candidate metadata payload for Service Worker
 function getMetaPayloadForSw() {
+  const isNative = isNativeOrApkEnvironment();
   const origins: string[] = [];
-  if (typeof window !== 'undefined' && window.location?.origin && window.location.origin !== 'null') {
-    origins.push(window.location.origin);
-  }
   const custom = getCustomServerUrl();
-  if (custom && !origins.includes(custom)) origins.push(custom);
+  if (custom && !custom.includes('localhost') && !custom.includes('127.0.0.1') && !origins.includes(custom)) {
+    origins.push(custom);
+  }
+  if (!isNative && typeof window !== 'undefined' && window.location?.origin && window.location.origin !== 'null') {
+    if (!origins.includes(window.location.origin)) origins.push(window.location.origin);
+  }
   for (const s of CANDIDATE_SERVERS) {
     if (s && !origins.includes(s)) origins.push(s);
   }
@@ -520,7 +523,7 @@ export function syncToNativeAndroid(queue: PendingAction[]) {
   if (typeof window === 'undefined') return;
   try {
     const jsonStr = JSON.stringify(queue);
-    const serverUrl = getApiBaseUrl() || window.location.origin;
+    const serverUrl = getApiBaseUrl() || (isNativeOrApkEnvironment() ? CANDIDATE_SERVERS[0] : window.location.origin);
 
     // 1. Direct Native JavascriptInterface Bridge
     const bridge =
@@ -941,8 +944,11 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
     if (!res || !res.ok || res.status < 200 || res.status >= 300) {
       return false;
     }
-    const ct = res.headers?.get('content-type') || '';
-    if (ct.includes('text/html') || !ct.includes('application/json')) {
+    if (res.url && res.url.includes('accounts.google.com')) {
+      return false;
+    }
+    const ct = (res.headers?.get('content-type') || '').toLowerCase();
+    if (ct.includes('text/html')) {
       return false;
     }
     const data = await res.json().catch(() => null);
@@ -1018,9 +1024,12 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
         );
 
         if (response && response.ok && response.status >= 200 && response.status < 300) {
-          const ct = response.headers?.get('content-type') || '';
-          if (ct.includes('application/json') && !ct.includes('text/html')) {
-            const data = await response.json().catch(() => ({}));
+          if (response.url && response.url.includes('accounts.google.com')) {
+            continue;
+          }
+          const ct = (response.headers?.get('content-type') || '').toLowerCase();
+          if (!ct.includes('text/html')) {
+            const data = await response.json().catch(() => null);
             if (data && Array.isArray(data.processedIds)) {
               processedIdsFromBatch.push(...data.processedIds);
             } else if (data && data.success) {

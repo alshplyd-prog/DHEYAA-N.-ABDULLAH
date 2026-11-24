@@ -55,8 +55,8 @@ public class ForegroundSyncService extends Service {
 
     private static final String[] CANDIDATE_SYNC_URLS = {
         "http://72.62.158.128:3000/api/sync/batch",
-        "https://ais-dev-5x4c6bq6p4ul7njqnkzon5-947254878994.europe-west2.run.app/api/sync/batch",
-        "https://ais-pre-5x4c6bq6p4ul7njqnkzon5-947254878994.europe-west2.run.app/api/sync/batch"
+        "http://72.62.158.128/api/sync/batch",
+        "https://ais-pre-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app/api/sync/batch"
     };
 
     private static WeakReference<WebView> activeActivityWebView = null;
@@ -584,12 +584,20 @@ public class ForegroundSyncService extends Service {
 
             Log.i(TAG, "Native sync found " + pendingItems.length() + " total pending actions. Uploading in chunks...");
 
-            // Read custom server URL if configured
+            // Read custom server URL if configured, ignoring stale local or AI Studio temporary URLs
             SharedPreferences prefs = context.getSharedPreferences(PREFS_ALKARRAR, Context.MODE_PRIVATE);
             String customServerUrl = prefs.getString(KEY_SERVER_URL, null);
             if (customServerUrl == null) {
                 SharedPreferences capPrefs = context.getSharedPreferences(PREFS_CAPACITOR_STORAGE, Context.MODE_PRIVATE);
                 customServerUrl = capPrefs.getString(KEY_SERVER_URL, null);
+            }
+            if (customServerUrl != null) {
+                String lowerCustom = customServerUrl.toLowerCase();
+                if (lowerCustom.contains("localhost") || lowerCustom.contains("127.0.0.1") ||
+                    lowerCustom.contains("ais-dev-") || lowerCustom.contains("ais-pre-") ||
+                    lowerCustom.contains("5x4c6bq6p4ul7njqnkzon5")) {
+                    customServerUrl = null;
+                }
             }
 
             java.util.List<String> targetUrls = new java.util.ArrayList<>();
@@ -636,7 +644,7 @@ public class ForegroundSyncService extends Service {
 
                         int code = conn.getResponseCode();
                         String contentType = conn.getContentType();
-                        if (code >= 200 && code < 300 && contentType != null && contentType.contains("application/json")) {
+                        if (code >= 200 && code < 300 && (contentType == null || !contentType.toLowerCase().contains("text/html"))) {
                             java.io.InputStream is = conn.getInputStream();
                             java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
                             byte[] buf = new byte[1024];
@@ -688,7 +696,7 @@ public class ForegroundSyncService extends Service {
                 }
 
                 if (unverifiedInChunk.length() > 0) {
-                    String primaryBaseUrl = targetUrls.size() > 0 ? targetUrls.get(0).replaceAll("/api/sync/batch.*", "") : "https://ais-pre-5x4c6bq6p4ul7njqnkzon5-947254878994.europe-west2.run.app";
+                    String primaryBaseUrl = targetUrls.size() > 0 ? targetUrls.get(0).replaceAll("/api/sync/batch.*", "") : "http://72.62.158.128:3000";
                     for (int i = 0; i < unverifiedInChunk.length(); i++) {
                         JSONObject item = unverifiedInChunk.optJSONObject(i);
                         if (item == null) continue;
@@ -699,18 +707,30 @@ public class ForegroundSyncService extends Service {
 
                         String docId = payload.optString("id", actionId);
                         String table = null;
-                        boolean isDelete = actionType.startsWith("DELETE_");
+                        boolean isDelete = actionType.startsWith("DELETE_") || actionType.startsWith("RESOLVE_") || actionType.startsWith("REJECT_");
 
                         if (actionType.contains("CONTRACT")) {
                             table = "contracts";
-                        } else if (actionType.contains("PAYMENT")) {
+                        } else if (actionType.contains("PAYMENT") && !actionType.contains("CONFLICT")) {
                             table = "payments";
                         } else if (actionType.contains("INVENTORY")) {
                             table = "inventory";
                         } else if (actionType.contains("REP")) {
                             table = "reps";
+                        } else if (actionType.contains("FUND_TX") || actionType.contains("FUND_TRANSACTION")) {
+                            table = "fund-transactions";
                         } else if (actionType.contains("FUND")) {
                             table = "funds";
+                        } else if (actionType.contains("CUSTOMER_LIST")) {
+                            table = "customer-lists";
+                        } else if (actionType.contains("EMPLOYEE_TX") || actionType.contains("EMPLOYEE_TRANSACTION")) {
+                            table = "employee-transactions";
+                        } else if (actionType.contains("EMPLOYEE")) {
+                            table = "employees";
+                        } else if (actionType.contains("CONFLICT")) {
+                            table = "payment-conflicts";
+                        } else if (actionType.contains("APPOINTMENT")) {
+                            table = "appointments";
                         }
 
                         if (table != null) {

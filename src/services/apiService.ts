@@ -8,7 +8,7 @@ import { getApiBaseUrl, isNativeOrApkEnvironment } from '../lib/apiConfig';
 /**
  * Production VPS backend URL for mobile APK and external environments
  */
-export const CLOUD_API_URL = 'https://ais-pre-5x4c6bq6p4ul7njqnkzon5-947254878994.europe-west2.run.app/api';
+export const CLOUD_API_URL = 'http://72.62.158.128:3000/api';
 
 /**
  * Dynamic API Base URL resolver:
@@ -43,12 +43,13 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
 
   try {
     const response = await fetch(url, {
+      ...options,
       headers: {
         'Content-Type': 'application/json',
+        'Accept': 'application/json',
         ...(options.headers || {}),
       },
       signal: controller.signal,
-      ...options,
     });
 
     const text = await response.text();
@@ -76,11 +77,12 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
       try {
         const fallbackUrl = `${CLOUD_API_URL}/${cleanEndpoint}`;
         const fallbackRes = await fetch(fallbackUrl, {
+          ...options,
           headers: {
             'Content-Type': 'application/json',
+            'Accept': 'application/json',
             ...(options.headers || {}),
           },
-          ...options,
         });
         if (fallbackRes.ok) {
           return fallbackRes.json();

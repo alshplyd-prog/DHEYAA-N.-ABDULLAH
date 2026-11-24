@@ -5,17 +5,32 @@ addEventListener('syncOfflineQueue', async (resolve, reject, args) => {
   try {
     console.log('[BackgroundRunner] Woke up to check and sync offlineQueue...');
     
-    // 1. Read stored server config or use candidate cloud servers
+    // 1. Read stored server config or use candidate servers (production VPS first)
     let candidateServers = [
-      'https://ais-pre-5x4c6bq6p4ul7njqnkzon5-947254878994.europe-west2.run.app',
-      'https://ais-dev-5x4c6bq6p4ul7njqnkzon5-947254878994.europe-west2.run.app',
-      'http://72.62.158.128:3000'
+      'http://72.62.158.128:3000',
+      'http://72.62.158.128',
+      'https://ais-pre-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app'
     ];
     if (typeof CapacitorKV !== 'undefined') {
       try {
-        const custom = await CapacitorKV.get('alkarrar_custom_server_url');
-        if (custom && typeof custom === 'string' && (custom.startsWith('http://') || custom.startsWith('https://'))) {
-          candidateServers.unshift(custom.replace(/\/+$/, ''));
+        const storedKeys = ['alkarrar_custom_server_url', 'alkarrar_backend_server_url'];
+        for (const k of storedKeys) {
+          const custom = await CapacitorKV.get(k);
+          if (
+            custom &&
+            typeof custom === 'string' &&
+            (custom.startsWith('http://') || custom.startsWith('https://')) &&
+            !custom.includes('localhost') &&
+            !custom.includes('127.0.0.1') &&
+            !custom.includes('ais-dev-') &&
+            !custom.includes('ais-pre-') &&
+            !custom.includes('5x4c6bq6p4ul7njqnkzon5')
+          ) {
+            const cleanCustom = custom.replace(/\/+$/, '');
+            if (!candidateServers.includes(cleanCustom)) {
+              candidateServers.unshift(cleanCustom);
+            }
+          }
         }
       } catch (e) {}
     }
@@ -56,8 +71,11 @@ addEventListener('syncOfflineQueue', async (resolve, reject, args) => {
           body: JSON.stringify({ actions: pendingActions, timestamp: Date.now() }),
         });
         if (batchResp && batchResp.ok) {
+          const ct = (batchResp.headers && typeof batchResp.headers.get === 'function' ? batchResp.headers.get('content-type') || '' : '').toLowerCase();
+          if (ct.includes('text/html')) continue;
+          const batchJson = await batchResp.json().catch(() => null);
+          if (!batchJson) continue;
           activeWorkingServer = sUrl;
-          const batchJson = await batchResp.json().catch(() => ({}));
           if (Array.isArray(batchJson.processedIds)) {
             processedIds.push(...batchJson.processedIds);
           } else if (batchJson.success) {
