@@ -10,7 +10,7 @@ let database = process.env.DB_NAME || process.env.SQL_DB_NAME || "";
 let user = process.env.DB_USER || process.env.SQL_ADMIN_USER || process.env.SQL_USER || "";
 let password = process.env.DB_PASSWORD || process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD || "";
 
-if ((!database || !user) && process.env.DATABASE_URL) {
+if ((!database || !user || !password) && process.env.DATABASE_URL) {
   try {
     const parsed = new URL(process.env.DATABASE_URL);
     host = parsed.hostname || host;

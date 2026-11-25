@@ -3,7 +3,7 @@ import path from 'path';
 import { createPool } from './index.ts';
 
 export async function initializeDatabaseSchema() {
-  if (!process.env.DATABASE_URL && !process.env.DB_HOST && (!process.env.SQL_HOST || !process.env.SQL_DB_NAME)) {
+  if (!process.env.DATABASE_URL && !process.env.DB_HOST && !process.env.DB_NAME && (!process.env.SQL_HOST || !process.env.SQL_DB_NAME)) {
     console.log('PostgreSQL connection details not provided, skipping schema initialization.');
     return;
   }
