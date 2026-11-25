@@ -24,7 +24,8 @@ addEventListener('syncOfflineQueue', async (resolve, reject, args) => {
             !custom.includes('127.0.0.1') &&
             !custom.includes('ais-dev-') &&
             !custom.includes('ais-pre-') &&
-            !custom.includes('5x4c6bq6p4ul7njqnkzon5')
+            !custom.includes('5x4c6bq6p4ul7njqnkzon5') &&
+            !custom.includes('asc5xuvnur4hlmpl5rfxpz')
           ) {
             const cleanCustom = custom.replace(/\/+$/, '');
             if (!candidateServers.includes(cleanCustom)) {

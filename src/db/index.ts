@@ -1,11 +1,42 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
+import os from 'os';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
 import * as schema from './schema.ts';
 
 declare global {
   var _postgresPool: Pool | undefined;
+  var _preferLocalhostPg: boolean | undefined;
+}
+
+function isHostAddressLocal(hostname: string): boolean {
+  const clean = (hostname || '').trim().toLowerCase();
+  if (!clean) return false;
+  if (clean === '127.0.0.1' || clean === 'localhost' || clean === '::1') return true;
+  try {
+    const nets = os.networkInterfaces();
+    for (const ifaceList of Object.values(nets)) {
+      if (!ifaceList) continue;
+      for (const iface of ifaceList) {
+        if (iface.address && iface.address.toLowerCase() === clean) {
+          return true;
+        }
+      }
+    }
+  } catch (e) {}
+  return false;
+}
+
+function rewriteDbUrlToLocalhost(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    u.hostname = '127.0.0.1';
+    u.searchParams.delete('sslmode');
+    return u.toString();
+  } catch {
+    return rawUrl.replace(/@[^:/?#]+/, '@127.0.0.1');
+  }
 }
 
 export const resetPool = () => {
@@ -17,29 +48,67 @@ export const resetPool = () => {
   }
 };
 
-export const createPool = () => {
+export const createPool = (forceLocalhost = false): Pool | null => {
+  if (forceLocalhost) {
+    global._preferLocalhostPg = true;
+  }
   if (global._postgresPool) {
     return global._postgresPool;
   }
 
-  // Primary configuration: prefer explicit DB_HOST credentials if available
+  const shouldUseLocalhost = Boolean(forceLocalhost || global._preferLocalhostPg);
+
   let dbUrl = '';
-  if (process.env.DB_HOST && process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
-    dbUrl = `postgresql://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASSWORD)}@${process.env.DB_HOST}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME}`;
-  } else if (process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('supabase.co') && !process.env.DATABASE_URL.includes('[YOUR-PASSWORD]') && !process.env.DATABASE_URL.includes('YOUR-PASSWORD')) {
+  if (process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
+    const rawHost = process.env.DB_HOST || '127.0.0.1';
+    const targetHost = shouldUseLocalhost || isHostAddressLocal(rawHost) ? '127.0.0.1' : rawHost;
+    dbUrl = `postgresql://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASSWORD)}@${targetHost}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME}`;
+  } else if (process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_DB_NAME) {
+    const targetHost = shouldUseLocalhost || isHostAddressLocal(process.env.SQL_HOST) ? '127.0.0.1' : process.env.SQL_HOST;
+    dbUrl = `postgresql://${encodeURIComponent(process.env.SQL_USER)}:${encodeURIComponent(process.env.SQL_PASSWORD || '')}@${targetHost}:${process.env.SQL_PORT || 5432}/${process.env.SQL_DB_NAME}`;
+  } else if (
+    process.env.DATABASE_URL &&
+    !process.env.DATABASE_URL.includes('supabase.co') &&
+    !process.env.DATABASE_URL.includes('[PASSWORD]') &&
+    !process.env.DATABASE_URL.includes('[YOUR-PASSWORD]') &&
+    !process.env.DATABASE_URL.includes('YOUR-PASSWORD')
+  ) {
     dbUrl = process.env.DATABASE_URL;
+    try {
+      const parsed = new URL(dbUrl);
+      if (shouldUseLocalhost || isHostAddressLocal(parsed.hostname)) {
+        dbUrl = rewriteDbUrlToLocalhost(dbUrl);
+      }
+    } catch (e) {}
   } else {
-    // Direct production Hostinger PostgreSQL database
-    dbUrl = 'postgresql://app_user:vOY9)hN0)5egF3cL@72.62.158.128:5432/app_database';
+    return null;
+  }
+
+  let isLocalTarget = false;
+  try {
+    const parsed = new URL(dbUrl);
+    isLocalTarget = isHostAddressLocal(parsed.hostname);
+  } catch (e) {}
+
+  const useSsl = !isLocalTarget && process.env.DB_SSL === 'true';
+
+  if (!useSsl) {
+    try {
+      const parsed = new URL(dbUrl);
+      if (parsed.searchParams.has('sslmode')) {
+        parsed.searchParams.delete('sslmode');
+        dbUrl = parsed.toString();
+      }
+    } catch (e) {}
   }
 
   const newPool = new Pool({
     connectionString: dbUrl,
-    ssl: { rejectUnauthorized: false },
+    ssl: useSsl ? { rejectUnauthorized: false } : false,
     max: 10,
     idleTimeoutMillis: 10000,
-    connectionTimeoutMillis: 2500,
-    statement_timeout: 10000,
+    connectionTimeoutMillis: 3000,
+    statement_timeout: 15000,
     keepAlive: true,
     keepAliveInitialDelayMillis: 5000,
   });
@@ -55,4 +124,4 @@ export const createPool = () => {
 };
 
 const pool = createPool();
-export const db = drizzle(pool, { schema });
+export const db = pool ? drizzle(pool, { schema }) : (undefined as any);

@@ -20,6 +20,8 @@ function isAiStudioTempOrDeadUrl(url: string): boolean {
   const lower = url.toLowerCase();
   return (
     lower.includes('5x4c6bq6p4ul7njqnkzon5') ||
+    lower.includes('asc5xuvnur4hlmpl5rfxpz') ||
+    lower.includes('alkarar.baghdad.dev') ||
     lower.includes('ais-dev-') ||
     lower.includes('ais-pre-')
   );
@@ -41,8 +43,8 @@ export function getCustomServerUrl(): string {
     const custom = localStorage.getItem(SERVER_URL_STORAGE_KEY);
     if (custom && (custom.startsWith('http://') || custom.startsWith('https://'))) {
       const clean = custom.trim().replace(/\/+$/, '');
-      if (isAiStudioTempOrDeadUrl(clean)) {
-        // Auto-clear previously cached temporary AI Studio preview/dev URLs so APK reconnects to production server
+      if (isAiStudioTempOrDeadUrl(clean) || clean !== HOSTINGER_DEFAULT_SERVER) {
+        // Auto-clear stale/manual overrides so the exact Hostinger link is always used automatically
         localStorage.removeItem(SERVER_URL_STORAGE_KEY);
         return '';
       }
@@ -53,23 +55,19 @@ export function getCustomServerUrl(): string {
 }
 
 export function getHostingerServerUrl(): string {
-  const custom = getCustomServerUrl();
-  if (custom) return custom;
+  // Always return the exact configured Hostinger server automatically
+  getCustomServerUrl();
   return HOSTINGER_DEFAULT_SERVER;
 }
 
-export function setCustomServerUrl(url: string) {
+export function setCustomServerUrl(_url: string) {
   try {
-    if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
-      localStorage.setItem(SERVER_URL_STORAGE_KEY, url.trim().replace(/\/+$/, ''));
-    } else {
-      localStorage.removeItem(SERVER_URL_STORAGE_KEY);
-    }
+    localStorage.setItem(SERVER_URL_STORAGE_KEY, HOSTINGER_DEFAULT_SERVER);
   } catch (e) {}
 }
 
-export function setHostingerServerUrl(url: string) {
-  setCustomServerUrl(url);
+export function setHostingerServerUrl(_url: string) {
+  setCustomServerUrl(HOSTINGER_DEFAULT_SERVER);
 }
 
 let activeWorkingServer = '';
@@ -77,7 +75,7 @@ let activeWorkingServer = '';
 export function setActiveWorkingServer(url: string) {
   if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
     const clean = url.trim().replace(/\/+$/, '');
-    if (isLocalhostUrl(clean) || clean.includes('ais-dev-') || clean.includes('5x4c6bq6p4ul7njqnkzon5')) {
+    if (isLocalhostUrl(clean) || clean.includes('ais-dev-') || clean.includes('5x4c6bq6p4ul7njqnkzon5') || clean.includes('asc5xuvnur4hlmpl5rfxpz') || clean.includes('alkarar.baghdad.dev')) {
       return;
     }
     activeWorkingServer = clean;
@@ -207,20 +205,20 @@ export async function fetchWithFallback(
       }
     }
 
-    // 2. Add configured URL and candidate servers
+    // 2. Add configured URL and candidate servers (skip raw http:// when browser is on https:// to avoid Mixed Content)
+    const isHttpsPage = typeof window !== 'undefined' && window.location?.protocol === 'https:';
+    const addWebCandidate = (candidate: string) => {
+      if (!candidate) return;
+      if (isHttpsPage && candidate.startsWith('http://')) return;
+      if (!urlsToTry.includes(candidate)) urlsToTry.push(candidate);
+    };
     if (activeWorkingServer) {
-      const activeUrl = `${activeWorkingServer}${cleanEndpoint}`;
-      if (!urlsToTry.includes(activeUrl)) urlsToTry.push(activeUrl);
+      addWebCandidate(`${activeWorkingServer}${cleanEndpoint}`);
     }
     const primaryUrl = getFullApiUrl(cleanEndpoint);
-    if (!urlsToTry.includes(primaryUrl)) {
-      urlsToTry.push(primaryUrl);
-    }
+    addWebCandidate(primaryUrl);
     for (const server of CANDIDATE_SERVERS) {
-      const candidateUrl = `${server}${cleanEndpoint}`;
-      if (!urlsToTry.includes(candidateUrl)) {
-        urlsToTry.push(candidateUrl);
-      }
+      addWebCandidate(`${server}${cleanEndpoint}`);
     }
   }
 
@@ -260,6 +258,12 @@ export async function fetchWithFallback(
         }
         return res;
       }
+      if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404 || res.status === 409 || res.status === 422) {
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
+        if (!contentType.includes('text/html') && !(res.url && res.url.includes('accounts.google.com'))) {
+          return res;
+        }
+      }
     } catch (err: any) {
       lastError = err;
     }
@@ -294,7 +298,7 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
 
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 7000);
+    const timer = setTimeout(() => controller.abort(), 10500);
     const res = await fetch(targetUrl, {
       signal: controller.signal,
       headers: { 'Accept': 'application/json' }
@@ -332,7 +336,7 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
           status: 'local-only',
           database: 'filedb',
           latencyMs,
-          error: 'الموقع يعمل حالياً بالذاكرة المحلية فقط لأن السيرفر الرئيسي (72.62.158.128:3000) غير متصل',
+          error: 'الموقع يعمل حالياً بالذاكرة المحلية فقط لأن السيرفر الرئيسي غير متصل',
         };
       }
       return {

@@ -56,7 +56,11 @@ export async function probePgConnection(): Promise<boolean> {
 
   activeProbePromise = (async () => {
     try {
-      const currentPool = createPool();
+      const currentPool = createPool(false);
+      if (!currentPool) {
+        pgReachable = false;
+        return false;
+      }
       await Promise.race([
         currentPool.query('SELECT 1'),
         new Promise((_, reject) => setTimeout(() => reject(new Error('PG probe timeout')), 2500)),
@@ -64,10 +68,24 @@ export async function probePgConnection(): Promise<boolean> {
       pgReachable = true;
       return true;
     } catch (err: any) {
+      resetPool();
+      // If configured with a public IP while running on the same server, retry locally via 127.0.0.1 (DB_SSL=false)
+      try {
+        const localPool = createPool(true);
+        if (localPool) {
+          await Promise.race([
+            localPool.query('SELECT 1'),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('PG local probe timeout')), 1500)),
+          ]);
+          pgReachable = true;
+          return true;
+        }
+      } catch (_localErr) {
+        resetPool();
+      }
       pgReachable = false;
       lastPgFailureAt = Date.now();
       lastFailureCooldownMs = isAuthOrAclError(err) ? PG_AUTH_RETRY_COOLDOWN_MS : PG_RETRY_COOLDOWN_MS;
-      resetPool();
       return false;
     } finally {
       activeProbePromise = null;
@@ -112,6 +130,9 @@ export async function executePgStrict(sql: string, params: any[] = []): Promise<
   await pgSemaphore.acquire();
   try {
     const currentPool = createPool();
+    if (!currentPool) {
+      throw new Error('PostgreSQL unavailable - using local fileDb');
+    }
     const res = await currentPool.query(sql, params);
     pgReachable = true;
     return res.rows || [];
@@ -135,6 +156,9 @@ export async function executePg(sql: string, params: any[] = []): Promise<any[]>
   await pgSemaphore.acquire();
   try {
     const currentPool = createPool();
+    if (!currentPool) {
+      return [];
+    }
     const res = await currentPool.query(sql, params);
     pgReachable = true;
     return res.rows || [];

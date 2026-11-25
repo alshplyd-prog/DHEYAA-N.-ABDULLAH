@@ -595,7 +595,8 @@ public class ForegroundSyncService extends Service {
                 String lowerCustom = customServerUrl.toLowerCase();
                 if (lowerCustom.contains("localhost") || lowerCustom.contains("127.0.0.1") ||
                     lowerCustom.contains("ais-dev-") || lowerCustom.contains("ais-pre-") ||
-                    lowerCustom.contains("5x4c6bq6p4ul7njqnkzon5")) {
+                    lowerCustom.contains("5x4c6bq6p4ul7njqnkzon5") ||
+                    lowerCustom.contains("asc5xuvnur4hlmpl5rfxpz")) {
                     customServerUrl = null;
                 }
             }

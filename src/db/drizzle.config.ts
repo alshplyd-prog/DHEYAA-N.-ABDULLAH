@@ -2,26 +2,40 @@ import { defineConfig } from "drizzle-kit";
 import * as dotenv from "dotenv";
 
 // Load environment variables from .env file.
-dotenv.config();
+dotenv.config({ override: true });
 
-const sqlHost = process.env.SQL_HOST;
-const sqlDbName = process.env.SQL_DB_NAME;
-const user = process.env.SQL_ADMIN_USER;
-const password = process.env.SQL_ADMIN_PASSWORD;
+let host = process.env.DB_HOST || process.env.SQL_HOST || "127.0.0.1";
+let port = Number(process.env.DB_PORT || process.env.SQL_PORT || 5432);
+let database = process.env.DB_NAME || process.env.SQL_DB_NAME || "";
+let user = process.env.DB_USER || process.env.SQL_ADMIN_USER || process.env.SQL_USER || "";
+let password = process.env.DB_PASSWORD || process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD || "";
 
-if (!sqlHost) {
-  throw new Error("SQL_HOST must be set in environment variables.");
+if ((!database || !user) && process.env.DATABASE_URL) {
+  try {
+    const parsed = new URL(process.env.DATABASE_URL);
+    host = parsed.hostname || host;
+    port = Number(parsed.port || port);
+    database = parsed.pathname.replace(/^\/+/, "") || database;
+    user = decodeURIComponent(parsed.username || "") || user;
+    password = decodeURIComponent(parsed.password || "") || password;
+  } catch (e) {}
 }
-if (!sqlDbName) {
-  throw new Error("SQL_DB_NAME must be set in environment variables.");
+
+if (!host) {
+  throw new Error("DB_HOST or SQL_HOST must be set in environment variables.");
+}
+if (!database) {
+  throw new Error("DB_NAME or SQL_DB_NAME must be set in environment variables.");
 }
 if (!user) {
-  throw new Error("SQL_ADMIN_USER must be set in environment variables.");
+  throw new Error("DB_USER or SQL_ADMIN_USER must be set in environment variables.");
 }
 if (!password) {
-  throw new Error("SQL_ADMIN_PASSWORD must be set in environment variables.");
+  throw new Error("DB_PASSWORD or SQL_ADMIN_PASSWORD must be set in environment variables.");
 }
-console.log(`Using user: ${user} to connect to database.`);
+
+const isLocal = host === "127.0.0.1" || host === "localhost" || host === "::1";
+const useSsl = !isLocal && process.env.DB_SSL === "true";
 
 export default defineConfig({
   schema: "./src/db/schema.ts",
@@ -29,11 +43,12 @@ export default defineConfig({
   dialect: "postgresql",
   schemaFilter: ["public"],
   dbCredentials: {
-    host: sqlHost,
-    user: user,
-    password: password,
-    database: sqlDbName,
-    ssl: { rejectUnauthorized: false },
+    host,
+    port,
+    user,
+    password,
+    database,
+    ssl: useSsl ? { rejectUnauthorized: false } : false,
   },
   verbose: true,
 });

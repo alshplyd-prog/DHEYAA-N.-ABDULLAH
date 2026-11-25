@@ -126,7 +126,8 @@ async function getCandidateServerOrigins() {
       low === 'https://localhost' ||
       low === 'capacitor://localhost' ||
       low.includes('ais-dev-') ||
-      low.includes('5x4c6bq6p4ul7njqnkzon5')
+      low.includes('5x4c6bq6p4ul7njqnkzon5') ||
+      low.includes('asc5xuvnur4hlmpl5rfxpz')
     );
   };
 

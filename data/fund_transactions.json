@@ -10896,7 +10896,8 @@
     "amount": 5000,
     "note": "تسديد قسط زبون: أحمد محمد عبد الله",
     "repName": "ضياء المحاسب",
-    "createdAt": "2026-11-23T08:17:55.530Z"
+    "createdAt": "2026-11-23T00:00:00.000Z",
+    "targetFundId": null
   },
   {
     "id": "ft_pay_pay_257450b0-0094-475a-89d0-b9b998ec129f",
@@ -10905,7 +10906,8 @@
     "amount": 5000,
     "note": "تسديد قسط زبون: أحمد محمد عبد الله",
     "repName": "ضياء المحاسب",
-    "createdAt": "2026-11-24T18:15:23.990Z"
+    "createdAt": "2026-11-24T00:00:00.000Z",
+    "targetFundId": null
   },
   {
     "id": "ft_pay_pay_e14ce17a-6c91-4151-b18f-c9d7025ad57c",
@@ -10914,6 +10916,17 @@
     "amount": 5000,
     "note": "تسديد قسط زبون: أحمد محمد عبد الله",
     "repName": "ضياء المحاسب",
-    "createdAt": "2026-11-24T19:05:20.388Z"
+    "createdAt": "2026-11-24T00:00:00.000Z",
+    "targetFundId": null
+  },
+  {
+    "id": "ft_pay_pay_9d86e30f-7640-4ce7-8960-45850c5a6e06",
+    "fundId": "fund-4",
+    "type": "installment",
+    "amount": 5000,
+    "note": "تسديد قسط زبون: أحمد محمد عبد الله",
+    "repName": "ضياء المحاسب",
+    "createdAt": "2026-11-25T00:00:00.000Z",
+    "targetFundId": null
   }
 ]

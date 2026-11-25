@@ -10,6 +10,7 @@ export async function initializeDatabaseSchema() {
 
   try {
     const pool = createPool();
+    if (!pool) return;
     const client = await pool.connect();
     try {
       await client.query(`

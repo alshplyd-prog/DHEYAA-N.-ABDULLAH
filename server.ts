@@ -23,9 +23,75 @@ export function bumpSyncVersion() {
   } catch (e) {}
 }
 import fs from "fs";
+import os from "os";
+import net from "net";
 import webpush from "web-push";
 
-const UPSTREAM_SERVER_URL = (process.env.UPSTREAM_SERVER_URL ?? "http://72.62.158.128:3000").trim().replace(/\/+$/, "");
+const SERVER_INSTANCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+function resolveUpstreamServerUrl(): string {
+  const raw = (process.env.UPSTREAM_SERVER_URL ?? "").trim().replace(/\/+$/, "");
+  const lower = raw.toLowerCase();
+  if (
+    !raw ||
+    lower.includes("alkarar.baghdad.dev") ||
+    lower.includes("5x4c6bq6p4ul7njqnkzon5") ||
+    lower.includes("asc5xuvnur4hlmpl5rfxpz") ||
+    lower.includes("ais-dev-")
+  ) {
+    return "http://72.62.158.128:3000";
+  }
+  return raw;
+}
+
+const UPSTREAM_SERVER_URL = resolveUpstreamServerUrl();
+
+function isRunningOnUpstreamHost(): boolean {
+  if (!UPSTREAM_SERVER_URL) return false;
+  try {
+    const parsed = new URL(UPSTREAM_SERVER_URL);
+    const upHost = parsed.hostname.toLowerCase();
+    const upPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    const localPort = String(process.env.PORT || 3000);
+    if (upPort !== localPort) return false;
+    if (upHost === "localhost" || upHost === "127.0.0.1") return true;
+    const nets = os.networkInterfaces();
+    for (const ifaceList of Object.values(nets)) {
+      if (!ifaceList) continue;
+      for (const iface of ifaceList) {
+        if (iface.address && iface.address.toLowerCase() === upHost) {
+          return true;
+        }
+      }
+    }
+  } catch (e) {}
+  return false;
+}
+
+function testTcpPort(host: string, port: number, timeoutMs = 1200): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch (e) {}
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+    try {
+      socket.connect(port, host);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
 let lastUpstreamCheckAt = 0;
 let lastUpstreamSyncVersion: string | number | null = null;
 let upstreamConnected = false;
@@ -92,6 +158,7 @@ let isFlushingUpstreamOutbox = false;
 
 function isRequestMatchingUpstream(req: express.Request): boolean {
   if (req.headers["x-alkarrar-forwarded"] === "1") return true;
+  if (req.headers["x-alkarrar-origin-id"] === SERVER_INSTANCE_ID) return true;
   try {
     const upHost = new URL(UPSTREAM_SERVER_URL).hostname;
     const reqHost = req.hostname || "";
@@ -101,7 +168,7 @@ function isRequestMatchingUpstream(req: express.Request): boolean {
 }
 
 async function sendMutationToUpstream(item: { method: string; url: string; body?: any }): Promise<boolean> {
-  if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true") return false;
+  if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost()) return false;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3500);
   try {
@@ -114,6 +181,7 @@ async function sendMutationToUpstream(item: { method: string; url: string; body?
         "Content-Type": "application/json",
         "Accept": "application/json",
         "x-alkarrar-forwarded": "1",
+        "x-alkarrar-origin-id": SERVER_INSTANCE_ID,
       },
       body: hasBody ? JSON.stringify(item.body) : undefined,
     });
@@ -129,7 +197,7 @@ async function sendMutationToUpstream(item: { method: string; url: string; body?
 }
 
 async function flushUpstreamOutbox(): Promise<number> {
-  if (isPgConfigured() || !UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true") return 0;
+  if (isPgConfigured() || !UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost()) return 0;
   if (isFlushingUpstreamOutbox) return 0;
   isFlushingUpstreamOutbox = true;
   let flushed = 0;
@@ -163,7 +231,7 @@ async function flushUpstreamOutbox(): Promise<number> {
 }
 
 function enqueueAndForwardUpstreamMutation(method: string, url: string, body?: any) {
-  if (isPgConfigured() || !UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true") return;
+  if (isPgConfigured() || !UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost()) return;
   try {
     const outbox = fileDb.get<any>(UPSTREAM_OUTBOX_KEY) || [];
     outbox.push({
@@ -179,7 +247,7 @@ function enqueueAndForwardUpstreamMutation(method: string, url: string, body?: a
 }
 
 async function syncFromUpstreamServer(force = false): Promise<boolean> {
-  if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true") return false;
+  if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost()) return false;
   if (isPgConfigured()) return false;
 
   const currentContracts = fileDb.get<any>("contracts") || [];
@@ -1525,10 +1593,16 @@ async function startServer() {
     let deletedCount = 0;
     try {
       if (isPgConfigured()) {
-        const dRes = await executePg("SELECT COUNT(*) as count FROM deleted_records").catch(() => []);
+        const dRes = await Promise.race([
+          executePg("SELECT COUNT(*) as count FROM deleted_records").catch(() => []),
+          new Promise<any[]>((resolve) => setTimeout(() => resolve([]), 2000)),
+        ]);
         if (dRes && dRes[0]?.count) deletedCount = Number(dRes[0].count);
       } else {
-        await syncFromUpstreamServer(false).catch(() => {});
+        await Promise.race([
+          syncFromUpstreamServer(false).catch(() => false),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ]);
       }
     } catch (e) {}
 
@@ -1552,12 +1626,16 @@ async function startServer() {
       ? req.query.url.trim().replace(/\/+$/, "")
       : UPSTREAM_SERVER_URL;
     const start = Date.now();
+    let parsedHost = "";
+    let parsedPort = 80;
     try {
       const parsed = new URL(rawUrl);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
         return res.status(400).json({ ok: false, latencyMs: 0, error: "Invalid protocol" });
       }
       const host = parsed.hostname.toLowerCase();
+      parsedHost = host;
+      parsedPort = parsed.port ? Number(parsed.port) : (parsed.protocol === "https:" ? 443 : 80);
       const isPrivateOrLocal =
         host === "localhost" ||
         host === "127.0.0.1" ||
@@ -1571,7 +1649,7 @@ async function startServer() {
       }
 
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
+      const timer = setTimeout(() => controller.abort(), 7500);
       const upRes = await fetch(`${rawUrl}/api/health`, {
         signal: controller.signal,
         headers: { Accept: "application/json" },
@@ -1612,13 +1690,18 @@ async function startServer() {
       if (rawUrl === UPSTREAM_SERVER_URL) {
         upstreamConnected = false;
       }
+      const tcpOpen = parsedHost ? await testTcpPort(parsedHost, parsedPort, 1200) : false;
+      const errorMsg =
+        err?.name === "AbortError"
+          ? tcpOpen
+            ? `تم الاتصال بالمنفذ ${parsedPort} بنجاح، لكن مسارات API في السيرفر (${rawUrl}) لا ترد (تحقق من عملية Node.js أو قاعدة البيانات على السيرفر)`
+            : `تعذر الوصول إلى السيرفر (${rawUrl}) - تأكد من تشغيل الخادم وفتح المنفذ ${parsedPort}`
+          : err?.message || "تعذر الوصول إلى السيرفر";
       return res.json({
         ok: false,
+        tcpOpen,
         latencyMs,
-        error:
-          err?.name === "AbortError"
-            ? `انتهت مهلة الاتصال بالسيرفر (${rawUrl}) - تحقق أن السيرفر يعمل ومنفذ 3000 مفتوح`
-            : err?.message || "تعذر الوصول إلى السيرفر",
+        error: errorMsg,
       });
     }
   });
