@@ -1,4 +1,4 @@
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, CapacitorHttp } from '@capacitor/core';
 
 /**
  * Centralized API & Server Endpoint Resolver for Web and Android APK
@@ -8,8 +8,6 @@ export const HOSTINGER_DEFAULT_SERVER = 'http://72.62.158.128:3000';
 
 export const CANDIDATE_SERVERS: string[] = [
   'http://72.62.158.128:3000',
-  'http://72.62.158.128',
-  'https://ais-pre-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app',
 ];
 
 const DEFAULT_REMOTE_SERVER = 'http://72.62.158.128:3000';
@@ -159,13 +157,113 @@ export async function isNetworkConnected(): Promise<boolean> {
   return true;
 }
 
+async function executeNativeCapacitorHttp(
+  url: string,
+  options: RequestInit | undefined,
+  timeoutMs: number
+): Promise<Response | null> {
+  if (!CapacitorHttp || typeof CapacitorHttp.request !== 'function') {
+    return null;
+  }
+
+  const method = ((options?.method || 'GET') as string).toUpperCase();
+  const reqHeaders: Record<string, string> = {
+    'Accept': 'application/json, text/plain, */*',
+  };
+
+  if (options?.headers) {
+    if (options.headers instanceof Headers) {
+      options.headers.forEach((v, k) => {
+        reqHeaders[k] = v;
+      });
+    } else if (Array.isArray(options.headers)) {
+      for (const [k, v] of options.headers) {
+        reqHeaders[k] = v;
+      }
+    } else {
+      Object.assign(reqHeaders, options.headers);
+    }
+  }
+
+  let parsedData: any = undefined;
+  if (method !== 'GET' && method !== 'HEAD' && options?.body !== undefined && options?.body !== null) {
+    if (!reqHeaders['Content-Type'] && !reqHeaders['content-type']) {
+      reqHeaders['Content-Type'] = 'application/json';
+    }
+    if (typeof options.body === 'string') {
+      try {
+        parsedData = JSON.parse(options.body);
+      } catch {
+        parsedData = options.body;
+      }
+    } else {
+      parsedData = options.body;
+    }
+  } else {
+    // Avoid sending Content-Type on GET/HEAD requests
+    delete reqHeaders['Content-Type'];
+    delete reqHeaders['content-type'];
+  }
+
+  const nativeRes = await Promise.race([
+    CapacitorHttp.request({
+      url,
+      method,
+      headers: reqHeaders,
+      data: parsedData,
+      connectTimeout: Math.min(timeoutMs, 12000),
+      readTimeout: timeoutMs,
+      responseType: 'text',
+    }),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Native HTTP timeout after ${timeoutMs}ms`)), timeoutMs + 500)
+    ),
+  ]);
+
+  const status = Number(nativeRes?.status) || 0;
+  if (status < 200 || status > 599) {
+    throw new Error(`Invalid native HTTP status: ${status}`);
+  }
+
+  const headerMap = new Headers();
+  if (nativeRes?.headers && typeof nativeRes.headers === 'object') {
+    for (const [k, v] of Object.entries(nativeRes.headers)) {
+      if (k && k !== 'null' && v !== undefined && v !== null) {
+        try {
+          headerMap.set(k, String(v));
+        } catch (e) {}
+      }
+    }
+  }
+
+  const rawBody =
+    nativeRes?.data === undefined || nativeRes?.data === null
+      ? ''
+      : typeof nativeRes.data === 'string'
+        ? nativeRes.data
+        : JSON.stringify(nativeRes.data);
+
+  const syntheticResponse = new Response(status === 204 ? null : rawBody, {
+    status,
+    headers: headerMap,
+  });
+
+  try {
+    Object.defineProperty(syntheticResponse, 'url', {
+      value: nativeRes?.url || url,
+    });
+  } catch (e) {}
+
+  return syntheticResponse;
+}
+
 /**
  * Universal fetch that automatically tries candidate servers and local endpoints with fallback
  */
 export async function fetchWithFallback(
   endpoint: string,
   options?: RequestInit,
-  timeoutMs: number = 6000
+  timeoutMs: number = 12000
 ): Promise<Response> {
   const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
   const isNative = isNativeOrApkEnvironment();
@@ -223,20 +321,71 @@ export async function fetchWithFallback(
   }
 
   let lastError: any = null;
+  const method = ((options?.method || 'GET') as string).toUpperCase();
 
   for (const url of urlsToTry) {
+    const perUrlTimeout = isNative ? Math.max(timeoutMs || 12000, 12000) : (timeoutMs || 8000);
+
+    // On Android/iOS APK, try direct native CapacitorHttp.request first (immune to CORS & Mixed Content & proxy bugs)
+    if (isNative) {
+      try {
+        const nativeRes = await executeNativeCapacitorHttp(url, options, perUrlTimeout);
+        if (nativeRes) {
+          if (nativeRes.ok) {
+            const contentType = (nativeRes.headers.get('content-type') || '').toLowerCase();
+            if (!contentType.includes('text/html') && !(nativeRes.url && nativeRes.url.includes('accounts.google.com'))) {
+              try {
+                setActiveWorkingServer(new URL(url).origin);
+              } catch (e) {}
+              return nativeRes;
+            }
+          } else if (
+            nativeRes.status === 400 ||
+            nativeRes.status === 401 ||
+            nativeRes.status === 403 ||
+            nativeRes.status === 404 ||
+            nativeRes.status === 409 ||
+            nativeRes.status === 422
+          ) {
+            const contentType = (nativeRes.headers.get('content-type') || '').toLowerCase();
+            if (!contentType.includes('text/html')) {
+              return nativeRes;
+            }
+          }
+        }
+      } catch (nativeErr: any) {
+        lastError = nativeErr;
+      }
+    }
+
+    // Fallback (and primary in Web browser): standard fetch
     try {
       const controller = new AbortController();
-      const perUrlTimeout = timeoutMs || (isNative ? 8000 : 5000);
       const timer = setTimeout(() => controller.abort(), perUrlTimeout);
+      const fetchHeaders: Record<string, string> = {
+        'Accept': 'application/json, text/plain, */*',
+      };
+      if (method !== 'GET' && method !== 'HEAD') {
+        fetchHeaders['Content-Type'] = 'application/json';
+      }
+      if (options?.headers) {
+        if (options.headers instanceof Headers) {
+          options.headers.forEach((v, k) => {
+            fetchHeaders[k] = v;
+          });
+        } else if (Array.isArray(options.headers)) {
+          for (const [k, v] of options.headers) {
+            fetchHeaders[k] = v;
+          }
+        } else {
+          Object.assign(fetchHeaders, options.headers);
+        }
+      }
+
       const res = await fetch(url, {
         ...options,
         signal: controller.signal,
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json, text/plain, */*',
-          ...(options?.headers || {}),
-        },
+        headers: fetchHeaders,
       });
       clearTimeout(timer);
 
@@ -276,7 +425,7 @@ export async function universalApiFetch(
   endpoint: string,
   options?: RequestInit
 ): Promise<Response> {
-  return fetchWithFallback(endpoint, options, 8000);
+  return fetchWithFallback(endpoint, options, 12000);
 }
 
 export async function checkServerHealth(url?: string): Promise<{ ok: boolean; status?: string; database?: string; latencyMs: number; error?: string }> {

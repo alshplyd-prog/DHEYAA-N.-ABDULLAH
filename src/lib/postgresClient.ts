@@ -1647,7 +1647,7 @@ async function saveToPostgres(endpoint: string, method: string = 'POST', data?: 
       headers: { 'Content-Type': 'application/json' },
       body: data ? JSON.stringify(data) : undefined,
       keepalive: true,
-    }, 8000).catch(() => null);
+    }, 15000).catch(() => null);
 
     // 2. Table resolution and verification
     const rawTable = endpoint.split('/')[0].replace('-', '_');
@@ -1685,6 +1685,8 @@ async function saveToPostgres(endpoint: string, method: string = 'POST', data?: 
 
 // Module-level cached server sync version to avoid redundant heavy downloads
 let cachedServerSyncVersion: number | string | null = null;
+// Cooldown timestamp if /api/sync/all times out on slower servers so subsequent syncs go straight to batched table pulls
+let syncAllCooldownUntil = 0;
 
 export function resetServerSyncVersionCache() {
   cachedServerSyncVersion = null;
@@ -1714,10 +1716,11 @@ export async function reconcileAllLocalWithDatabase(options?: {
       await flushPendingQueue();
     } catch (e) {}
 
-    // 1.2. Lightweight version check: ONLY if not forced
+    // 1.2. Lightweight version check: ONLY if not forced (commit version ONLY after data pull succeeds!)
+    let incomingSyncVersion: number | string | null = null;
     if (!options?.force) {
       try {
-        const vRes = await fetchWithFallback('/api/sync/version', undefined, 4000).catch(() => null);
+        const vRes = await fetchWithFallback('/api/sync/version', undefined, 8000).catch(() => null);
         if (vRes && vRes.ok) {
           const vData = await vRes.json().catch(() => null);
           if (vData && vData.syncVersion !== undefined) {
@@ -1725,7 +1728,7 @@ export async function reconcileAllLocalWithDatabase(options?: {
               // Version is completely identical — server hasn't changed. Return instantly!
               return { success: true, totalInserted: 0, message: 'البيانات مطابقة تماماً' };
             }
-            cachedServerSyncVersion = vData.syncVersion;
+            incomingSyncVersion = vData.syncVersion;
           }
         }
       } catch (verErr) {}
@@ -1779,8 +1782,12 @@ export async function reconcileAllLocalWithDatabase(options?: {
       }
     }
 
-    // 2. Fetch atomic full snapshot from server with robust timeout
-    const res = await fetchWithFallback('/api/sync/all', undefined, 25000).catch(() => null);
+    // 2. Fetch atomic full snapshot from server (unless on cooldown after a previous timeout)
+    const canTrySyncAll = Date.now() >= syncAllCooldownUntil;
+    const res = canTrySyncAll
+      ? await fetchWithFallback('/api/sync/all', undefined, 8000).catch(() => null)
+      : null;
+
     if (res && res.ok) {
       const data = await res.json().catch(() => null);
       if (data && data.success) {
@@ -1841,6 +1848,9 @@ export async function reconcileAllLocalWithDatabase(options?: {
 
         recalculateLocalFundBalances(true);
 
+        if (incomingSyncVersion !== null) {
+          cachedServerSyncVersion = incomingSyncVersion;
+        }
         mirrorLocalSnapshotToIndexedDb(true);
         notifySubscribersRefresh();
         const cCount = data.contracts?.length || 0;
@@ -1851,11 +1861,17 @@ export async function reconcileAllLocalWithDatabase(options?: {
           message: `تمت المطابقة الشاملة بنجاح (${cCount} عقد، ${pCount} دفعة)`,
         };
       }
+    } else if (canTrySyncAll) {
+      // /api/sync/all timed out or failed — put on 3-minute cooldown so batched table pulls execute immediately
+      syncAllCooldownUntil = Date.now() + 3 * 60 * 1000;
     }
 
-    // Fallback: Individual endpoint refresh
+    // Fallback: Individual batched endpoint refresh (reliable on Hostinger & mobile networks)
     const refreshed = await forceRefreshAllDataFromPostgres();
     if (refreshed) {
+      if (incomingSyncVersion !== null) {
+        cachedServerSyncVersion = incomingSyncVersion;
+      }
       const cCount = getLocalCache('contracts').length;
       const pCount = getLocalCache('payments').length;
       return {
@@ -1866,8 +1882,6 @@ export async function reconcileAllLocalWithDatabase(options?: {
     }
 
     // Check if local cache has data to provide reassuring status
-    const cCount = getLocalCache('contracts').length;
-    const pCount = getLocalCache('payments').length;
     return {
       success: false,
       totalInserted: 0,
@@ -2359,7 +2373,7 @@ function createSubscriber<T extends { id?: string }>(tableName: string, apiEndpo
       if (isOnline && apiEndpoint) {
         // First attempt: Central PostgreSQL Server API endpoint with fallback for APK
         try {
-          const res = await fetchWithFallback(`/api/${apiEndpoint}`, undefined, 8000);
+          const res = await fetchWithFallback(`/api/${apiEndpoint}`, undefined, 15000);
           if (res && res.ok) {
             const contentType = res.headers.get('content-type') || '';
             if (!contentType.includes('text/html')) {
@@ -3647,78 +3661,109 @@ export async function forceRefreshAllDataFromPostgres(): Promise<boolean> {
       console.warn('Pre-refresh flush note:', flushErr);
     }
 
-    // Try atomic full sync endpoint first
-    try {
-      const allRes = await fetchWithFallback('/api/sync/all', undefined, 10000);
-      if (allRes && allRes.ok) {
-        const data = await allRes.json();
-        if (data && data.success) {
-          if (Array.isArray(data.deletedRecordIds)) {
-            markRecordAsDeleted(data.deletedRecordIds);
+    // Try atomic full sync endpoint first unless in cooldown after timeout
+    if (Date.now() >= syncAllCooldownUntil) {
+      try {
+        const allRes = await fetchWithFallback('/api/sync/all', undefined, 8000);
+        if (allRes && allRes.ok) {
+          const data = await allRes.json();
+          if (data && data.success) {
+            if (Array.isArray(data.deletedRecordIds)) {
+              markRecordAsDeleted(data.deletedRecordIds);
+            }
+            // Process payments first so payments from other reps are saved
+            if (Array.isArray(data.payments)) setLocalCache('payments', mergeRemoteWithPendingLocal('payments', data.payments));
+            // Recalculate contracts with all payments
+            if (Array.isArray(data.contracts)) {
+              const mergedContracts = mergeRemoteWithPendingLocal('contracts', data.contracts);
+              const currentPayments = getLocalCache<any>('payments');
+              const recalculated = recalculateAllContractsFromPayments(mergedContracts, currentPayments, false);
+              setLocalCache('contracts', recalculated);
+            } else {
+              recalculateAllContractsFromPayments(undefined, undefined, true);
+            }
+            if (Array.isArray(data.inventory)) setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', data.inventory));
+            if (Array.isArray(data.reps)) setLocalCache('reps', mergeRemoteWithPendingLocal('reps', data.reps));
+            if (Array.isArray(data.funds)) setLocalCache('funds', mergeRemoteWithPendingLocal('funds', data.funds));
+            if (Array.isArray(data.customerLists)) setLocalCache('customer_lists', mergeRemoteWithPendingLocal('customer_lists', data.customerLists));
+            if (Array.isArray(data.employees)) setLocalCache('employees', mergeRemoteWithPendingLocal('employees', data.employees));
+            if (Array.isArray(data.fundTransactions)) setLocalCache('fund_transactions', mergeRemoteWithPendingLocal('fund_transactions', data.fundTransactions));
+            if (Array.isArray(data.employeeTransactions)) setLocalCache('employee_transactions', mergeRemoteWithPendingLocal('employee_transactions', data.employeeTransactions));
+            if (Array.isArray(data.paymentConflicts)) {
+              const realConflicts = data.paymentConflicts.filter((c: any) => c.id !== '__appointments_sync_master__' && c.status !== 'appointment_sync_record' && c.contractId !== 'appointments_container');
+              setLocalCache('payment_conflicts', mergeRemoteWithPendingLocal('payment_conflicts', realConflicts));
+            }
+            if (Array.isArray(data.appointments)) {
+              const mapped = data.appointments.map((r: any) => mapRow('appointments', r));
+              setLocalCache('appointments', mergeRemoteWithPendingLocal('appointments', mapped));
+            }
+            recalculateLocalFundBalances(true);
+            mirrorLocalSnapshotToIndexedDb(true);
+            notifySubscribersRefresh();
+            return true;
           }
-          // Process payments first so payments from other reps are saved
-          if (Array.isArray(data.payments)) setLocalCache('payments', mergeRemoteWithPendingLocal('payments', data.payments));
-          // Recalculate contracts with all payments
-          if (Array.isArray(data.contracts)) {
-            const mergedContracts = mergeRemoteWithPendingLocal('contracts', data.contracts);
-            const currentPayments = getLocalCache<any>('payments');
-            const recalculated = recalculateAllContractsFromPayments(mergedContracts, currentPayments, false);
-            setLocalCache('contracts', recalculated);
-          } else {
-            recalculateAllContractsFromPayments(undefined, undefined, true);
-          }
-          if (Array.isArray(data.inventory)) setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', data.inventory));
-          if (Array.isArray(data.reps)) setLocalCache('reps', mergeRemoteWithPendingLocal('reps', data.reps));
-          if (Array.isArray(data.funds)) setLocalCache('funds', mergeRemoteWithPendingLocal('funds', data.funds));
-          if (Array.isArray(data.customerLists)) setLocalCache('customer_lists', mergeRemoteWithPendingLocal('customer_lists', data.customerLists));
-          if (Array.isArray(data.employees)) setLocalCache('employees', mergeRemoteWithPendingLocal('employees', data.employees));
-          if (Array.isArray(data.fundTransactions)) setLocalCache('fund_transactions', mergeRemoteWithPendingLocal('fund_transactions', data.fundTransactions));
-          if (Array.isArray(data.employeeTransactions)) setLocalCache('employee_transactions', mergeRemoteWithPendingLocal('employee_transactions', data.employeeTransactions));
-          if (Array.isArray(data.paymentConflicts)) setLocalCache('payment_conflicts', mergeRemoteWithPendingLocal('payment_conflicts', data.paymentConflicts));
-          if (Array.isArray(data.appointments)) {
-            const mapped = data.appointments.map((r: any) => mapRow('appointments', r));
-            setLocalCache('appointments', mergeRemoteWithPendingLocal('appointments', mapped));
-          }
-          mirrorLocalSnapshotToIndexedDb(true);
-          notifySubscribersRefresh();
-          return true;
         }
+        syncAllCooldownUntil = Date.now() + 3 * 60 * 1000;
+      } catch (allErr) {
+        syncAllCooldownUntil = Date.now() + 3 * 60 * 1000;
+        console.warn('Fast /api/sync/all attempt fallback:', allErr);
       }
-    } catch (allErr) {
-      console.warn('Fast /api/sync/all attempt fallback:', allErr);
     }
 
+    // Fetch payments and core tables first in small batches of 3 (prevents overloading server pool & timeouts)
     const tableEndpoints: { table: string; endpoint: string }[] = [
-      { table: 'contracts', endpoint: 'contracts' },
-      { table: 'inventory', endpoint: 'inventory' },
       { table: 'payments', endpoint: 'payments' },
-      { table: 'reps', endpoint: 'reps' },
-      { table: 'funds', endpoint: 'funds' },
+      { table: 'contracts', endpoint: 'contracts' },
       { table: 'customer_lists', endpoint: 'customer-lists' },
+      { table: 'funds', endpoint: 'funds' },
+      { table: 'reps', endpoint: 'reps' },
+      { table: 'inventory', endpoint: 'inventory' },
       { table: 'employees', endpoint: 'employees' },
       { table: 'fund_transactions', endpoint: 'fund-transactions' },
       { table: 'employee_transactions', endpoint: 'employee-transactions' },
       { table: 'payment_conflicts', endpoint: 'payment-conflicts' },
       { table: 'appointments', endpoint: 'appointments' },
     ];
-    
-    const results = await Promise.allSettled(
-      tableEndpoints.map(async ({ table, endpoint }) => {
-        const res = await fetchWithFallback(`/api/${endpoint}`, undefined, 10000);
-        if (res && res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data)) {
-            const mapped = data.map((row) => mapRow(table, row));
-            const merged = mergeRemoteWithPendingLocal(table, mapped);
-            setLocalCache(table, merged);
-            return true;
-          }
-        }
-        return false;
-      })
-    );
 
-    const successCount = results.filter(r => r.status === 'fulfilled' && r.value === true).length;
+    let successCount = 0;
+    const BATCH_SIZE = 3;
+    for (let i = 0; i < tableEndpoints.length; i += BATCH_SIZE) {
+      const slice = tableEndpoints.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.allSettled(
+        slice.map(async ({ table, endpoint }) => {
+          const res = await fetchWithFallback(`/api/${endpoint}`, undefined, 20000);
+          if (res && res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data)) {
+              const filtered =
+                table === 'payment_conflicts'
+                  ? data.filter(
+                      (c: any) =>
+                        c.id !== '__appointments_sync_master__' &&
+                        c.status !== 'appointment_sync_record' &&
+                        c.contractId !== 'appointments_container'
+                    )
+                  : data;
+              const mapped = filtered.map((row) => mapRow(table, row));
+              let merged = mergeRemoteWithPendingLocal(table, mapped);
+              if (table === 'contracts') {
+                merged = enrichContractsWithCustomerLocations(merged);
+              }
+              setLocalCache(table, merged);
+              return true;
+            }
+          }
+          return false;
+        })
+      );
+      successCount += batchResults.filter((r) => r.status === 'fulfilled' && r.value === true).length;
+    }
+
+    if (successCount > 0) {
+      recalculateAllContractsFromPayments(undefined, undefined, true);
+      recalculateLocalFundBalances(true);
+      mirrorLocalSnapshotToIndexedDb(true);
+    }
     notifySubscribersRefresh();
     return successCount > 0;
   } catch (e) {

@@ -165,8 +165,6 @@ async function getCandidateServerOrigins() {
   // Fallback candidate origins with Production VPS first
   const defaults = [
     'http://72.62.158.128:3000',
-    'http://72.62.158.128',
-    'https://ais-pre-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app',
     'http://localhost:3000',
     'http://127.0.0.1:3000',
     'http://10.0.2.2:3000'
@@ -314,7 +312,7 @@ async function uploadSingleActionViaRest(action, origins) {
     try {
       const url = `${origin}${endpointPath}`;
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
+      const timer = setTimeout(() => controller.abort(), 12000);
       const res = await fetch(url, {
         method,
         headers: { 'Content-Type': 'application/json' },
@@ -366,7 +364,7 @@ async function flushPendingActionsInBackground() {
         try {
           const batchUrl = `${origin}/api/sync/batch`;
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 6000);
+          const timer = setTimeout(() => controller.abort(), 15000);
           const attempt = await fetch(batchUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -415,7 +413,7 @@ async function flushPendingActionsInBackground() {
         try {
           const beaconUrl = `${origin}/api/sync/beacon`;
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 6000);
+          const timer = setTimeout(() => controller.abort(), 15000);
           const bAttempt = await fetch(beaconUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

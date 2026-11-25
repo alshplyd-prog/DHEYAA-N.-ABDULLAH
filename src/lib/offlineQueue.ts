@@ -939,7 +939,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
       method,
       headers: { 'Content-Type': 'application/json' },
       body: method !== 'DELETE' ? JSON.stringify(typeof payload === 'object' ? payload : { id: docId, value: payload }) : undefined,
-    }, 8000);
+    }, 15000);
 
     if (!res || !res.ok || res.status < 200 || res.status >= 300) {
       return false;
@@ -971,12 +971,12 @@ let lastFlushStartTime = 0;
 export async function flushPendingQueue(): Promise<{ flushed: number; remaining: number }> {
   const now = Date.now();
   if (isFlushing) {
-    // Watchdog check: If flushing has been active for more than 12 seconds, force-reset the lock to prevent deadlock
-    if (now - lastFlushStartTime < 12000) {
+    // Watchdog check: If flushing has been active for more than 20 seconds, force-reset the lock to prevent deadlock
+    if (now - lastFlushStartTime < 20000) {
       const q = getPendingQueueSync();
       return { flushed: 0, remaining: q.filter((i) => i.status !== 'synced').length };
     }
-    console.warn('[Offline Sync Engine] Previous flush lock timed out (>12s). Resetting lock to unfreeze sync.');
+    console.warn('[Offline Sync Engine] Previous flush lock timed out (>20s). Resetting lock to unfreeze sync.');
     isFlushing = false;
   }
 
@@ -1020,7 +1020,7 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ actions: batchSlice }),
           },
-          12000
+          15000
         );
 
         if (response && response.ok && response.status >= 200 && response.status < 300) {
@@ -1226,11 +1226,35 @@ export function sendBeaconOnExit() {
     const beaconUrl = isNative ? getFullApiUrl('/api/sync/beacon') : '/api/sync/beacon';
     const batchUrl = isNative ? getFullApiUrl('/api/sync/batch') : '/api/sync/batch';
 
-    // 5. Send dual transmission (Beacon + keepalive Fetch)
+    // 5. Send dual transmission (Native CapacitorHttp via fetchWithFallback on APK, or Beacon + keepalive Fetch on Web)
     const BEACON_CHUNK = 25;
     for (let i = 0; i < pendingToSync.length; i += BEACON_CHUNK) {
       const chunk = pendingToSync.slice(i, i + BEACON_CHUNK);
       const payloadJson = JSON.stringify({ actions: chunk });
+
+      if (isNative) {
+        fetchWithFallback(
+          '/api/sync/batch',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: payloadJson,
+            keepalive: true,
+          },
+          12000
+        )
+          .then((res) => {
+            if (res && res.ok) {
+              res.json().then((data) => {
+                if (data && Array.isArray(data.processedIds)) {
+                  data.processedIds.forEach((pid: string) => deleteActionFromIndexedDb(pid).catch(() => {}));
+                }
+              }).catch(() => {});
+            }
+          })
+          .catch(() => {});
+        continue;
+      }
 
       // Primary keepalive fetch (supported in modern Chromium, iOS Safari, WebViews)
       if (typeof fetch === 'function') {

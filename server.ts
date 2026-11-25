@@ -3947,22 +3947,31 @@ async function startServer() {
     }
   });
 
+  let rep1VerifiedInPg = false;
+  async function ensureRep1OnceInPg() {
+    if (rep1VerifiedInPg) return;
+    await executePg("DELETE FROM deleted_records WHERE record_id = 'rep-1' OR record_id IN (SELECT id FROM reps WHERE name LIKE '%ضياء%')").catch(() => {});
+    await executePg(`
+      INSERT INTO reps (id, name, phone, code, role, can_edit, can_delete, can_move_customer, can_sell, allowed_list_ids)
+      VALUES ('rep-1', 'ضياء المحاسب', '07801112233', '4444', 'admin', true, true, true, true, '["all"]')
+      ON CONFLICT (id) DO UPDATE SET name = 'ضياء المحاسب', role = 'admin', can_edit = true, can_delete = true, can_move_customer = true, can_sell = true, allowed_list_ids = '["all"]'
+    `).catch(() => {});
+    rep1VerifiedInPg = true;
+  }
+
   // --- Sales Reps API ---
   app.get("/api/reps", async (req, res) => {
     try {
       if (isPgConfigured()) {
         try {
-          // Ensure rep-1 is never excluded by deleted_records
-          await executePg("DELETE FROM deleted_records WHERE record_id = 'rep-1' OR record_id IN (SELECT id FROM reps WHERE name LIKE '%ضياء%')").catch(() => {});
-          
-          // Ensure rep-1 exists in reps table without overwriting user-customized code
-          await executePg(`
-            INSERT INTO reps (id, name, phone, code, role, can_edit, can_delete, can_move_customer, can_sell, allowed_list_ids)
-            VALUES ('rep-1', 'ضياء المحاسب', '07801112233', '4444', 'admin', true, true, true, true, '["all"]')
-            ON CONFLICT (id) DO UPDATE SET name = 'ضياء المحاسب', role = 'admin', can_edit = true, can_delete = true, can_move_customer = true, can_sell = true, allowed_list_ids = '["all"]'
-          `).catch(() => {});
+          await ensureRep1OnceInPg();
 
-          const rows = await executePgStrict("SELECT * FROM reps r WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = r.id AND dr.record_id != 'rep-1' AND (dr.table_name = 'reps' OR dr.table_name = 'unknown')) ORDER BY r.name ASC");
+          let rows = await executePgStrict("SELECT * FROM reps r WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = r.id AND dr.record_id != 'rep-1' AND (dr.table_name = 'reps' OR dr.table_name = 'unknown')) ORDER BY r.name ASC");
+          if (rows && !rows.some((r: any) => r.id === 'rep-1')) {
+            rep1VerifiedInPg = false;
+            await ensureRep1OnceInPg();
+            rows = await executePgStrict("SELECT * FROM reps r WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = r.id AND dr.record_id != 'rep-1' AND (dr.table_name = 'reps' OR dr.table_name = 'unknown')) ORDER BY r.name ASC");
+          }
           if (rows && rows.length > 0) {
             const reps = rows.map(mapRepRow);
             // Ensure ضياء is present
@@ -6902,24 +6911,26 @@ async function startServer() {
     return;
   }
 
+  let lastSyncAllMaintenanceAt = 0;
+
   // Comprehensive atomic full-sync endpoint for 100% perfect matching between Web & Android APK
   app.get("/api/sync/all", async (req, res) => {
     try {
       const pgOk = await probePgConnection();
       if (pgOk && isPgConfigured()) {
-        await cleanupDuplicateEntities().catch(() => {});
-        await syncCustomersTableInPg().catch(() => {});
-        if (req.query.audit === 'true' || req.query.force_recalc === 'true') {
+        const forceAudit = req.query.audit === 'true' || req.query.force_recalc === 'true';
+        const nowMs = Date.now();
+        if (forceAudit || nowMs - lastSyncAllMaintenanceAt > 10 * 60 * 1000) {
+          lastSyncAllMaintenanceAt = nowMs;
+          await cleanupDuplicateEntities().catch(() => {});
+          await syncCustomersTableInPg().catch(() => {});
+        }
+        if (forceAudit) {
           await syncContractBalancesInPgAndFileDb().catch(() => {});
         }
 
-        // Ensure rep-1 is never excluded by deleted_records and always exists
-        await executePg("DELETE FROM deleted_records WHERE record_id = 'rep-1' OR record_id IN (SELECT id FROM reps WHERE name LIKE '%ضياء%')").catch(() => {});
-        await executePg(`
-          INSERT INTO reps (id, name, phone, code, role, can_edit, can_delete, can_move_customer, can_sell, allowed_list_ids)
-          VALUES ('rep-1', 'ضياء المحاسب', '07801112233', '4444', 'admin', true, true, true, true, '["all"]')
-          ON CONFLICT (id) DO UPDATE SET name = 'ضياء المحاسب', role = 'admin', can_edit = true, can_delete = true, can_move_customer = true, can_sell = true, allowed_list_ids = '["all"]'
-        `).catch(() => {});
+        // Ensure rep-1 exists on boot without running 2 extra write queries on every sync poll
+        await ensureRep1OnceInPg().catch(() => {});
 
         const [
           contractsRows,
@@ -6936,22 +6947,48 @@ async function startServer() {
           deletedRows,
         ] = await Promise.all([
           executePg(`
-            SELECT 
+            WITH active_payments AS (
+              SELECT p.contract_id,
+                     TRIM(LOWER(p.customer_name)) AS norm_name,
+                     COALESCE(p.amount_paid, p.amount, 0) AS amt,
+                     p.payment_date
+              FROM payments p
+              WHERE NOT EXISTS (
+                SELECT 1 FROM deleted_records dr
+                WHERE dr.record_id = p.id AND dr.table_name = 'payments'
+              )
+            ),
+            by_contract AS (
+              SELECT contract_id,
+                     COUNT(*) AS cnt,
+                     SUM(amt) AS total_amt,
+                     MAX(payment_date) AS max_date
+              FROM active_payments
+              WHERE contract_id IS NOT NULL AND contract_id != ''
+              GROUP BY contract_id
+            ),
+            by_name AS (
+              SELECT norm_name,
+                     COUNT(*) AS cnt,
+                     SUM(amt) AS total_amt,
+                     MAX(payment_date) AS max_date
+              FROM active_payments
+              WHERE (contract_id IS NULL OR contract_id = '') AND norm_name != ''
+              GROUP BY norm_name
+            )
+            SELECT
               c.*,
-              (SELECT COUNT(*) FROM payments p WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name))) AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments'))) AS payment_count,
-              COALESCE((
-                SELECT SUM(COALESCE(p.amount_paid, p.amount, 0))
-                FROM payments p
-                WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                  AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments'))
-              ), 0) AS actual_total_paid,
-              (
-                SELECT MAX(p.payment_date)
-                FROM payments p
-                WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                  AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments'))
-              ) AS actual_last_payment_date
+              COALESCE(bc.cnt, 0) + COALESCE(bn.cnt, 0) AS payment_count,
+              COALESCE(bc.total_amt, 0) + COALESCE(bn.total_amt, 0) AS actual_total_paid,
+              CASE
+                WHEN bc.max_date IS NULL THEN bn.max_date
+                WHEN bn.max_date IS NULL THEN bc.max_date
+                WHEN bc.max_date >= bn.max_date THEN bc.max_date
+                ELSE bn.max_date
+              END AS actual_last_payment_date
             FROM sales c
+            LEFT JOIN by_contract bc ON bc.contract_id = c.id
+            LEFT JOIN by_name bn ON bn.norm_name = TRIM(LOWER(c.customer_name))
             WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = c.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts'))
               AND TRIM(c.customer_name) != ''
               AND c.id NOT LIKE 'pay_%' AND c.id NOT LIKE 'fund_%' AND c.id NOT LIKE 'emp_%' AND c.id NOT LIKE 'item_%' AND c.id NOT LIKE 'ft_%' AND c.id NOT LIKE 'emptx_%' AND c.id NOT LIKE 'conflict_%'

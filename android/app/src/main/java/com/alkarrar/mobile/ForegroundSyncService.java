@@ -54,9 +54,7 @@ public class ForegroundSyncService extends Service {
     private static final int NOTIFICATION_ID = 9981;
 
     private static final String[] CANDIDATE_SYNC_URLS = {
-        "http://72.62.158.128:3000/api/sync/batch",
-        "http://72.62.158.128/api/sync/batch",
-        "https://ais-pre-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app/api/sync/batch"
+        "http://72.62.158.128:3000/api/sync/batch"
     };
 
     private static WeakReference<WebView> activeActivityWebView = null;
@@ -745,8 +743,8 @@ public class ForegroundSyncService extends Service {
                                 sConn.setRequestMethod(isDelete ? "DELETE" : "POST");
                                 sConn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
                                 sConn.setRequestProperty("Accept", "application/json");
-                                sConn.setConnectTimeout(6000);
-                                sConn.setReadTimeout(10000);
+                                sConn.setConnectTimeout(8000);
+                                sConn.setReadTimeout(20000);
 
                                 if (!isDelete) {
                                     sConn.setDoOutput(true);

@@ -20,7 +20,7 @@
       "sound": "beep.wav"
     },
     "CapacitorHttp": {
-      "enabled": true
+      "enabled": false
     },
     "CapacitorCookies": {
       "enabled": true
