@@ -10,9 +10,17 @@ let database = process.env.DB_NAME || process.env.SQL_DB_NAME || "";
 let user = process.env.DB_USER || process.env.SQL_ADMIN_USER || process.env.SQL_USER || "";
 let password = process.env.DB_PASSWORD || process.env.SQL_ADMIN_PASSWORD || process.env.SQL_PASSWORD || "";
 
-if ((!database || !user || !password) && process.env.DATABASE_URL) {
+const rawDatabaseUrl = process.env.DATABASE_URL || "";
+const isPlaceholderUrl =
+  !rawDatabaseUrl ||
+  rawDatabaseUrl.toLowerCase().includes("postgresql://user:password@") ||
+  rawDatabaseUrl.toLowerCase().includes("[password]") ||
+  rawDatabaseUrl.toLowerCase().includes("your-password") ||
+  /\/database(\?|$)/i.test(rawDatabaseUrl);
+
+if (!isPlaceholderUrl) {
   try {
-    const parsed = new URL(process.env.DATABASE_URL);
+    const parsed = new URL(rawDatabaseUrl);
     host = parsed.hostname || host;
     port = Number(parsed.port || port);
     database = parsed.pathname.replace(/^\/+/, "") || database;

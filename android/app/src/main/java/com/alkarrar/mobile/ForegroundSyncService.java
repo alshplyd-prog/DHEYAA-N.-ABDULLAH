@@ -590,8 +590,9 @@ public class ForegroundSyncService extends Service {
                 customServerUrl = capPrefs.getString(KEY_SERVER_URL, null);
             }
             if (customServerUrl != null) {
-                String lowerCustom = customServerUrl.toLowerCase();
+                String lowerCustom = customServerUrl.toLowerCase().replaceAll("/+$", "");
                 if (lowerCustom.contains("localhost") || lowerCustom.contains("127.0.0.1") ||
+                    lowerCustom.equals("http://72.62.158.128") ||
                     lowerCustom.contains("ais-dev-") || lowerCustom.contains("ais-pre-") ||
                     lowerCustom.contains("5x4c6bq6p4ul7njqnkzon5") ||
                     lowerCustom.contains("asc5xuvnur4hlmpl5rfxpz")) {
@@ -600,12 +601,15 @@ public class ForegroundSyncService extends Service {
             }
 
             java.util.List<String> targetUrls = new java.util.ArrayList<>();
-            if (customServerUrl != null && (customServerUrl.startsWith("http://") || customServerUrl.startsWith("https://"))) {
-                targetUrls.add(customServerUrl.replaceAll("/+$", "") + "/api/sync/batch");
-            }
             for (String u : CANDIDATE_SYNC_URLS) {
                 if (!targetUrls.contains(u)) {
                     targetUrls.add(u);
+                }
+            }
+            if (customServerUrl != null && (customServerUrl.startsWith("http://") || customServerUrl.startsWith("https://"))) {
+                String cleanCustomBatch = customServerUrl.replaceAll("/+$", "") + "/api/sync/batch";
+                if (!targetUrls.contains(cleanCustomBatch)) {
+                    targetUrls.add(cleanCustomBatch);
                 }
             }
 

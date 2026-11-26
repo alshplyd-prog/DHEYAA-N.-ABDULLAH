@@ -39,6 +39,19 @@ function rewriteDbUrlToLocalhost(rawUrl: string): string {
   }
 }
 
+function isPlaceholderDbUrl(rawUrl: string): boolean {
+  const lower = (rawUrl || '').toLowerCase();
+  return (
+    !rawUrl ||
+    lower.includes('supabase.co') ||
+    lower.includes('postgresql://user:password@') ||
+    lower.includes('[password]') ||
+    lower.includes('[your-password]') ||
+    lower.includes('your-password') ||
+    /\/database(\?|$)/i.test(rawUrl)
+  );
+}
+
 export const resetPool = () => {
   if (global._postgresPool) {
     try {
@@ -59,20 +72,7 @@ export const createPool = (forceLocalhost = false): Pool | null => {
   const shouldUseLocalhost = Boolean(forceLocalhost || global._preferLocalhostPg);
 
   let dbUrl = '';
-  if (process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
-    const rawHost = process.env.DB_HOST || '127.0.0.1';
-    const targetHost = shouldUseLocalhost || isHostAddressLocal(rawHost) ? '127.0.0.1' : rawHost;
-    dbUrl = `postgresql://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASSWORD)}@${targetHost}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME}`;
-  } else if (process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_DB_NAME) {
-    const targetHost = shouldUseLocalhost || isHostAddressLocal(process.env.SQL_HOST) ? '127.0.0.1' : process.env.SQL_HOST;
-    dbUrl = `postgresql://${encodeURIComponent(process.env.SQL_USER)}:${encodeURIComponent(process.env.SQL_PASSWORD || '')}@${targetHost}:${process.env.SQL_PORT || 5432}/${process.env.SQL_DB_NAME}`;
-  } else if (
-    process.env.DATABASE_URL &&
-    !process.env.DATABASE_URL.includes('supabase.co') &&
-    !process.env.DATABASE_URL.includes('[PASSWORD]') &&
-    !process.env.DATABASE_URL.includes('[YOUR-PASSWORD]') &&
-    !process.env.DATABASE_URL.includes('YOUR-PASSWORD')
-  ) {
+  if (process.env.DATABASE_URL && !isPlaceholderDbUrl(process.env.DATABASE_URL)) {
     dbUrl = process.env.DATABASE_URL;
     try {
       const parsed = new URL(dbUrl);
@@ -80,6 +80,13 @@ export const createPool = (forceLocalhost = false): Pool | null => {
         dbUrl = rewriteDbUrlToLocalhost(dbUrl);
       }
     } catch (e) {}
+  } else if (process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
+    const rawHost = process.env.DB_HOST || '127.0.0.1';
+    const targetHost = shouldUseLocalhost || isHostAddressLocal(rawHost) ? '127.0.0.1' : rawHost;
+    dbUrl = `postgresql://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASSWORD)}@${targetHost}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME}`;
+  } else if (process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_DB_NAME) {
+    const targetHost = shouldUseLocalhost || isHostAddressLocal(process.env.SQL_HOST) ? '127.0.0.1' : process.env.SQL_HOST;
+    dbUrl = `postgresql://${encodeURIComponent(process.env.SQL_USER)}:${encodeURIComponent(process.env.SQL_PASSWORD || '')}@${targetHost}:${process.env.SQL_PORT || 5432}/${process.env.SQL_DB_NAME}`;
   } else {
     return null;
   }

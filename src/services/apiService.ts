@@ -3,17 +3,17 @@
  * Connects the React client to the Node.js backend server via standard REST endpoints.
  */
 
-import { getApiBaseUrl, isNativeOrApkEnvironment } from '../lib/apiConfig';
+import { getApiBaseUrl, HOSTINGER_DEFAULT_SERVER, isNativeOrApkEnvironment, fetchWithFallback } from '../lib/apiConfig';
 
 /**
  * Production VPS backend URL for mobile APK and external environments
  */
-export const CLOUD_API_URL = 'http://72.62.158.128:3000/api';
+export const CLOUD_API_URL = `${HOSTINGER_DEFAULT_SERVER}/api`;
 
 /**
  * Dynamic API Base URL resolver:
- * - Directs all mobile / APK requests directly to http://72.62.158.128:3000/api
- * - In web browser, uses relative `/api` or custom server
+ * - Directs all mobile / APK requests directly to HOSTINGER_DEFAULT_SERVER/api
+ * - In web browser, uses relative `/api` or active origin
  */
 export function getActiveApiUrl(): string {
   if (typeof window !== 'undefined') {
@@ -32,25 +32,24 @@ export function getActiveApiUrl(): string {
 
 export const API_BASE_URL = getActiveApiUrl();
 
-// Helper function for all HTTP requests with timeout & error handling
+// Helper function for all HTTP requests unified via fetchWithFallback (handles APK native HTTP & Web fallback)
 async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
   const cleanEndpoint = endpoint.replace(/^\/+/, '');
-  const baseUrl = getActiveApiUrl();
-  const url = `${baseUrl.replace(/\/+$/, '')}/${cleanEndpoint}`;
-  
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  const apiPath = cleanEndpoint.startsWith('api/') ? `/${cleanEndpoint}` : `/api/${cleanEndpoint}`;
 
   try {
-    const response = await fetch(url, {
-      ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        ...(options.headers || {}),
+    const response = await fetchWithFallback(
+      apiPath,
+      {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          ...(options.headers || {}),
+        },
       },
-      signal: controller.signal,
-    });
+      12000
+    );
 
     const text = await response.text();
     let data;
@@ -69,31 +68,10 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
 
     return data;
   } catch (err: any) {
-    if (err.name === 'AbortError') {
+    if (err.name === 'AbortError' || String(err?.message || '').toLowerCase().includes('timeout')) {
       throw new Error('انتهت مهلة الاتصال بالسيرفر. يرجى التحقق من اتصال الإنترنت.');
     }
-    // Fallback: if we were using a relative URL that failed or vice versa, try cloud URL
-    if (baseUrl !== CLOUD_API_URL) {
-      try {
-        const fallbackUrl = `${CLOUD_API_URL}/${cleanEndpoint}`;
-        const fallbackRes = await fetch(fallbackUrl, {
-          ...options,
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            ...(options.headers || {}),
-          },
-        });
-        if (fallbackRes.ok) {
-          return fallbackRes.json();
-        }
-      } catch (fallbackErr) {
-        // ignore and throw original error
-      }
-    }
     throw err;
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 

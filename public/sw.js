@@ -121,15 +121,22 @@ async function getCandidateServerOrigins() {
   const origins = [];
   const isStaleOrFakeLocal = (o) => {
     if (!o || typeof o !== 'string') return true;
-    const low = o.toLowerCase();
+    const low = o.toLowerCase().replace(/\/+$/, '');
     return (
       low === 'https://localhost' ||
       low === 'capacitor://localhost' ||
+      low === 'http://72.62.158.128' ||
       low.includes('ais-dev-') ||
+      low.includes('ais-pre-') ||
       low.includes('5x4c6bq6p4ul7njqnkzon5') ||
       low.includes('asc5xuvnur4hlmpl5rfxpz')
     );
   };
+
+  const isCapacitorWebViewOrigin =
+    self.location &&
+    self.location.origin &&
+    (self.location.origin.toLowerCase() === 'https://localhost' || self.location.origin.toLowerCase() === 'capacitor://localhost');
 
   if (self.location && self.location.origin && self.location.origin !== 'null' && !isStaleOrFakeLocal(self.location.origin)) {
     origins.push(self.location.origin);
@@ -162,13 +169,14 @@ async function getCandidateServerOrigins() {
     }
   } catch (e) {}
 
-  // Fallback candidate origins with Production VPS first
-  const defaults = [
-    'http://72.62.158.128:3000',
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-    'http://10.0.2.2:3000'
-  ];
+  // Unified production VPS origin first; only add local dev origins when not in APK WebView
+  const defaults = isCapacitorWebViewOrigin
+    ? ['http://72.62.158.128:3000']
+    : [
+        'http://72.62.158.128:3000',
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+      ];
   for (const d of defaults) {
     if (!origins.includes(d)) origins.push(d);
   }

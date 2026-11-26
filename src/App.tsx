@@ -83,6 +83,7 @@ import { silentAutoPrintReceipt, directPrintReceipt, openThermalPrintWindow, pri
 import { App as CapApp } from '@capacitor/app';
 import { Network } from '@capacitor/network';
 import { initBackgroundSync, registerBackgroundSyncWorker, sendBeaconOnExit, runBackgroundExitSync, enableForegroundService, syncToNativeAndroid, requestAllBackgroundAndSyncPermissions } from './lib/offlineQueue';
+import { fetchWithFallback } from './lib/apiConfig';
 import {
   subscribeToContracts,
   subscribeToCustomers,
@@ -576,17 +577,22 @@ export default function App() {
           setSyncError(true);
         }
       } else {
-        // Quick lightweight version verification
+        // Quick lightweight version verification (unified for Web & APK)
         try {
-          const res = await fetch('/api/sync/version', { method: 'GET', cache: 'no-store' }).catch(() => null);
+          const res = await fetchWithFallback('/api/sync/version', { method: 'GET', cache: 'no-store' }, 8000).catch(() => null);
           if (res && res.ok) {
             setSyncError(false);
             const data = await res.json().catch(() => null);
             if (data && data.syncVersion) {
               const lastKnownVersion = localStorage.getItem('sami_last_sync_version');
               if (String(data.syncVersion) !== lastKnownVersion) {
-                localStorage.setItem('sami_last_sync_version', String(data.syncVersion));
-                reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+                reconcileAllLocalWithDatabase({ force: true })
+                  .then((syncRes) => {
+                    if (syncRes?.success) {
+                      localStorage.setItem('sami_last_sync_version', String(data.syncVersion));
+                    }
+                  })
+                  .catch(() => {});
               }
             }
           }
@@ -2874,7 +2880,7 @@ export default function App() {
 
   const handleRecalculateFundBalances = async () => {
     try {
-      const res = await fetch('/api/funds/recalculate', { method: 'POST' });
+      const res = await fetchWithFallback('/api/funds/recalculate', { method: 'POST' }, 15000);
       if (res.ok) {
         const data = await res.json();
         if (data.funds && Array.isArray(data.funds)) {

@@ -73,7 +73,7 @@ let activeWorkingServer = '';
 export function setActiveWorkingServer(url: string) {
   if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
     const clean = url.trim().replace(/\/+$/, '');
-    if (isLocalhostUrl(clean) || clean.includes('ais-dev-') || clean.includes('5x4c6bq6p4ul7njqnkzon5') || clean.includes('asc5xuvnur4hlmpl5rfxpz') || clean.includes('alkarar.baghdad.dev')) {
+    if (isLocalhostUrl(clean) || isAiStudioTempOrDeadUrl(clean)) {
       return;
     }
     activeWorkingServer = clean;
@@ -110,7 +110,7 @@ export function getApiBaseUrl(): string {
     const custom = getCustomServerUrl();
     if (custom && !isLocalhostUrl(custom)) {
       base = custom;
-    } else if (activeWorkingServer && !isLocalhostUrl(activeWorkingServer) && !activeWorkingServer.includes('ais-dev-')) {
+    } else if (activeWorkingServer && !isLocalhostUrl(activeWorkingServer) && !isAiStudioTempOrDeadUrl(activeWorkingServer)) {
       base = activeWorkingServer;
     } else {
       base = DEFAULT_REMOTE_SERVER;

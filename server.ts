@@ -37,7 +37,8 @@ function resolveUpstreamServerUrl(): string {
     lower.includes("alkarar.baghdad.dev") ||
     lower.includes("5x4c6bq6p4ul7njqnkzon5") ||
     lower.includes("asc5xuvnur4hlmpl5rfxpz") ||
-    lower.includes("ais-dev-")
+    lower.includes("ais-dev-") ||
+    lower.includes("ais-pre-")
   ) {
     return "http://72.62.158.128:3000";
   }

@@ -15,6 +15,7 @@ import {
   DEFAULT_DUPLICATE_RECEIPT_WARNING
 } from '../lib/bluetoothPrinter';
 import { numberToArabicWords } from '../lib/tafqeet';
+import { fetchWithFallback } from '../lib/apiConfig';
 
 interface CustomerReceiptViewProps {
   receiptId?: string | null;
@@ -73,7 +74,7 @@ export const CustomerReceiptView: React.FC<CustomerReceiptViewProps> = ({ receip
 
     // If ID is available, fetch exact receipt from server endpoint /api/receipt/:id
     if (id) {
-      fetch(`/api/receipt/${encodeURIComponent(id)}`)
+      fetchWithFallback(`/api/receipt/${encodeURIComponent(id)}`, undefined, 12000)
         .then((res) => {
           if (res.ok) return res.json();
           throw new Error('API receipt error');
@@ -87,7 +88,7 @@ export const CustomerReceiptView: React.FC<CustomerReceiptViewProps> = ({ receip
         })
         .catch(() => {
           // Fallback to /api/payments
-          fetch(`/api/payments`)
+          fetchWithFallback('/api/payments', undefined, 15000)
             .then((r) => r.json())
             .then((allP) => {
               if (Array.isArray(allP)) {
