@@ -168,12 +168,14 @@ function isRequestMatchingUpstream(req: express.Request): boolean {
   return false;
 }
 
-async function sendMutationToUpstream(item: { method: string; url: string; body?: any }): Promise<boolean> {
-  if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost()) return false;
+async function sendMutationToUpstream(item: { method: string; url: string; body?: any }): Promise<{ ok: boolean; permanent?: boolean }> {
+  if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost()) return { ok: false };
+  const cleanUrl = item.url.startsWith("/") ? item.url : `/${item.url}`;
+  const isHeavySync = cleanUrl.startsWith("/api/sync/reconcile") || cleanUrl.startsWith("/api/sync/batch") || cleanUrl.startsWith("/api/sync/beacon");
+  const timeoutMs = isHeavySync ? 28000 : 18000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3500);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const cleanUrl = item.url.startsWith("/") ? item.url : `/${item.url}`;
     const hasBody = item.method !== "DELETE" && item.method !== "GET" && item.body !== undefined;
     const res = await fetch(`${UPSTREAM_SERVER_URL}${cleanUrl}`, {
       method: item.method,
@@ -186,12 +188,15 @@ async function sendMutationToUpstream(item: { method: string; url: string; body?
       },
       body: hasBody ? JSON.stringify(item.body) : undefined,
     });
-    if (!res.ok) return false;
+    if (!res.ok) {
+      const permanent = res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
+      return { ok: false, permanent };
+    }
     const ct = (res.headers.get("content-type") || "").toLowerCase();
-    if (ct.includes("text/html")) return false;
-    return true;
+    if (ct.includes("text/html")) return { ok: false };
+    return { ok: true };
   } catch {
-    return false;
+    return { ok: false };
   } finally {
     clearTimeout(timer);
   }
@@ -206,22 +211,39 @@ async function flushUpstreamOutbox(): Promise<number> {
     const outbox = fileDb.get<any>(UPSTREAM_OUTBOX_KEY) || [];
     if (!Array.isArray(outbox) || outbox.length === 0) return 0;
 
+    const now = Date.now();
     const remaining: any[] = [];
     let upstreamDead = false;
     for (let i = 0; i < outbox.length; i++) {
       const entry = outbox[i];
       if (!entry || !entry.method || !entry.url) continue;
+      // Expire items older than 24h or failed >= 6 attempts so one bad item never deadlocks sync
+      const ageMs = entry.timestamp ? now - Number(entry.timestamp) : 0;
+      const attempts = Number(entry.attempts || 0);
+      if (attempts >= 6 || ageMs > 24 * 60 * 60 * 1000) {
+        continue;
+      }
       if (upstreamDead) {
         remaining.push(entry);
         continue;
       }
-      const ok = await sendMutationToUpstream(entry);
-      if (ok) {
+      const res = await sendMutationToUpstream(entry);
+      if (res.ok) {
         flushed++;
         upstreamConnected = true;
+      } else if (res.permanent) {
+        // Discard permanently rejected 4xx mutations so newer updates continue flowing
+        continue;
       } else {
-        upstreamDead = true;
-        remaining.push(entry);
+        entry.attempts = attempts + 1;
+        entry.lastAttemptAt = now;
+        if (entry.attempts < 6) {
+          remaining.push(entry);
+        }
+        // Only abort remaining items if it wasn't a heavy reconcile timeout
+        if (!String(entry.url).startsWith("/api/sync/reconcile")) {
+          upstreamDead = true;
+        }
       }
     }
     fileDb.setAll(UPSTREAM_OUTBOX_KEY, remaining);
@@ -234,15 +256,23 @@ async function flushUpstreamOutbox(): Promise<number> {
 function enqueueAndForwardUpstreamMutation(method: string, url: string, body?: any) {
   if (isPgConfigured() || !UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost()) return;
   try {
-    const outbox = fileDb.get<any>(UPSTREAM_OUTBOX_KEY) || [];
+    const cleanUrl = url.startsWith("/") ? url : `/${url}`;
+    if (!cleanUrl.startsWith("/api/")) return;
+    let outbox = fileDb.get<any>(UPSTREAM_OUTBOX_KEY) || [];
+    if (!Array.isArray(outbox)) outbox = [];
+    // Deduplicate redundant /api/sync/reconcile snapshots so the outbox never bloats with 1MB+ duplicates
+    if (cleanUrl.startsWith("/api/sync/reconcile")) {
+      outbox = outbox.filter((e: any) => !String(e?.url || "").startsWith("/api/sync/reconcile"));
+    }
     outbox.push({
       id: `up_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       method,
-      url,
+      url: cleanUrl,
       body,
       timestamp: Date.now(),
+      attempts: 0,
     });
-    fileDb.setAll(UPSTREAM_OUTBOX_KEY, outbox.slice(-1000));
+    fileDb.setAll(UPSTREAM_OUTBOX_KEY, outbox.slice(-500));
     void flushUpstreamOutbox();
   } catch (e) {}
 }
@@ -264,7 +294,7 @@ async function syncFromUpstreamServer(force = false): Promise<boolean> {
   inFlightUpstreamSync = (async () => {
     try {
       lastUpstreamCheckAt = Date.now();
-      const verRes = await fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/sync/version`, 3500);
+      const verRes = await fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/sync/version`, 8500);
       if (!verRes || verRes.syncVersion === undefined) {
         upstreamConnected = false;
         return false;
@@ -274,8 +304,11 @@ async function syncFromUpstreamServer(force = false): Promise<boolean> {
       // Flush queued local writes to upstream BEFORE pulling updates
       await flushUpstreamOutbox().catch(() => 0);
       const pendingOutbox = fileDb.get<any>(UPSTREAM_OUTBOX_KEY) || [];
-      if (pendingOutbox.length > 0) {
-        // Wait until outbox drains before overwriting local state from upstream
+      const hasFreshNonReconcileWrites = Array.isArray(pendingOutbox) && pendingOutbox.some((e: any) =>
+        e && !String(e.url || "").startsWith("/api/sync/reconcile") && (Date.now() - Number(e.timestamp || 0)) < 60_000
+      );
+      if (hasFreshNonReconcileWrites) {
+        // Only hold off briefly if fresh incremental writes are actively draining
         return true;
       }
 
@@ -296,17 +329,17 @@ async function syncFromUpstreamServer(force = false): Promise<boolean> {
         employeeTransactions,
         paymentConflicts,
       ] = await Promise.all([
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/contracts`, 12000),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payments`, 12000),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/customer-lists`, 8000),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/funds`, 8000),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/inventory`, 8000),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/reps`, 8000),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employees`, 8000),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/appointments`, 8000),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/fund-transactions`, 12000),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employee-transactions`, 8000),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payment-conflicts`, 8000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/contracts`, 18000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payments`, 18000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/customer-lists`, 12000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/funds`, 12000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/inventory`, 12000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/reps`, 12000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employees`, 12000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/appointments`, 12000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/fund-transactions`, 18000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employee-transactions`, 12000),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payment-conflicts`, 12000),
       ]);
 
       let updatedAny = false;
@@ -1470,6 +1503,12 @@ async function startServer() {
   if (!pgOkAtStartup) {
     console.log("[DB] Direct PostgreSQL unreachable; syncing from upstream server / FileDB mode.");
     syncFromUpstreamServer(true).catch(() => {});
+    setInterval(() => {
+      if (!isPgConfigured()) {
+        flushUpstreamOutbox().catch(() => 0);
+        syncFromUpstreamServer(false).catch(() => false);
+      }
+    }, 20000);
   } else {
     (async () => {
       await initializeDatabaseSchema();
@@ -1602,7 +1641,7 @@ async function startServer() {
       } else {
         await Promise.race([
           syncFromUpstreamServer(false).catch(() => false),
-          new Promise((resolve) => setTimeout(resolve, 1500)),
+          new Promise((resolve) => setTimeout(resolve, 4500)),
         ]);
       }
     } catch (e) {}
@@ -5879,7 +5918,11 @@ async function startServer() {
           }
           if (fields.length > 0) {
             vals.push(payload.id);
-            await executePg(`UPDATE sales SET ${fields.join(", ")} WHERE id = $${idx}`, vals).catch(() => {});
+            const updRows = await executePg(`UPDATE sales SET ${fields.join(", ")} WHERE id = $${idx} RETURNING id`, vals).catch(() => null);
+            if (isPgConfigured() && Array.isArray(updRows) && updRows.length === 0) {
+              // If the contract was created and edited offline before syncing CREATE_CONTRACT, ensure it is inserted
+              await processSingleSyncAction({ type: 'CREATE_CONTRACT', payload }, skipBalanceRecalc);
+            }
             if (payload.latitude !== undefined || payload.longitude !== undefined) {
               const newLat = (payload.latitude != null && payload.latitude !== 0 && !isNaN(Number(payload.latitude))) ? Number(payload.latitude) : null;
               const newLng = (payload.longitude != null && payload.longitude !== 0 && !isNaN(Number(payload.longitude))) ? Number(payload.longitude) : null;

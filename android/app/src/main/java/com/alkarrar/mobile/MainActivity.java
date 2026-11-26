@@ -14,6 +14,7 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.util.Base64;
 import android.util.Log;
+import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -176,6 +177,14 @@ public class MainActivity extends BridgeActivity {
                 settings.setAllowFileAccess(true);
                 settings.setAllowContentAccess(true);
                 settings.setMediaPlaybackRequiresUserGesture(false);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+                    try {
+                        CookieManager cookieManager = CookieManager.getInstance();
+                        cookieManager.setAcceptCookie(true);
+                        cookieManager.setAcceptThirdPartyCookies(webView, true);
+                    } catch (Throwable ignored) {}
+                }
 
                 PrinterJavascriptInterface nativeInterface = new PrinterJavascriptInterface();
                 webView.addJavascriptInterface(nativeInterface, "AndroidPrinter");
@@ -590,6 +599,16 @@ public class MainActivity extends BridgeActivity {
                 return ForegroundSyncService.readNativePendingQueue(MainActivity.this);
             } catch (Throwable e) {
                 Log.w(TAG, "Error in getPendingQueueFromNative: " + e.getMessage());
+                return "[]";
+            }
+        }
+
+        @JavascriptInterface
+        public String consumeNativeSyncedIds() {
+            try {
+                return ForegroundSyncService.consumeNativeSyncedIds(MainActivity.this);
+            } catch (Throwable e) {
+                Log.w(TAG, "Error in consumeNativeSyncedIds: " + e.getMessage());
                 return "[]";
             }
         }

@@ -324,7 +324,7 @@ export async function fetchWithFallback(
   const method = ((options?.method || 'GET') as string).toUpperCase();
 
   for (const url of urlsToTry) {
-    const perUrlTimeout = isNative ? Math.max(timeoutMs || 12000, 12000) : (timeoutMs || 8000);
+    const perUrlTimeout = isNative ? Math.max(timeoutMs || 15000, 15000) : Math.max(timeoutMs || 12000, 10000);
 
     // On Android/iOS APK, try direct native CapacitorHttp.request first (immune to CORS & Mixed Content & proxy bugs)
     if (isNative) {
@@ -446,13 +446,23 @@ export async function checkServerHealth(url?: string): Promise<{ ok: boolean; st
     : (baseUrl ? `${baseUrl}/api/health` : '/api/health');
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10500);
-    const res = await fetch(targetUrl, {
-      signal: controller.signal,
-      headers: { 'Accept': 'application/json' }
-    });
-    clearTimeout(timer);
+    let res: Response | null = null;
+    if (isNative) {
+      res = await executeNativeCapacitorHttp(
+        targetUrl,
+        { method: 'GET', headers: { 'Accept': 'application/json' } },
+        12000
+      ).catch(() => null);
+    }
+    if (!res) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
+      res = await fetch(targetUrl, {
+        signal: controller.signal,
+        headers: { 'Accept': 'application/json' }
+      });
+      clearTimeout(timer);
+    }
     const latencyMs = Date.now() - start;
 
     if (res.ok) {

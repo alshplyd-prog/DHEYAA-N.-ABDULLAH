@@ -42,7 +42,8 @@ import {
 import {
   get5DayPruneAndPollStatus,
   run5DayPruneAndPollingInspection,
-  reconcileAllLocalWithDatabase
+  reconcileAllLocalWithDatabase,
+  auditAndRequeueUnsyncedPayments
 } from '../lib/postgresClient';
 import { getCustomServerUrl, setCustomServerUrl, checkServerHealth } from '../lib/apiConfig';
 
@@ -141,13 +142,31 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
   const handleManualFlush = async () => {
     setIsSyncing(true);
     try {
+      await auditAndRequeueUnsyncedPayments().catch(() => 0);
       const res = await flushPendingQueue();
+      if (res.flushed > 0) {
+        await reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+      }
       await loadHealthAndQueue();
-      showToast(
-        isAr
-          ? `تمت المزامنة بنجاح! تم رفع ${res.flushed} عملية، المتبقي: ${res.remaining}`
-          : `Synced! ${res.flushed} uploaded, remaining: ${res.remaining}`
-      );
+      if (res.remaining > 0 && res.flushed === 0) {
+        showToast(
+          isAr
+            ? `تعذر رفع المعلقات الآن (${res.remaining} عملية بانتظار الاتصال بالسيرفر)`
+            : `Upload failed (${res.remaining} pending)`
+        );
+      } else if (res.remaining > 0) {
+        showToast(
+          isAr
+            ? `تم رفع ${res.flushed} عملية، المتبقي: ${res.remaining}`
+            : `Uploaded ${res.flushed}, remaining: ${res.remaining}`
+        );
+      } else {
+        showToast(
+          isAr
+            ? `تمت المزامنة بنجاح! تم رفع ${res.flushed} عملية بالكامل`
+            : `Synced! ${res.flushed} uploaded cleanly`
+        );
+      }
     } catch (err: any) {
       showToast(isAr ? `فشل المزامنة: ${err?.message || err}` : `Sync failed: ${err?.message || err}`);
     } finally {

@@ -376,32 +376,32 @@ export function getPendingQueueSync(): PendingAction[] {
     if (!Array.isArray(list)) return [];
     const now = Date.now();
     
-    // Deduplicate by entity/payload ID (keep latest action per record)
+    // Deduplicate by actionType + entityId so CREATE_* is never discarded by a later UPDATE_*
     const entityMap = new Map<string, any>();
     for (const item of list) {
       if (!item || item.id?.startsWith('__meta_') || item.type === '__META_CONFIG__' || permanentlySynced.has(item.id)) continue;
+      if (item.status === 'synced') continue;
       const entityId = item.payload?.id || (typeof item.payload === 'string' ? item.payload : item.id);
-      if (entityId) {
-        const existing = entityMap.get(entityId);
-        if (!existing || Number(item.timestamp || 0) > Number(existing.timestamp || 0)) {
-          entityMap.set(entityId, item);
-        }
-      } else {
-        entityMap.set(item.id, item);
+      const dedupKey = entityId ? `${item.type || 'ACTION'}:${entityId}` : item.id;
+      const existing = entityMap.get(dedupKey);
+      if (!existing || Number(item.timestamp || 0) > Number(existing.timestamp || 0)) {
+        entityMap.set(dedupKey, item);
       }
     }
 
-    return Array.from(entityMap.values()).map((item) => ({
-      id: item.id,
-      type: item.type,
-      payload: item.payload,
-      timestamp: Number(item.timestamp) || now,
-      status: (item.status === 'synced' ? 'synced' : (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 10000 ? 'syncing' : 'pending')) as ActionStatus,
-      retryCount: Number(item.retryCount) || 0,
-      error: item.error || null,
-      syncedAt: item.syncedAt || null,
-      lastAttemptAt: item.lastAttemptAt || null,
-    }));
+    return Array.from(entityMap.values())
+      .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0))
+      .map((item) => ({
+        id: item.id,
+        type: item.type,
+        payload: item.payload,
+        timestamp: Number(item.timestamp) || now,
+        status: (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 10000 ? 'syncing' : 'pending') as ActionStatus,
+        retryCount: Number(item.retryCount) || 0,
+        error: item.error || null,
+        syncedAt: item.syncedAt || null,
+        lastAttemptAt: item.lastAttemptAt || null,
+      }));
   } catch (e) {
     return [];
   }
@@ -436,12 +436,22 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
 
     // 2. Read from Native Android Bridge, Preferences and localStorage
     let nativeList: any[] = [];
+    let nativeSyncedIds: string[] = [];
     try {
       const bridge =
         (window as any).AndroidInterface ||
         (window as any).AndroidPrinter ||
         (window as any).Android ||
         (window as any).AndroidBridge;
+      if (bridge && typeof bridge.consumeNativeSyncedIds === 'function') {
+        const rawSynced = bridge.consumeNativeSyncedIds();
+        if (rawSynced && rawSynced.startsWith('[') && rawSynced.endsWith(']')) {
+          const parsedSynced = JSON.parse(rawSynced);
+          if (Array.isArray(parsedSynced)) {
+            nativeSyncedIds = parsedSynced.filter(Boolean);
+          }
+        }
+      }
       if (bridge && typeof bridge.getPendingQueueFromNative === 'function') {
         const rawNative = bridge.getPendingQueueFromNative();
         if (rawNative && rawNative.startsWith('[') && rawNative.endsWith(']')) {
@@ -449,6 +459,11 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
         }
       }
     } catch (e) {}
+
+    if (nativeSyncedIds.length > 0 || swSyncedIds.length > 0) {
+      markActionIdsAsPermanentlySynced([...swSyncedIds, ...nativeSyncedIds]);
+    }
+    const permanentlySyncedSet = getPermanentlySyncedIds();
 
     let prefList: any[] = [];
     try {
@@ -462,22 +477,33 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
       if (local) localList = JSON.parse(local);
     } catch (e) {}
 
+    const syncedIdsSeen = new Set<string>([...swSyncedIds, ...nativeSyncedIds]);
+    for (const src of [idbActions, nativeList, prefList, localList]) {
+      if (!Array.isArray(src)) continue;
+      for (const item of src) {
+        if (item?.id && item.status === 'synced') {
+          syncedIdsSeen.add(item.id);
+        }
+      }
+    }
+    if (syncedIdsSeen.size > 0) {
+      markActionIdsAsPermanentlySynced(Array.from(syncedIdsSeen));
+      syncedIdsSeen.forEach((sid) => permanentlySyncedSet.add(sid));
+    }
+
     const mergedMap = new Map<string, PendingAction>();
     const entityLatestMap = new Map<string, any>();
     const now = Date.now();
 
     const addAction = (item: any) => {
       if (!item || !item.id || item.id.startsWith('__meta_') || item.type === '__META_CONFIG__') return;
-      if (swSyncedSet.has(item.id)) return; // Already uploaded by Service Worker while app was closed
-      
+      if (swSyncedSet.has(item.id) || permanentlySyncedSet.has(item.id) || item.status === 'synced') return;
+
       const entityId = item.payload?.id || (typeof item.payload === 'string' ? item.payload : item.id);
-      if (entityId) {
-        const existingEntity = entityLatestMap.get(entityId);
-        if (!existingEntity || Number(item.timestamp || 0) > Number(existingEntity.timestamp || 0)) {
-          entityLatestMap.set(entityId, item);
-        }
-      } else {
-        entityLatestMap.set(item.id, item);
+      const dedupKey = entityId ? `${item.type || 'ACTION'}:${entityId}` : item.id;
+      const existingEntity = entityLatestMap.get(dedupKey);
+      if (!existingEntity || Number(item.timestamp || 0) > Number(existingEntity.timestamp || 0)) {
+        entityLatestMap.set(dedupKey, item);
       }
     };
 
@@ -486,14 +512,16 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
     if (Array.isArray(prefList)) prefList.forEach(addAction);
     if (Array.isArray(localList)) localList.forEach(addAction);
 
-    const filteredActions = Array.from(entityLatestMap.values());
+    const filteredActions = Array.from(entityLatestMap.values()).sort(
+      (a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0)
+    );
     for (const item of filteredActions) {
       mergedMap.set(item.id, {
         id: item.id,
         type: item.type,
         payload: item.payload,
         timestamp: Number(item.timestamp) || now,
-        status: (item.status === 'synced' ? 'synced' : (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 10000 ? 'syncing' : 'pending')) as ActionStatus,
+        status: (item.status === 'syncing' && item.lastAttemptAt && now - item.lastAttemptAt < 10000 ? 'syncing' : 'pending') as ActionStatus,
         retryCount: Number(item.retryCount) || 0,
         error: item.error || null,
         syncedAt: item.syncedAt || null,
@@ -506,7 +534,7 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
     localStorage.setItem(QUEUE_KEY, jsonStr);
     syncToNativeAndroid(merged);
 
-    if (swSyncedIds.length > 0 || (idbActions.length === 0 && merged.length > 0)) {
+    if (swSyncedIds.length > 0 || nativeSyncedIds.length > 0 || (idbActions.length === 0 && merged.length > 0)) {
       syncQueueToIndexedDb(merged).catch(() => {});
     }
 
@@ -1007,9 +1035,10 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
     // Save to IndexedDB asynchronously in background without blocking immediate batch network fetch
     actionsToSync.forEach((a) => saveActionToIndexedDb(a).catch(() => {}));
 
-    // 3. Path A: Send Batch Request to /api/sync/batch in chunks of 200 (with fast 12s timeout)
+    // 3. Path A: Send Batch Request to /api/sync/batch in chunks of 40 (with 25s timeout for Hostinger RTT)
     let processedIdsFromBatch: string[] = [];
-    const BATCH_CHUNK = 200;
+    let lastBatchErrorMsg: string | null = null;
+    const BATCH_CHUNK = 40;
     for (let b = 0; b < actionsToSync.length; b += BATCH_CHUNK) {
       const batchSlice = actionsToSync.slice(b, b + BATCH_CHUNK);
       try {
@@ -1020,11 +1049,12 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ actions: batchSlice }),
           },
-          15000
+          25000
         );
 
         if (response && response.ok && response.status >= 200 && response.status < 300) {
           if (response.url && response.url.includes('accounts.google.com')) {
+            lastBatchErrorMsg = 'تم التوجيه لصفحة تسجيل الدخول';
             continue;
           }
           const ct = (response.headers?.get('content-type') || '').toLowerCase();
@@ -1034,11 +1064,18 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
               processedIdsFromBatch.push(...data.processedIds);
             } else if (data && data.success) {
               processedIdsFromBatch.push(...batchSlice.map((a) => a.id));
+            } else if (data?.error) {
+              lastBatchErrorMsg = String(data.error);
             }
+          } else {
+            lastBatchErrorMsg = 'استجابة HTML غير صالحة من الخادم';
           }
+        } else if (response) {
+          lastBatchErrorMsg = `HTTP ${response.status}`;
         }
       } catch (netErr: any) {
-        console.log('[Offline Sync Engine] Batch endpoint chunk notice, falling back:', netErr?.message || netErr);
+        lastBatchErrorMsg = netErr?.message ? String(netErr.message) : 'تعذر الوصول إلى السيرفر';
+        console.log('[Offline Sync Engine] Batch endpoint chunk notice, falling back:', lastBatchErrorMsg);
       }
     }
 
@@ -1062,14 +1099,13 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
       await Promise.all(deletePromises);
     }
 
-    // 5. Fallback path for unconfirmed actions (parallel chunks of 8)
+    // 5. Fallback path for unconfirmed actions (parallel chunks of 6)
     if (pendingFallbackActions.length > 0) {
-      const CHUNK_SIZE = 8;
+      const CHUNK_SIZE = 6;
       for (let i = 0; i < pendingFallbackActions.length; i += CHUNK_SIZE) {
         const chunk = pendingFallbackActions.slice(i, i + CHUNK_SIZE);
         await Promise.all(
           chunk.map(async (action) => {
-            // First fallback: REST endpoint directly
             const executedViaRest = await executeActionViaRestEndpoint(action);
             if (executedViaRest) {
               action.status = 'synced';
@@ -1080,10 +1116,10 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
               return;
             }
 
-            // Otherwise revert to pending for next retry
+            // Otherwise revert to pending for next retry with diagnostic reason
             action.status = 'pending';
             action.retryCount = (action.retryCount || 0) + 1;
-            action.error = 'Pending connection to sync server';
+            action.error = lastBatchErrorMsg || 'بانتظار الاتصال بسيرفر هوستنجر';
             await saveActionToIndexedDb(action).catch(() => {});
           })
         );

@@ -111,11 +111,12 @@ addEventListener('syncOfflineQueue', async (resolve, reject, args) => {
 
         if (!table) continue;
 
-        const isDelete = type.startsWith('DELETE_') || type.startsWith('RESOLVE_') || type.startsWith('REJECT_');
+        const isDelete = type.startsWith('DELETE_') || type.startsWith('REJECT_');
+        const isUpdate = type.startsWith('UPDATE_') || type.startsWith('RESOLVE_');
         let url = `${activeWorkingServer}/api/${table}`;
-        if (isDelete && docId) {
+        if ((isDelete || isUpdate) && docId) {
           url += `/${encodeURIComponent(docId)}`;
-          method = 'DELETE';
+          method = isDelete ? 'DELETE' : 'PUT';
         }
 
         const headers = {

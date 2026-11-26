@@ -306,6 +306,9 @@ async function uploadSingleActionViaRest(action, origins) {
       method = 'DELETE';
       break;
     case 'RESOLVE_PAYMENT_CONFLICT':
+      endpointPath = docId ? `/api/payment-conflicts/${docId}` : '';
+      method = 'PUT';
+      break;
     case 'REJECT_PAYMENT_CONFLICT':
       endpointPath = docId ? `/api/payment-conflicts/${docId}` : '';
       method = 'DELETE';

@@ -123,6 +123,7 @@ var fileDb = {
 
 // src/db/index.ts
 var import_dotenv = __toESM(require("dotenv"), 1);
+var import_os = __toESM(require("os"), 1);
 var import_node_postgres = require("drizzle-orm/node-postgres");
 var import_pg = require("pg");
 
@@ -333,6 +334,38 @@ var usersRelations = (0, import_drizzle_orm.relations)(users, ({ many }) => ({
 
 // src/db/index.ts
 import_dotenv.default.config({ override: true });
+function isHostAddressLocal(hostname) {
+  const clean = (hostname || "").trim().toLowerCase();
+  if (!clean) return false;
+  if (clean === "127.0.0.1" || clean === "localhost" || clean === "::1") return true;
+  try {
+    const nets = import_os.default.networkInterfaces();
+    for (const ifaceList of Object.values(nets)) {
+      if (!ifaceList) continue;
+      for (const iface of ifaceList) {
+        if (iface.address && iface.address.toLowerCase() === clean) {
+          return true;
+        }
+      }
+    }
+  } catch (e) {
+  }
+  return false;
+}
+function rewriteDbUrlToLocalhost(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    u.hostname = "127.0.0.1";
+    u.searchParams.delete("sslmode");
+    return u.toString();
+  } catch {
+    return rawUrl.replace(/@[^:/?#]+/, "@127.0.0.1");
+  }
+}
+function isPlaceholderDbUrl(rawUrl) {
+  const lower = (rawUrl || "").toLowerCase();
+  return !rawUrl || lower.includes("supabase.co") || lower.includes("postgresql://user:password@") || lower.includes("[password]") || lower.includes("[your-password]") || lower.includes("your-password") || /\/database(\?|$)/i.test(rawUrl);
+}
 var resetPool = () => {
   if (global._postgresPool) {
     try {
@@ -343,21 +376,51 @@ var resetPool = () => {
     global._postgresPool = void 0;
   }
 };
-var createPool = () => {
+var createPool = (forceLocalhost = false) => {
+  if (forceLocalhost) {
+    global._preferLocalhostPg = true;
+  }
   if (global._postgresPool) {
     return global._postgresPool;
   }
+  const shouldUseLocalhost = Boolean(forceLocalhost || global._preferLocalhostPg);
   let dbUrl = "";
-  if (process.env.DB_HOST && process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
-    dbUrl = `postgresql://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASSWORD)}@${process.env.DB_HOST}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME}`;
-  } else if (process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_DB_NAME) {
-    dbUrl = `postgresql://${encodeURIComponent(process.env.SQL_USER)}:${encodeURIComponent(process.env.SQL_PASSWORD || "")}@${process.env.SQL_HOST}:${process.env.SQL_PORT || 5432}/${process.env.SQL_DB_NAME}`;
-  } else if (process.env.DATABASE_URL && !process.env.DATABASE_URL.includes("supabase.co") && !process.env.DATABASE_URL.includes("[PASSWORD]") && !process.env.DATABASE_URL.includes("[YOUR-PASSWORD]") && !process.env.DATABASE_URL.includes("YOUR-PASSWORD")) {
+  if (process.env.DATABASE_URL && !isPlaceholderDbUrl(process.env.DATABASE_URL)) {
     dbUrl = process.env.DATABASE_URL;
+    try {
+      const parsed = new URL(dbUrl);
+      if (shouldUseLocalhost || isHostAddressLocal(parsed.hostname)) {
+        dbUrl = rewriteDbUrlToLocalhost(dbUrl);
+      }
+    } catch (e) {
+    }
+  } else if (process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) {
+    const rawHost = process.env.DB_HOST || "127.0.0.1";
+    const targetHost = shouldUseLocalhost || isHostAddressLocal(rawHost) ? "127.0.0.1" : rawHost;
+    dbUrl = `postgresql://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(process.env.DB_PASSWORD)}@${targetHost}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME}`;
+  } else if (process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_DB_NAME) {
+    const targetHost = shouldUseLocalhost || isHostAddressLocal(process.env.SQL_HOST) ? "127.0.0.1" : process.env.SQL_HOST;
+    dbUrl = `postgresql://${encodeURIComponent(process.env.SQL_USER)}:${encodeURIComponent(process.env.SQL_PASSWORD || "")}@${targetHost}:${process.env.SQL_PORT || 5432}/${process.env.SQL_DB_NAME}`;
   } else {
     return null;
   }
-  const useSsl = process.env.DB_SSL === "true" || dbUrl.includes("sslmode=require");
+  let isLocalTarget = false;
+  try {
+    const parsed = new URL(dbUrl);
+    isLocalTarget = isHostAddressLocal(parsed.hostname);
+  } catch (e) {
+  }
+  const useSsl = !isLocalTarget && process.env.DB_SSL === "true";
+  if (!useSsl) {
+    try {
+      const parsed = new URL(dbUrl);
+      if (parsed.searchParams.has("sslmode")) {
+        parsed.searchParams.delete("sslmode");
+        dbUrl = parsed.toString();
+      }
+    } catch (e) {
+    }
+  }
   const newPool = new import_pg.Pool({
     connectionString: dbUrl,
     ssl: useSsl ? { rejectUnauthorized: false } : false,
@@ -406,7 +469,7 @@ async function probePgConnection() {
   if (activeProbePromise) return activeProbePromise;
   activeProbePromise = (async () => {
     try {
-      const currentPool = createPool();
+      const currentPool = createPool(false);
       if (!currentPool) {
         pgReachable = false;
         return false;
@@ -418,10 +481,23 @@ async function probePgConnection() {
       pgReachable = true;
       return true;
     } catch (err) {
+      resetPool();
+      try {
+        const localPool = createPool(true);
+        if (localPool) {
+          await Promise.race([
+            localPool.query("SELECT 1"),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("PG local probe timeout")), 1500))
+          ]);
+          pgReachable = true;
+          return true;
+        }
+      } catch (_localErr) {
+        resetPool();
+      }
       pgReachable = false;
       lastPgFailureAt = Date.now();
       lastFailureCooldownMs = isAuthOrAclError(err) ? PG_AUTH_RETRY_COOLDOWN_MS : PG_RETRY_COOLDOWN_MS;
-      resetPool();
       return false;
     } finally {
       activeProbePromise = null;
@@ -507,7 +583,7 @@ async function executePg(sql, params = []) {
 var import_fs2 = __toESM(require("fs"), 1);
 var import_path2 = __toESM(require("path"), 1);
 async function initializeDatabaseSchema() {
-  if (!process.env.DATABASE_URL && !process.env.DB_HOST && (!process.env.SQL_HOST || !process.env.SQL_DB_NAME)) {
+  if (!process.env.DATABASE_URL && !process.env.DB_HOST && !process.env.DB_NAME && (!process.env.SQL_HOST || !process.env.SQL_DB_NAME)) {
     console.log("PostgreSQL connection details not provided, skipping schema initialization.");
     return;
   }
@@ -1872,7 +1948,7 @@ var INITIAL_APPOINTMENTS = [
 
 // server.ts
 var import_fs3 = __toESM(require("fs"), 1);
-var import_os = __toESM(require("os"), 1);
+var import_os2 = __toESM(require("os"), 1);
 var import_net = __toESM(require("net"), 1);
 var import_web_push = __toESM(require("web-push"), 1);
 import_dotenv2.default.config({ override: true });
@@ -1895,7 +1971,7 @@ var SERVER_INSTANCE_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 10
 function resolveUpstreamServerUrl() {
   const raw = (process.env.UPSTREAM_SERVER_URL ?? "").trim().replace(/\/+$/, "");
   const lower = raw.toLowerCase();
-  if (!raw || lower.includes("alkarar.baghdad.dev") || lower.includes("5x4c6bq6p4ul7njqnkzon5") || lower.includes("asc5xuvnur4hlmpl5rfxpz") || lower.includes("ais-dev-")) {
+  if (!raw || lower.includes("alkarar.baghdad.dev") || lower.includes("5x4c6bq6p4ul7njqnkzon5") || lower.includes("asc5xuvnur4hlmpl5rfxpz") || lower.includes("ais-dev-") || lower.includes("ais-pre-")) {
     return "http://72.62.158.128:3000";
   }
   return raw;
@@ -1910,7 +1986,7 @@ function isRunningOnUpstreamHost() {
     const localPort = String(process.env.PORT || 3e3);
     if (upPort !== localPort) return false;
     if (upHost === "localhost" || upHost === "127.0.0.1") return true;
-    const nets = import_os.default.networkInterfaces();
+    const nets = import_os2.default.networkInterfaces();
     for (const ifaceList of Object.values(nets)) {
       if (!ifaceList) continue;
       for (const iface of ifaceList) {
@@ -2019,11 +2095,13 @@ function isRequestMatchingUpstream(req) {
   return false;
 }
 async function sendMutationToUpstream(item) {
-  if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost()) return false;
+  if (!UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost()) return { ok: false };
+  const cleanUrl = item.url.startsWith("/") ? item.url : `/${item.url}`;
+  const isHeavySync = cleanUrl.startsWith("/api/sync/reconcile") || cleanUrl.startsWith("/api/sync/batch") || cleanUrl.startsWith("/api/sync/beacon");
+  const timeoutMs = isHeavySync ? 28e3 : 18e3;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3500);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const cleanUrl = item.url.startsWith("/") ? item.url : `/${item.url}`;
     const hasBody = item.method !== "DELETE" && item.method !== "GET" && item.body !== void 0;
     const res = await fetch(`${UPSTREAM_SERVER_URL}${cleanUrl}`, {
       method: item.method,
@@ -2036,12 +2114,15 @@ async function sendMutationToUpstream(item) {
       },
       body: hasBody ? JSON.stringify(item.body) : void 0
     });
-    if (!res.ok) return false;
+    if (!res.ok) {
+      const permanent = res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
+      return { ok: false, permanent };
+    }
     const ct = (res.headers.get("content-type") || "").toLowerCase();
-    if (ct.includes("text/html")) return false;
-    return true;
+    if (ct.includes("text/html")) return { ok: false };
+    return { ok: true };
   } catch {
-    return false;
+    return { ok: false };
   } finally {
     clearTimeout(timer);
   }
@@ -2054,22 +2135,36 @@ async function flushUpstreamOutbox() {
   try {
     const outbox = fileDb.get(UPSTREAM_OUTBOX_KEY) || [];
     if (!Array.isArray(outbox) || outbox.length === 0) return 0;
+    const now = Date.now();
     const remaining = [];
     let upstreamDead = false;
     for (let i = 0; i < outbox.length; i++) {
       const entry = outbox[i];
       if (!entry || !entry.method || !entry.url) continue;
+      const ageMs = entry.timestamp ? now - Number(entry.timestamp) : 0;
+      const attempts = Number(entry.attempts || 0);
+      if (attempts >= 6 || ageMs > 24 * 60 * 60 * 1e3) {
+        continue;
+      }
       if (upstreamDead) {
         remaining.push(entry);
         continue;
       }
-      const ok = await sendMutationToUpstream(entry);
-      if (ok) {
+      const res = await sendMutationToUpstream(entry);
+      if (res.ok) {
         flushed++;
         upstreamConnected = true;
+      } else if (res.permanent) {
+        continue;
       } else {
-        upstreamDead = true;
-        remaining.push(entry);
+        entry.attempts = attempts + 1;
+        entry.lastAttemptAt = now;
+        if (entry.attempts < 6) {
+          remaining.push(entry);
+        }
+        if (!String(entry.url).startsWith("/api/sync/reconcile")) {
+          upstreamDead = true;
+        }
       }
     }
     fileDb.setAll(UPSTREAM_OUTBOX_KEY, remaining);
@@ -2081,15 +2176,22 @@ async function flushUpstreamOutbox() {
 function enqueueAndForwardUpstreamMutation(method, url, body) {
   if (isPgConfigured() || !UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost()) return;
   try {
-    const outbox = fileDb.get(UPSTREAM_OUTBOX_KEY) || [];
+    const cleanUrl = url.startsWith("/") ? url : `/${url}`;
+    if (!cleanUrl.startsWith("/api/")) return;
+    let outbox = fileDb.get(UPSTREAM_OUTBOX_KEY) || [];
+    if (!Array.isArray(outbox)) outbox = [];
+    if (cleanUrl.startsWith("/api/sync/reconcile")) {
+      outbox = outbox.filter((e) => !String(e?.url || "").startsWith("/api/sync/reconcile"));
+    }
     outbox.push({
       id: `up_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       method,
-      url,
+      url: cleanUrl,
       body,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      attempts: 0
     });
-    fileDb.setAll(UPSTREAM_OUTBOX_KEY, outbox.slice(-1e3));
+    fileDb.setAll(UPSTREAM_OUTBOX_KEY, outbox.slice(-500));
     void flushUpstreamOutbox();
   } catch (e) {
   }
@@ -2108,7 +2210,7 @@ async function syncFromUpstreamServer(force = false) {
   inFlightUpstreamSync = (async () => {
     try {
       lastUpstreamCheckAt = Date.now();
-      const verRes = await fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/sync/version`, 3500);
+      const verRes = await fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/sync/version`, 8500);
       if (!verRes || verRes.syncVersion === void 0) {
         upstreamConnected = false;
         return false;
@@ -2116,7 +2218,10 @@ async function syncFromUpstreamServer(force = false) {
       upstreamConnected = true;
       await flushUpstreamOutbox().catch(() => 0);
       const pendingOutbox = fileDb.get(UPSTREAM_OUTBOX_KEY) || [];
-      if (pendingOutbox.length > 0) {
+      const hasFreshNonReconcileWrites = Array.isArray(pendingOutbox) && pendingOutbox.some(
+        (e) => e && !String(e.url || "").startsWith("/api/sync/reconcile") && Date.now() - Number(e.timestamp || 0) < 6e4
+      );
+      if (hasFreshNonReconcileWrites) {
         return true;
       }
       if (!force && !needsUrgentSeed && lastUpstreamSyncVersion !== null && String(verRes.syncVersion) === String(lastUpstreamSyncVersion)) {
@@ -2135,17 +2240,17 @@ async function syncFromUpstreamServer(force = false) {
         employeeTransactions2,
         paymentConflicts2
       ] = await Promise.all([
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/contracts`, 12e3),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payments`, 12e3),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/customer-lists`, 8e3),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/funds`, 8e3),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/inventory`, 8e3),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/reps`, 8e3),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employees`, 8e3),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/appointments`, 8e3),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/fund-transactions`, 12e3),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employee-transactions`, 8e3),
-        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payment-conflicts`, 8e3)
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/contracts`, 18e3),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payments`, 18e3),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/customer-lists`, 12e3),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/funds`, 12e3),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/inventory`, 12e3),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/reps`, 12e3),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employees`, 12e3),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/appointments`, 12e3),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/fund-transactions`, 18e3),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employee-transactions`, 12e3),
+        fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payment-conflicts`, 12e3)
       ]);
       let updatedAny = false;
       if (Array.isArray(contracts) && (contracts.length > 2 || currentContracts.length <= 2)) {
@@ -3153,6 +3258,12 @@ async function startServer() {
     console.log("[DB] Direct PostgreSQL unreachable; syncing from upstream server / FileDB mode.");
     syncFromUpstreamServer(true).catch(() => {
     });
+    setInterval(() => {
+      if (!isPgConfigured()) {
+        flushUpstreamOutbox().catch(() => 0);
+        syncFromUpstreamServer(false).catch(() => false);
+      }
+    }, 2e4);
   } else {
     (async () => {
       await initializeDatabaseSchema();
@@ -3262,7 +3373,7 @@ async function startServer() {
       } else {
         await Promise.race([
           syncFromUpstreamServer(false).catch(() => false),
-          new Promise((resolve) => setTimeout(resolve, 1500))
+          new Promise((resolve) => setTimeout(resolve, 4500))
         ]);
       }
     } catch (e) {
@@ -5485,19 +5596,30 @@ async function startServer() {
       res.status(500).json({ error: err.message });
     }
   });
+  let rep1VerifiedInPg = false;
+  async function ensureRep1OnceInPg() {
+    if (rep1VerifiedInPg) return;
+    await executePg("DELETE FROM deleted_records WHERE record_id = 'rep-1' OR record_id IN (SELECT id FROM reps WHERE name LIKE '%\u0636\u064A\u0627\u0621%')").catch(() => {
+    });
+    await executePg(`
+      INSERT INTO reps (id, name, phone, code, role, can_edit, can_delete, can_move_customer, can_sell, allowed_list_ids)
+      VALUES ('rep-1', '\u0636\u064A\u0627\u0621 \u0627\u0644\u0645\u062D\u0627\u0633\u0628', '07801112233', '4444', 'admin', true, true, true, true, '["all"]')
+      ON CONFLICT (id) DO UPDATE SET name = '\u0636\u064A\u0627\u0621 \u0627\u0644\u0645\u062D\u0627\u0633\u0628', role = 'admin', can_edit = true, can_delete = true, can_move_customer = true, can_sell = true, allowed_list_ids = '["all"]'
+    `).catch(() => {
+    });
+    rep1VerifiedInPg = true;
+  }
   app.get("/api/reps", async (req, res) => {
     try {
       if (isPgConfigured()) {
         try {
-          await executePg("DELETE FROM deleted_records WHERE record_id = 'rep-1' OR record_id IN (SELECT id FROM reps WHERE name LIKE '%\u0636\u064A\u0627\u0621%')").catch(() => {
-          });
-          await executePg(`
-            INSERT INTO reps (id, name, phone, code, role, can_edit, can_delete, can_move_customer, can_sell, allowed_list_ids)
-            VALUES ('rep-1', '\u0636\u064A\u0627\u0621 \u0627\u0644\u0645\u062D\u0627\u0633\u0628', '07801112233', '4444', 'admin', true, true, true, true, '["all"]')
-            ON CONFLICT (id) DO UPDATE SET name = '\u0636\u064A\u0627\u0621 \u0627\u0644\u0645\u062D\u0627\u0633\u0628', role = 'admin', can_edit = true, can_delete = true, can_move_customer = true, can_sell = true, allowed_list_ids = '["all"]'
-          `).catch(() => {
-          });
-          const rows = await executePgStrict("SELECT * FROM reps r WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = r.id AND dr.record_id != 'rep-1' AND (dr.table_name = 'reps' OR dr.table_name = 'unknown')) ORDER BY r.name ASC");
+          await ensureRep1OnceInPg();
+          let rows = await executePgStrict("SELECT * FROM reps r WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = r.id AND dr.record_id != 'rep-1' AND (dr.table_name = 'reps' OR dr.table_name = 'unknown')) ORDER BY r.name ASC");
+          if (rows && !rows.some((r) => r.id === "rep-1")) {
+            rep1VerifiedInPg = false;
+            await ensureRep1OnceInPg();
+            rows = await executePgStrict("SELECT * FROM reps r WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = r.id AND dr.record_id != 'rep-1' AND (dr.table_name = 'reps' OR dr.table_name = 'unknown')) ORDER BY r.name ASC");
+          }
           if (rows && rows.length > 0) {
             const reps3 = rows.map(mapRepRow);
             if (!reps3.some((r) => r.id === "rep-1" || r.name && r.name.includes("\u0636\u064A\u0627\u0621"))) {
@@ -7290,8 +7412,10 @@ async function startServer() {
           }
           if (fields.length > 0) {
             vals.push(payload.id);
-            await executePg(`UPDATE sales SET ${fields.join(", ")} WHERE id = $${idx}`, vals).catch(() => {
-            });
+            const updRows = await executePg(`UPDATE sales SET ${fields.join(", ")} WHERE id = $${idx} RETURNING id`, vals).catch(() => null);
+            if (isPgConfigured() && Array.isArray(updRows) && updRows.length === 0) {
+              await processSingleSyncAction({ type: "CREATE_CONTRACT", payload }, skipBalanceRecalc);
+            }
             if (payload.latitude !== void 0 || payload.longitude !== void 0) {
               const newLat = payload.latitude != null && payload.latitude !== 0 && !isNaN(Number(payload.latitude)) ? Number(payload.latitude) : null;
               const newLng = payload.longitude != null && payload.longitude !== 0 && !isNaN(Number(payload.longitude)) ? Number(payload.longitude) : null;
@@ -8280,25 +8404,25 @@ async function startServer() {
   async function autoSyncCustomersAndSalesInPg() {
     return;
   }
+  let lastSyncAllMaintenanceAt = 0;
   app.get("/api/sync/all", async (req, res) => {
     try {
       const pgOk = await probePgConnection();
       if (pgOk && isPgConfigured()) {
-        await cleanupDuplicateEntities().catch(() => {
-        });
-        await syncCustomersTableInPg().catch(() => {
-        });
-        if (req.query.audit === "true" || req.query.force_recalc === "true") {
+        const forceAudit = req.query.audit === "true" || req.query.force_recalc === "true";
+        const nowMs = Date.now();
+        if (forceAudit || nowMs - lastSyncAllMaintenanceAt > 10 * 60 * 1e3) {
+          lastSyncAllMaintenanceAt = nowMs;
+          await cleanupDuplicateEntities().catch(() => {
+          });
+          await syncCustomersTableInPg().catch(() => {
+          });
+        }
+        if (forceAudit) {
           await syncContractBalancesInPgAndFileDb().catch(() => {
           });
         }
-        await executePg("DELETE FROM deleted_records WHERE record_id = 'rep-1' OR record_id IN (SELECT id FROM reps WHERE name LIKE '%\u0636\u064A\u0627\u0621%')").catch(() => {
-        });
-        await executePg(`
-          INSERT INTO reps (id, name, phone, code, role, can_edit, can_delete, can_move_customer, can_sell, allowed_list_ids)
-          VALUES ('rep-1', '\u0636\u064A\u0627\u0621 \u0627\u0644\u0645\u062D\u0627\u0633\u0628', '07801112233', '4444', 'admin', true, true, true, true, '["all"]')
-          ON CONFLICT (id) DO UPDATE SET name = '\u0636\u064A\u0627\u0621 \u0627\u0644\u0645\u062D\u0627\u0633\u0628', role = 'admin', can_edit = true, can_delete = true, can_move_customer = true, can_sell = true, allowed_list_ids = '["all"]'
-        `).catch(() => {
+        await ensureRep1OnceInPg().catch(() => {
         });
         const [
           contractsRows,
@@ -8315,22 +8439,48 @@ async function startServer() {
           deletedRows
         ] = await Promise.all([
           executePg(`
-            SELECT 
+            WITH active_payments AS (
+              SELECT p.contract_id,
+                     TRIM(LOWER(p.customer_name)) AS norm_name,
+                     COALESCE(p.amount_paid, p.amount, 0) AS amt,
+                     p.payment_date
+              FROM payments p
+              WHERE NOT EXISTS (
+                SELECT 1 FROM deleted_records dr
+                WHERE dr.record_id = p.id AND dr.table_name = 'payments'
+              )
+            ),
+            by_contract AS (
+              SELECT contract_id,
+                     COUNT(*) AS cnt,
+                     SUM(amt) AS total_amt,
+                     MAX(payment_date) AS max_date
+              FROM active_payments
+              WHERE contract_id IS NOT NULL AND contract_id != ''
+              GROUP BY contract_id
+            ),
+            by_name AS (
+              SELECT norm_name,
+                     COUNT(*) AS cnt,
+                     SUM(amt) AS total_amt,
+                     MAX(payment_date) AS max_date
+              FROM active_payments
+              WHERE (contract_id IS NULL OR contract_id = '') AND norm_name != ''
+              GROUP BY norm_name
+            )
+            SELECT
               c.*,
-              (SELECT COUNT(*) FROM payments p WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name))) AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments'))) AS payment_count,
-              COALESCE((
-                SELECT SUM(COALESCE(p.amount_paid, p.amount, 0))
-                FROM payments p
-                WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                  AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments'))
-              ), 0) AS actual_total_paid,
-              (
-                SELECT MAX(p.payment_date)
-                FROM payments p
-                WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                  AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments'))
-              ) AS actual_last_payment_date
+              COALESCE(bc.cnt, 0) + COALESCE(bn.cnt, 0) AS payment_count,
+              COALESCE(bc.total_amt, 0) + COALESCE(bn.total_amt, 0) AS actual_total_paid,
+              CASE
+                WHEN bc.max_date IS NULL THEN bn.max_date
+                WHEN bn.max_date IS NULL THEN bc.max_date
+                WHEN bc.max_date >= bn.max_date THEN bc.max_date
+                ELSE bn.max_date
+              END AS actual_last_payment_date
             FROM sales c
+            LEFT JOIN by_contract bc ON bc.contract_id = c.id
+            LEFT JOIN by_name bn ON bn.norm_name = TRIM(LOWER(c.customer_name))
             WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = c.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts'))
               AND TRIM(c.customer_name) != ''
               AND c.id NOT LIKE 'pay_%' AND c.id NOT LIKE 'fund_%' AND c.id NOT LIKE 'emp_%' AND c.id NOT LIKE 'item_%' AND c.id NOT LIKE 'ft_%' AND c.id NOT LIKE 'emptx_%' AND c.id NOT LIKE 'conflict_%'

@@ -450,6 +450,44 @@ public class ForegroundSyncService extends Service {
     private static final String PREFS_CAPACITOR_PREFERENCES = "CapacitorPreferences";
     private static final String KEY_PENDING_QUEUE = "alkarrar_offline_pending_queue";
     private static final String KEY_SERVER_URL = "alkarrar_backend_server_url";
+    private static final String KEY_NATIVE_SYNCED_IDS = "alkarrar_native_synced_ids";
+
+    public static synchronized void recordNativeSyncedIds(Context context, java.util.Collection<String> ids) {
+        if (context == null || ids == null || ids.isEmpty()) return;
+        try {
+            SharedPreferences prefs = context.getSharedPreferences(PREFS_ALKARRAR, Context.MODE_PRIVATE);
+            String existingRaw = prefs.getString(KEY_NATIVE_SYNCED_IDS, "[]");
+            JSONArray existingArr = new JSONArray(existingRaw != null ? existingRaw : "[]");
+            java.util.LinkedHashSet<String> set = new java.util.LinkedHashSet<>();
+            for (int i = 0; i < existingArr.length(); i++) {
+                String v = existingArr.optString(i, "");
+                if (!v.isEmpty()) set.add(v);
+            }
+            for (String id : ids) {
+                if (id != null && !id.isEmpty()) set.add(id);
+            }
+            JSONArray out = new JSONArray();
+            int skip = Math.max(0, set.size() - 2000);
+            int idx = 0;
+            for (String id : set) {
+                if (idx++ >= skip) out.put(id);
+            }
+            prefs.edit().putString(KEY_NATIVE_SYNCED_IDS, out.toString()).commit();
+        } catch (Throwable ignored) {}
+    }
+
+    public static synchronized String consumeNativeSyncedIds(Context context) {
+        if (context == null) return "[]";
+        try {
+            SharedPreferences prefs = context.getSharedPreferences(PREFS_ALKARRAR, Context.MODE_PRIVATE);
+            String raw = prefs.getString(KEY_NATIVE_SYNCED_IDS, "[]");
+            if (raw != null && !raw.equals("[]")) {
+                prefs.edit().putString(KEY_NATIVE_SYNCED_IDS, "[]").commit();
+                return raw;
+            }
+        } catch (Throwable ignored) {}
+        return "[]";
+    }
 
     public static synchronized void persistPendingQueueFromWeb(Context context, String queueJson, String serverUrl) {
         if (context == null || queueJson == null) return;
@@ -486,12 +524,14 @@ public class ForegroundSyncService extends Service {
                         editor.putString("CapacitorStorage." + KEY_SERVER_URL, serverUrl.trim());
                         editor.putString("CapacitorPreferences." + KEY_SERVER_URL, serverUrl.trim());
                     }
-                    editor.apply();
+                    editor.commit();
                 } catch (Throwable ignored) {}
             }
 
-            // 3. Trigger immediate sync if network is available
-            triggerSyncNow(context);
+            // 3. Trigger immediate sync if network is available and queue is non-empty
+            if (!"[]".equals(queueJson.trim())) {
+                triggerSyncNow(context);
+            }
         } catch (Throwable e) {
             Log.w(TAG, "persistPendingQueueFromWeb error: " + e.getMessage());
         }
@@ -500,9 +540,9 @@ public class ForegroundSyncService extends Service {
     public static synchronized String readNativePendingQueue(Context context) {
         if (context == null) return "[]";
         try {
-            // 1. First check atomic JSON file
+            // 1. First check atomic JSON file (>= 2 handles "[]" empty array cleanly)
             File file = new File(context.getFilesDir(), FILE_NAME_QUEUE);
-            if (file.exists() && file.length() > 2) {
+            if (file.exists() && file.length() >= 2) {
                 try (FileInputStream fis = new FileInputStream(file);
                      ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
                     byte[] buf = new byte[2048];
@@ -636,8 +676,8 @@ public class ForegroundSyncService extends Service {
                         conn.setRequestMethod("POST");
                         conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
                         conn.setRequestProperty("Accept", "application/json");
-                        conn.setConnectTimeout(12000);
-                        conn.setReadTimeout(20000);
+                        conn.setConnectTimeout(15000);
+                        conn.setReadTimeout(25000);
                         conn.setDoOutput(true);
 
                         OutputStream os = conn.getOutputStream();
@@ -710,7 +750,8 @@ public class ForegroundSyncService extends Service {
 
                         String docId = payload.optString("id", actionId);
                         String table = null;
-                        boolean isDelete = actionType.startsWith("DELETE_") || actionType.startsWith("RESOLVE_") || actionType.startsWith("REJECT_");
+                        boolean isDelete = actionType.startsWith("DELETE_") || actionType.startsWith("REJECT_");
+                        boolean isUpdate = actionType.startsWith("UPDATE_") || actionType.startsWith("RESOLVE_");
 
                         if (actionType.contains("CONTRACT")) {
                             table = "contracts";
@@ -739,16 +780,17 @@ public class ForegroundSyncService extends Service {
                         if (table != null) {
                             try {
                                 String ep = primaryBaseUrl + "/api/" + table;
-                                if (isDelete && docId != null) {
-                                    ep += "/" + docId;
+                                if ((isDelete || isUpdate) && docId != null && !docId.isEmpty()) {
+                                    ep += "/" + java.net.URLEncoder.encode(docId, "UTF-8");
                                 }
+                                String httpMethod = isDelete ? "DELETE" : (isUpdate && docId != null && !docId.isEmpty() ? "PUT" : "POST");
                                 URL sUrl = new URL(ep);
                                 HttpURLConnection sConn = (HttpURLConnection) sUrl.openConnection();
-                                sConn.setRequestMethod(isDelete ? "DELETE" : "POST");
+                                sConn.setRequestMethod(httpMethod);
                                 sConn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
                                 sConn.setRequestProperty("Accept", "application/json");
-                                sConn.setConnectTimeout(8000);
-                                sConn.setReadTimeout(20000);
+                                sConn.setConnectTimeout(15000);
+                                sConn.setReadTimeout(25000);
 
                                 if (!isDelete) {
                                     sConn.setDoOutput(true);
@@ -760,7 +802,8 @@ public class ForegroundSyncService extends Service {
                                 }
 
                                 int sCode = sConn.getResponseCode();
-                                if (sCode >= 200 && sCode < 300) {
+                                String sCt = sConn.getContentType();
+                                if (sCode >= 200 && sCode < 300 && (sCt == null || !sCt.toLowerCase().contains("text/html"))) {
                                     if (actionId != null) {
                                         chunkVerifiedIds.add(actionId);
                                     }
@@ -773,21 +816,21 @@ public class ForegroundSyncService extends Service {
                     }
                 }
 
-                // Persist incremental progress immediately
+                // Persist incremental progress immediately and strip synced items so queue shrinks cleanly
                 if (chunkVerifiedIds.size() > 0) {
                     totalSyncedIds.addAll(chunkVerifiedIds);
                     uploadedCount += chunkVerifiedIds.size();
+                    recordNativeSyncedIds(context, chunkVerifiedIds);
 
                     JSONArray updatedQueue = new JSONArray();
                     for (int i = 0; i < queue.length(); i++) {
                         JSONObject item = queue.optJSONObject(i);
                         if (item != null) {
                             String id = item.optString("id", "");
-                            if (totalSyncedIds.contains(id)) {
-                                item.put("status", "synced");
-                                item.put("syncedAt", System.currentTimeMillis());
+                            String st = item.optString("status", "pending");
+                            if (!totalSyncedIds.contains(id) && !"synced".equals(st)) {
+                                updatedQueue.put(item);
                             }
-                            updatedQueue.put(item);
                         }
                     }
                     writeNativePendingQueue(context, updatedQueue.toString());

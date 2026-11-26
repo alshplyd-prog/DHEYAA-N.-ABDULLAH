@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { PaymentConflictRecord, InstallmentContract, SalesRepresentative, Language } from '../types';
 import { getPendingQueue, subscribeToQueueChange, flushPendingQueue, removeFromPendingQueue, clearPendingQueue } from '../lib/offlineQueue';
+import { auditAndRequeueUnsyncedPayments, reconcileAllLocalWithDatabase } from '../lib/postgresClient';
 
 interface OfflinePaymentConflictsModalProps {
   isOpen: boolean;
@@ -69,13 +70,33 @@ export const OfflinePaymentConflictsModal: React.FC<OfflinePaymentConflictsModal
   const handleManualFlush = async () => {
     setIsSyncingQueue(true);
     try {
+      await auditAndRequeueUnsyncedPayments().catch(() => 0);
       const res = await flushPendingQueue();
+      if (res.flushed > 0) {
+        await reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+      }
       const updated = await getPendingQueue();
       setQueueItems(updated);
-      showNotification(
-        isAr ? `تمت المزامنة بنجاح! المتبقي في الطابور: ${res.remaining}` : `Synced successfully! Remaining: ${res.remaining}`,
-        res.remaining === 0 ? 'success' : 'info'
-      );
+      if (res.remaining > 0 && res.flushed === 0) {
+        showNotification(
+          isAr
+            ? `تعذر رفع العمليات المعلقة (${res.remaining} عملية بانتظار الاتصال بالسيرفر)`
+            : `Failed to upload (${res.remaining} remaining)`,
+          'error'
+        );
+      } else if (res.remaining > 0) {
+        showNotification(
+          isAr
+            ? `تم رفع ${res.flushed} عملية، المتبقي في الطابور: ${res.remaining}`
+            : `Uploaded ${res.flushed}, remaining: ${res.remaining}`,
+          'info'
+        );
+      } else {
+        showNotification(
+          isAr ? `تمت المزامنة بنجاح! تم رفع ${res.flushed} عملية بالكامل` : `Synced successfully! Uploaded: ${res.flushed}`,
+          'success'
+        );
+      }
     } catch (e: any) {
       showNotification(
         isAr ? `فشل مزامنة الطابور: ${e?.message || e}` : `Sync failed: ${e?.message || e}`,

@@ -7,9 +7,7 @@ addEventListener('syncOfflineQueue', async (resolve, reject, args) => {
     
     // 1. Read stored server config or use candidate servers (production VPS first)
     let candidateServers = [
-      'http://72.62.158.128:3000',
-      'http://72.62.158.128',
-      'https://ais-pre-xlqzraiyfzyn3zp3b3j5o7-947254878994.europe-west2.run.app'
+      'http://72.62.158.128:3000'
     ];
     if (typeof CapacitorKV !== 'undefined') {
       try {
@@ -113,11 +111,12 @@ addEventListener('syncOfflineQueue', async (resolve, reject, args) => {
 
         if (!table) continue;
 
-        const isDelete = type.startsWith('DELETE_') || type.startsWith('RESOLVE_') || type.startsWith('REJECT_');
+        const isDelete = type.startsWith('DELETE_') || type.startsWith('REJECT_');
+        const isUpdate = type.startsWith('UPDATE_') || type.startsWith('RESOLVE_');
         let url = `${activeWorkingServer}/api/${table}`;
-        if (isDelete && docId) {
+        if ((isDelete || isUpdate) && docId) {
           url += `/${encodeURIComponent(docId)}`;
-          method = 'DELETE';
+          method = isDelete ? 'DELETE' : 'PUT';
         }
 
         const headers = {

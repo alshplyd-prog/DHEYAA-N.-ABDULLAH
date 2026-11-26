@@ -91,7 +91,7 @@ try {
 
     const DEMO_FIX_KEY = 'alkarrar_fix_demo_cache_v6';
     if (!localStorage.getItem(DEMO_FIX_KEY)) {
-      const pendingRaw = localStorage.getItem('sami_pending_queue');
+      const pendingRaw = localStorage.getItem('alkarrar_offline_pending_queue') || localStorage.getItem('sami_pending_queue');
       const pendingArr = pendingRaw ? JSON.parse(pendingRaw) : [];
       const hasPendingContract = Array.isArray(pendingArr) && pendingArr.some((a: any) =>
         a && a.status !== 'synced' && (a.type === 'CREATE_CONTRACT' || a.type === 'UPDATE_CONTRACT' || a.type === 'CREATE_PAYMENT')
@@ -2151,7 +2151,7 @@ export function prunePaymentsOlderThanOneYearFromLocalCache(): {
     // Pending offline payments must NEVER be pruned
     const pendingIds = new Set<string>();
     try {
-      const qRaw = localStorage.getItem('sami_pending_queue') || '[]';
+      const qRaw = localStorage.getItem('alkarrar_offline_pending_queue') || localStorage.getItem('sami_pending_queue') || '[]';
       const q = JSON.parse(qRaw);
       if (Array.isArray(q)) {
         for (const item of q) {
