@@ -750,10 +750,19 @@ public class ForegroundSyncService extends Service {
 
                         String docId = payload.optString("id", actionId);
                         String table = null;
-                        boolean isDelete = actionType.startsWith("DELETE_") || actionType.startsWith("REJECT_");
-                        boolean isUpdate = actionType.startsWith("UPDATE_") || actionType.startsWith("RESOLVE_");
+                        String customEp = null;
+                        boolean isDelete = actionType.startsWith("DELETE_");
+                        boolean isUpdate = actionType.startsWith("UPDATE_") || actionType.startsWith("RESOLVE_") || actionType.startsWith("REJECT_");
 
-                        if (actionType.contains("CONTRACT")) {
+                        if ("REORDER_FUNDS".equals(actionType)) {
+                            customEp = primaryBaseUrl + "/api/funds/reorder";
+                            isDelete = false;
+                            isUpdate = false;
+                        } else if ("REORDER_CUSTOMER_LISTS".equals(actionType)) {
+                            customEp = primaryBaseUrl + "/api/customer-lists/reorder";
+                            isDelete = false;
+                            isUpdate = false;
+                        } else if (actionType.contains("CONTRACT") || actionType.contains("SALE")) {
                             table = "contracts";
                         } else if (actionType.contains("PAYMENT") && !actionType.contains("CONFLICT")) {
                             table = "payments";
@@ -777,10 +786,10 @@ public class ForegroundSyncService extends Service {
                             table = "appointments";
                         }
 
-                        if (table != null) {
+                        if (table != null || customEp != null) {
                             try {
-                                String ep = primaryBaseUrl + "/api/" + table;
-                                if ((isDelete || isUpdate) && docId != null && !docId.isEmpty()) {
+                                String ep = customEp != null ? customEp : (primaryBaseUrl + "/api/" + table);
+                                if (customEp == null && (isDelete || isUpdate) && docId != null && !docId.isEmpty()) {
                                     ep += "/" + java.net.URLEncoder.encode(docId, "UTF-8");
                                 }
                                 String httpMethod = isDelete ? "DELETE" : (isUpdate && docId != null && !docId.isEmpty() ? "PUT" : "POST");
@@ -803,14 +812,15 @@ public class ForegroundSyncService extends Service {
 
                                 int sCode = sConn.getResponseCode();
                                 String sCt = sConn.getContentType();
-                                if (sCode >= 200 && sCode < 300 && (sCt == null || !sCt.toLowerCase().contains("text/html"))) {
+                                if ((sCode >= 200 && sCode < 300 && (sCt == null || !sCt.toLowerCase().contains("text/html")))
+                                        || (isDelete && (sCode == 404 || sCode == 410))) {
                                     if (actionId != null) {
                                         chunkVerifiedIds.add(actionId);
                                     }
                                 }
                                 sConn.disconnect();
                             } catch (Throwable sErr) {
-                                Log.w(TAG, "Chunk fallback error for " + table + ": " + sErr.getMessage());
+                                Log.w(TAG, "Chunk fallback error for " + (table != null ? table : customEp) + ": " + sErr.getMessage());
                             }
                         }
                     }

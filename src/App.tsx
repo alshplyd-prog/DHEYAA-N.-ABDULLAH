@@ -468,15 +468,22 @@ export default function App() {
       try {
         await loadSnapshotFromIndexedDbIfAvailable().catch(() => {});
         const res = await flushPendingQueue();
+        if (res && typeof res.remaining === 'number') {
+          setPendingCount(res.remaining);
+        }
         if (res && res.remaining > 0) {
           await new Promise((r) => setTimeout(r, 800));
           if (!isUserActivelyTypingOrInputFocused()) {
-            await flushPendingQueue();
+            const retryRes = await flushPendingQueue();
+            if (retryRes && typeof retryRes.remaining === 'number') {
+              setPendingCount(retryRes.remaining);
+            }
           }
         }
         if (!isUserActivelyTypingOrInputFocused()) {
           await silentBackgroundSync();
-          await forceRefreshAllDataFromPostgres();
+          const refreshed = await forceRefreshAllDataFromPostgres();
+          if (refreshed) setSyncError(false);
         }
       } catch (e) {
         console.warn('Sync on online notice:', e);
@@ -569,9 +576,16 @@ export default function App() {
       if (hasUnsynced && !isSyncingRef.current) {
         try {
           const res = await flushPendingQueue();
-          setSyncError(false);
+          if (res && typeof res.remaining === 'number') {
+            setPendingCount(res.remaining);
+          }
+          if (res && res.remaining === 0) {
+            setSyncError(false);
+            setIsSyncing(false);
+          }
           if (res && res.flushed > 0) {
-            await forceRefreshAllDataFromPostgres();
+            const ok = await forceRefreshAllDataFromPostgres();
+            if (ok) setSyncError(false);
           }
         } catch (e) {
           setSyncError(true);
@@ -582,6 +596,7 @@ export default function App() {
           const res = await fetchWithFallback('/api/sync/version', { method: 'GET', cache: 'no-store' }, 8000).catch(() => null);
           if (res && res.ok) {
             setSyncError(false);
+            setIsSyncing(false);
             const data = await res.json().catch(() => null);
             if (data && data.syncVersion) {
               const lastKnownVersion = localStorage.getItem('sami_last_sync_version');
@@ -590,6 +605,7 @@ export default function App() {
                   .then((syncRes) => {
                     if (syncRes?.success) {
                       localStorage.setItem('sami_last_sync_version', String(data.syncVersion));
+                      setSyncError(false);
                     }
                   })
                   .catch(() => {});
@@ -666,9 +682,16 @@ export default function App() {
     const bootSync = async () => {
       try {
         enableForegroundService().catch(() => {});
-        await flushPendingQueue();
+        const flushRes = await flushPendingQueue();
+        if (flushRes && typeof flushRes.remaining === 'number') {
+          setPendingCount(flushRes.remaining);
+        }
         await silentBackgroundSync();
-        await forceRefreshAllDataFromPostgres();
+        const refreshed = await forceRefreshAllDataFromPostgres();
+        if (refreshed) {
+          setSyncError(false);
+          setIsSyncing(false);
+        }
       } catch (err) {
         console.warn('Initial boot sync from PostgreSQL warning:', err);
       }
@@ -3698,7 +3721,12 @@ export default function App() {
           setIsSyncing(true);
           try {
             const res = await reconcileAllLocalWithDatabase({ force: true, forcePushAll: true });
+            const flushRes = await flushPendingQueue();
+            if (flushRes && typeof flushRes.remaining === 'number') {
+              setPendingCount(flushRes.remaining);
+            }
             if (res.success) {
+              setSyncError(false);
               showToast(isAr ? 'تمت المطابقة الشاملة ورفع البيانات للسيرفر بنجاح' : 'All data reconciled and synced to server successfully');
             } else {
               showToast(isAr ? (res.message || 'تمت محاولة المزامنة') : 'Sync attempted');
@@ -3706,7 +3734,7 @@ export default function App() {
           } catch (e) {
             showToast(isAr ? 'تعذر الاتصال بالخادم للمزامنة' : 'Sync connection failed');
           } finally {
-            setTimeout(() => setIsSyncing(false), 500);
+            setTimeout(() => setIsSyncing(false), 300);
           }
         }}
       />

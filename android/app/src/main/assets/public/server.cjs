@@ -7327,16 +7327,34 @@ async function startServer() {
             `INSERT INTO sales (id, customer_name, customer_phone, customer_address, item_id, item_name, item_quantity, purchase_price, list_id, list_name, total_price, advance_payment, remaining_balance, daily_installment, start_date, notes, status, last_payment_date, total_paid, rep_name, created_at, completed_at, updated_at, is_edited, latitude, longitude, location_address, location_updated_at)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
              ON CONFLICT (id) DO UPDATE SET
-               customer_name=EXCLUDED.customer_name, customer_phone=EXCLUDED.customer_phone, customer_address=EXCLUDED.customer_address,
-               item_id=EXCLUDED.item_id, item_name=EXCLUDED.item_name, item_quantity=EXCLUDED.item_quantity, purchase_price=EXCLUDED.purchase_price,
-               list_id=EXCLUDED.list_id, list_name=EXCLUDED.list_name, total_price=EXCLUDED.total_price,
-               advance_payment=EXCLUDED.advance_payment, remaining_balance=EXCLUDED.remaining_balance, daily_installment=EXCLUDED.daily_installment,
-               start_date=EXCLUDED.start_date, notes=EXCLUDED.notes, status=EXCLUDED.status, last_payment_date=EXCLUDED.last_payment_date,
-               total_paid=EXCLUDED.total_paid, rep_name=EXCLUDED.rep_name, completed_at=EXCLUDED.completed_at,
-               updated_at=EXCLUDED.updated_at, is_edited=EXCLUDED.is_edited,
-               latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude, location_address=EXCLUDED.location_address, location_updated_at=EXCLUDED.location_updated_at`,
+               customer_name=COALESCE(NULLIF(EXCLUDED.customer_name, ''), sales.customer_name),
+               customer_phone=COALESCE(NULLIF(EXCLUDED.customer_phone, ''), sales.customer_phone),
+               customer_address=COALESCE(EXCLUDED.customer_address, sales.customer_address),
+               item_id=COALESCE(EXCLUDED.item_id, sales.item_id),
+               item_name=COALESCE(NULLIF(EXCLUDED.item_name, ''), sales.item_name),
+               item_quantity=CASE WHEN EXCLUDED.item_quantity > 0 THEN EXCLUDED.item_quantity ELSE sales.item_quantity END,
+               purchase_price=CASE WHEN EXCLUDED.purchase_price > 0 THEN EXCLUDED.purchase_price ELSE sales.purchase_price END,
+               list_id=COALESCE(EXCLUDED.list_id, sales.list_id),
+               list_name=COALESCE(EXCLUDED.list_name, sales.list_name),
+               total_price=CASE WHEN EXCLUDED.total_price > 0 THEN EXCLUDED.total_price ELSE sales.total_price END,
+               advance_payment=CASE WHEN EXCLUDED.advance_payment > 0 THEN EXCLUDED.advance_payment ELSE sales.advance_payment END,
+               remaining_balance=EXCLUDED.remaining_balance,
+               daily_installment=CASE WHEN EXCLUDED.daily_installment > 0 THEN EXCLUDED.daily_installment ELSE sales.daily_installment END,
+               start_date=COALESCE(NULLIF(EXCLUDED.start_date, ''), sales.start_date),
+               notes=COALESCE(EXCLUDED.notes, sales.notes),
+               status=EXCLUDED.status,
+               last_payment_date=COALESCE(EXCLUDED.last_payment_date, sales.last_payment_date),
+               total_paid=EXCLUDED.total_paid,
+               rep_name=COALESCE(NULLIF(EXCLUDED.rep_name, ''), sales.rep_name),
+               completed_at=COALESCE(EXCLUDED.completed_at, sales.completed_at),
+               updated_at=EXCLUDED.updated_at,
+               is_edited=EXCLUDED.is_edited,
+               latitude=COALESCE(EXCLUDED.latitude, sales.latitude),
+               longitude=COALESCE(EXCLUDED.longitude, sales.longitude),
+               location_address=COALESCE(EXCLUDED.location_address, sales.location_address),
+               location_updated_at=COALESCE(EXCLUDED.location_updated_at, sales.location_updated_at)`,
             vals
-          );
+          ).catch((err) => console.warn("Error upserting contract in sync:", err));
           return true;
         }
         case "UPDATE_CONTRACT": {
@@ -7595,19 +7613,19 @@ async function startServer() {
             `INSERT INTO payments (id, contract_id, customer_name, amount, amount_paid, payment_date, note, rep_name, fund_id, created_at, is_edited, latitude, longitude)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
              ON CONFLICT (id) DO UPDATE SET
-               contract_id = EXCLUDED.contract_id,
-               customer_name = EXCLUDED.customer_name,
+               contract_id = COALESCE(NULLIF(EXCLUDED.contract_id, ''), payments.contract_id),
+               customer_name = COALESCE(NULLIF(EXCLUDED.customer_name, ''), payments.customer_name),
                amount = EXCLUDED.amount,
                amount_paid = EXCLUDED.amount_paid,
-               payment_date = EXCLUDED.payment_date,
-               note = EXCLUDED.note,
-               rep_name = EXCLUDED.rep_name,
-               fund_id = EXCLUDED.fund_id,
+               payment_date = COALESCE(NULLIF(EXCLUDED.payment_date, ''), payments.payment_date),
+               note = COALESCE(EXCLUDED.note, payments.note),
+               rep_name = COALESCE(NULLIF(EXCLUDED.rep_name, ''), payments.rep_name),
+               fund_id = COALESCE(EXCLUDED.fund_id, payments.fund_id),
                is_edited = EXCLUDED.is_edited,
                latitude = COALESCE(EXCLUDED.latitude, payments.latitude),
                longitude = COALESCE(EXCLUDED.longitude, payments.longitude)`,
             [saved.id, cId, cName, amt, amt, pDate, pNote, rName, resolvedFundId, cAt, isEd, pLat, pLng]
-          );
+          ).catch((err) => console.warn("Error upserting payment in sync:", err));
           if (cId && pLat != null && pLng != null && !isNaN(pLat) && !isNaN(pLng) && pLat !== 0 && pLng !== 0) {
             const nowIso = (/* @__PURE__ */ new Date()).toISOString();
             const shouldForceUpdate = Boolean(payload.updateCustomerLocation || payload.shouldUpdateCustomerLocation);
@@ -7664,10 +7682,11 @@ async function startServer() {
           fileDb.update("payments", payload.id, { ...payload, amount: amt, amountPaid: amt, fundId: resolvedFundId || payload.fundId });
           await executePg(
             `UPDATE payments SET amount = COALESCE($1, amount), amount_paid = COALESCE($1, amount_paid), note = COALESCE($2, note), payment_date = COALESCE($3, payment_date), rep_name = COALESCE($4, rep_name), fund_id = COALESCE($5, fund_id) WHERE id = $6`,
-            [amt, payload.note ?? payload.notes, payload.paymentDate ?? payload.payment_date, payload.repName ?? payload.rep_name, resolvedFundId, payload.id]
-          );
+            [amt, payload.note ?? payload.notes ?? null, payload.paymentDate ?? payload.payment_date ?? null, payload.repName ?? payload.rep_name ?? null, resolvedFundId ?? null, payload.id]
+          ).catch((err) => console.warn("Error updating payment in sync:", err));
           if (cId && !skipBalanceRecalc) {
-            await syncContractBalancesInPgAndFileDb([cId]);
+            await syncContractBalancesInPgAndFileDb([cId]).catch(() => {
+            });
           }
           return true;
         }
@@ -7721,7 +7740,7 @@ async function startServer() {
                name = EXCLUDED.name, price = EXCLUDED.price, purchase_price = EXCLUDED.purchase_price,
                quantity = EXCLUDED.quantity, daily_installment = EXCLUDED.daily_installment, category = EXCLUDED.category`,
             [saved.id, itemName, saved.price ?? 0, saved.purchasePrice ?? 0, saved.quantity ?? 0, saved.dailyInstallment ?? 0, saved.category || "", saved.createdAt || (/* @__PURE__ */ new Date()).toISOString()]
-          );
+          ).catch((err) => console.warn("Error upserting inventory in sync:", err));
           return true;
         }
         case "DELETE_INVENTORY": {
@@ -8703,12 +8722,12 @@ async function startServer() {
           if (act?.id) processedIds.push(act.id);
           continue;
         }
-        if (act?.type === "CREATE_PAYMENT" || act?.type === "UPDATE_PAYMENT") {
+        if (act?.type === "CREATE_PAYMENT" || act?.type === "RECORD_PAYMENT" || act?.type === "ADD_PAYMENT") {
           if (targetId && deletedSet.has(targetId)) {
             deletedSet.delete(targetId);
           }
           paymentActions.push(act);
-        } else if (act?.type === "CREATE_CONTRACT") {
+        } else if (act?.type === "CREATE_CONTRACT" || act?.type === "ADD_SALE") {
           contractActions.push(act);
         } else {
           otherActions.push(act);
@@ -8718,6 +8737,7 @@ async function startServer() {
         const paymentRows = paymentActions.map((act) => {
           const p = act.payload || {};
           const amt = Number(p.amount ?? p.amountPaid ?? p.amount_paid) || 0;
+          if (!p.id || amt <= 0) return null;
           const cId = p.contractId ?? p.contract_id ?? "";
           const cName = p.customerName ?? p.customer_name ?? "";
           const pDate = p.paymentDate ?? p.payment_date ?? (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
@@ -8756,7 +8776,7 @@ async function startServer() {
             created_at: String(cAt),
             is_edited: isEd
           };
-        }).filter((r) => r.id);
+        }).filter((r) => Boolean(r && r.id));
         const uniquePaymentRowsMap = /* @__PURE__ */ new Map();
         for (const row of paymentRows) {
           if (row && row.id) {
@@ -8764,7 +8784,11 @@ async function startServer() {
           }
         }
         const dedupedPaymentRows = Array.from(uniquePaymentRowsMap.values());
-        if (dedupedPaymentRows.length > 0) {
+        if (dedupedPaymentRows.length === 0) {
+          for (const act of paymentActions) {
+            if (act?.id) processedIds.push(act.id);
+          }
+        } else if (dedupedPaymentRows.length > 0) {
           try {
             await executePg(`
               INSERT INTO payments (
@@ -8797,14 +8821,14 @@ async function startServer() {
                 is_edited boolean
               )
               ON CONFLICT (id) DO UPDATE SET
-                contract_id = EXCLUDED.contract_id,
-                customer_name = EXCLUDED.customer_name,
+                contract_id = COALESCE(NULLIF(EXCLUDED.contract_id, ''), payments.contract_id),
+                customer_name = COALESCE(NULLIF(EXCLUDED.customer_name, ''), payments.customer_name),
                 amount = EXCLUDED.amount,
                 amount_paid = EXCLUDED.amount_paid,
-                payment_date = EXCLUDED.payment_date,
-                note = EXCLUDED.note,
-                rep_name = EXCLUDED.rep_name,
-                fund_id = EXCLUDED.fund_id,
+                payment_date = COALESCE(NULLIF(EXCLUDED.payment_date, ''), payments.payment_date),
+                note = COALESCE(EXCLUDED.note, payments.note),
+                rep_name = COALESCE(NULLIF(EXCLUDED.rep_name, ''), payments.rep_name),
+                fund_id = COALESCE(EXCLUDED.fund_id, payments.fund_id),
                 is_edited = EXCLUDED.is_edited
             `, [JSON.stringify(dedupedPaymentRows)]);
             for (const row of dedupedPaymentRows) {
@@ -8890,7 +8914,7 @@ async function startServer() {
             updated_at: c.updatedAt ?? c.updated_at ?? (/* @__PURE__ */ new Date()).toISOString(),
             is_edited: Boolean(c.isEdited ?? c.is_edited)
           };
-        }).filter((r) => r.id);
+        }).filter((r) => Boolean(r && r.id));
         const uniqueContractRowsMap = /* @__PURE__ */ new Map();
         for (const row of contractRows) {
           if (row && row.id) {

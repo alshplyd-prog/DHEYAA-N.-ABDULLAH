@@ -38,12 +38,14 @@ import {
   flushPendingQueue,
   subscribeToQueueChange,
   clearPendingQueue,
+  removeFromPendingQueue,
 } from '../lib/offlineQueue';
 import {
   get5DayPruneAndPollStatus,
   run5DayPruneAndPollingInspection,
   reconcileAllLocalWithDatabase,
-  auditAndRequeueUnsyncedPayments
+  auditAndRequeueUnsyncedPayments,
+  verifyAndReconcileWithServer,
 } from '../lib/postgresClient';
 import { getCustomServerUrl, setCustomServerUrl, checkServerHealth } from '../lib/apiConfig';
 
@@ -75,6 +77,7 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [pruneStatus, setPruneStatus] = useState(get5DayPruneAndPollStatus());
   const [isPruningNow, setIsPruningNow] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -143,8 +146,12 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
     setIsSyncing(true);
     try {
       await auditAndRequeueUnsyncedPayments().catch(() => 0);
-      const res = await flushPendingQueue();
-      if (res.flushed > 0) {
+      let res = await flushPendingQueue();
+      if (res.remaining > 0) {
+        await verifyAndReconcileWithServer().catch(() => {});
+        res = await flushPendingQueue();
+      }
+      if (res.flushed > 0 || res.remaining === 0) {
         await reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
       }
       await loadHealthAndQueue();
@@ -158,12 +165,12 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
         showToast(
           isAr
             ? `تم رفع ${res.flushed} عملية، المتبقي: ${res.remaining}`
-            : `Uploaded ${res.flushed}, remaining: ${res.remaining}`
+            : `Uploaded ${res.remaining > 0 ? res.flushed : 0}, remaining: ${res.remaining}`
         );
       } else {
         showToast(
           isAr
-            ? `تمت المزامنة بنجاح! تم رفع ${res.flushed} عملية بالكامل`
+            ? `تمت المزامنة بنجاح! تم رفع ${res.flushed} عملية بالكامل والحالة متصل`
             : `Synced! ${res.flushed} uploaded cleanly`
         );
       }
@@ -569,20 +576,38 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
                   <span>{isAr ? `العمليات في الطابور (${queueItems.length}):` : `Pending Actions (${queueItems.length}):`}</span>
                 </h3>
                 <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      if (window.confirm(isAr ? 'هل أنت متأكد من تفريغ ومسح طابور المزامنة المعلق؟' : 'Are you sure you want to clear the pending queue?')) {
-                        await clearPendingQueue();
-                        await loadHealthAndQueue();
-                        showToast(isAr ? 'تم تفريغ طابور المزامنة المعلق' : 'Pending queue cleared');
-                      }
-                    }}
-                    className="text-[10px] font-bold text-rose-600 hover:text-rose-700 dark:text-rose-400 flex items-center gap-1 px-2 py-0.5 rounded-lg border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 cursor-pointer transition-all"
-                  >
-                    <Trash2 className="w-3 h-3" />
-                    <span>{isAr ? 'تفريغ الطابور' : 'Clear Queue'}</span>
-                  </button>
+                  {confirmClear ? (
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          setConfirmClear(false);
+                          await clearPendingQueue();
+                          await loadHealthAndQueue();
+                          showToast(isAr ? 'تم تفريغ طابور المزامنة المعلق' : 'Pending queue cleared');
+                        }}
+                        className="text-[10px] font-black text-white bg-rose-600 hover:bg-rose-700 px-2 py-0.5 rounded-lg cursor-pointer transition-all"
+                      >
+                        {isAr ? 'تأكيد المسح' : 'Confirm Clear'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmClear(false)}
+                        className="text-[10px] font-bold text-slate-600 bg-slate-200 hover:bg-slate-300 px-2 py-0.5 rounded-lg cursor-pointer transition-all"
+                      >
+                        {isAr ? 'إلغاء' : 'Cancel'}
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmClear(true)}
+                      className="text-[10px] font-bold text-rose-600 hover:text-rose-700 dark:text-rose-400 flex items-center gap-1 px-2 py-0.5 rounded-lg border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 cursor-pointer transition-all"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>{isAr ? 'تفريغ الطابور' : 'Clear Queue'}</span>
+                    </button>
+                  )}
                   <span className="text-[10px] font-normal text-slate-500">
                     {isAr ? 'محفوظة محلياً' : 'Local'}
                   </span>
@@ -592,27 +617,43 @@ export const BackgroundSyncModal: React.FC<BackgroundSyncModalProps> = ({
                 {queueItems.map((item, idx) => (
                   <div
                     key={item.id || idx}
-                    className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-between text-xs"
+                    className="p-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-between text-xs gap-2"
                   >
-                    <div>
-                      <div className="font-bold flex items-center gap-1.5">
-                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                    <div className="min-w-0 flex-1">
+                      <div className="font-bold flex items-center gap-1.5 flex-wrap">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse shrink-0" />
                         <span>{item.type || 'ACTION'}</span>
                         {item.payload?.customerName && (
-                          <span className="text-slate-500 dark:text-slate-400 font-normal">
+                          <span className="text-slate-500 dark:text-slate-400 font-normal truncate">
                             - {item.payload.customerName}
                           </span>
                         )}
                       </div>
                       <div className="text-[10px] text-slate-400 font-mono">
                         {item.timestamp ? new Date(item.timestamp).toLocaleTimeString('en-US') : ''}
+                        {item.error ? ` • ${item.error}` : ''}
                       </div>
                     </div>
-                    {item.payload?.amount ? (
-                      <span className="font-black text-emerald-600 dark:text-emerald-400 font-mono">
-                        {Number(item.payload.amount).toLocaleString('en-US')} د.ع
-                      </span>
-                    ) : null}
+                    <div className="flex items-center gap-2 shrink-0">
+                      {item.payload?.amount ? (
+                        <span className="font-black text-emerald-600 dark:text-emerald-400 font-mono">
+                          {Number(item.payload.amount).toLocaleString('en-US')} د.ع
+                        </span>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          if (item.id) {
+                            await removeFromPendingQueue(item.id);
+                            await loadHealthAndQueue();
+                          }
+                        }}
+                        title={isAr ? 'إزالة من الطابور' : 'Remove item'}
+                        className="p-1 rounded-md text-slate-400 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>

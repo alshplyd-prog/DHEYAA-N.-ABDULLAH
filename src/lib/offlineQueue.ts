@@ -312,8 +312,8 @@ export function subscribeToQueueChange(listener: (count: number) => void): () =>
   };
 }
 
-function notifyQueueListeners(count: number) {
-  if (lastNotifiedQueueCount === count) return;
+function notifyQueueListeners(count: number, force = false) {
+  if (!force && lastNotifiedQueueCount === count) return;
   lastNotifiedQueueCount = count;
   queueListeners.forEach((fn) => {
     try {
@@ -340,15 +340,18 @@ function notifySyncSuccessListeners() {
 }
 
 const PERMANENTLY_SYNCED_KEY = 'sami_permanently_synced_action_ids';
+const inMemorySyncedIds = new Set<string>();
 
 export function getPermanentlySyncedIds(): Set<string> {
   try {
     const raw = localStorage.getItem(PERMANENTLY_SYNCED_KEY);
-    if (!raw) return new Set();
+    if (!raw) return new Set(inMemorySyncedIds);
     const arr = JSON.parse(raw);
-    return new Set(Array.isArray(arr) ? arr : []);
+    const set = new Set<string>(Array.isArray(arr) ? arr : []);
+    inMemorySyncedIds.forEach((id) => set.add(id));
+    return set;
   } catch (e) {
-    return new Set();
+    return new Set(inMemorySyncedIds);
   }
 }
 
@@ -357,12 +360,36 @@ export function markActionIdsAsPermanentlySynced(ids: string[]): void {
   try {
     const set = getPermanentlySyncedIds();
     for (const id of ids) {
-      if (id) set.add(id);
+      if (id) {
+        set.add(id);
+        inMemorySyncedIds.add(id);
+      }
     }
     const arr = Array.from(set);
     const trimmed = arr.length > 2000 ? arr.slice(arr.length - 2000) : arr;
     localStorage.setItem(PERMANENTLY_SYNCED_KEY, JSON.stringify(trimmed));
   } catch (e) {}
+}
+
+function isPoisonPillOrInvalidAction(item: any): boolean {
+  if (!item || !item.id || item.id.startsWith('__meta_') || item.type === '__META_CONFIG__') return true;
+  if (!item.type) return true;
+  const t = String(item.type);
+  if (t.startsWith('DELETE_') || t.endsWith('_DELETE')) {
+    const targetId = typeof item.payload === 'string' ? item.payload : (item.payload?.id || item.payload?.contractId);
+    if (!targetId) return true;
+  } else if (t === 'CREATE_PAYMENT' || t === 'RECORD_PAYMENT' || t === 'ADD_PAYMENT') {
+    if (!item.payload || typeof item.payload !== 'object') return true;
+    const amt = Number(item.payload.amountPaid ?? item.payload.amount_paid ?? item.payload.amount ?? 0);
+    if (!item.payload.id || amt <= 0) return true;
+  } else if (t === 'UPDATE_PAYMENT') {
+    if (!item.payload || !item.payload.id) return true;
+  } else if (t === 'CREATE_CONTRACT' || t === 'ADD_SALE') {
+    if (!item.payload || !item.payload.id) return true;
+  } else if (t === 'REORDER_FUNDS' || t === 'REORDER_CUSTOMER_LISTS') {
+    if (!item.payload || !Array.isArray(item.payload.orderedIds) || item.payload.orderedIds.length === 0) return true;
+  }
+  return false;
 }
 
 /**
@@ -379,7 +406,8 @@ export function getPendingQueueSync(): PendingAction[] {
     // Deduplicate by actionType + entityId so CREATE_* is never discarded by a later UPDATE_*
     const entityMap = new Map<string, any>();
     for (const item of list) {
-      if (!item || item.id?.startsWith('__meta_') || item.type === '__META_CONFIG__' || permanentlySynced.has(item.id)) continue;
+      if (!item || permanentlySynced.has(item.id) || inMemorySyncedIds.has(item.id)) continue;
+      if (isPoisonPillOrInvalidAction(item)) continue;
       if (item.status === 'synced') continue;
       const entityId = item.payload?.id || (typeof item.payload === 'string' ? item.payload : item.id);
       const dedupKey = entityId ? `${item.type || 'ACTION'}:${entityId}` : item.id;
@@ -496,8 +524,14 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
     const now = Date.now();
 
     const addAction = (item: any) => {
-      if (!item || !item.id || item.id.startsWith('__meta_') || item.type === '__META_CONFIG__') return;
-      if (swSyncedSet.has(item.id) || permanentlySyncedSet.has(item.id) || item.status === 'synced') return;
+      if (!item) return;
+      if (swSyncedSet.has(item.id) || permanentlySyncedSet.has(item.id) || inMemorySyncedIds.has(item.id) || item.status === 'synced') return;
+      if (isPoisonPillOrInvalidAction(item)) {
+        if (item.id && !item.id.startsWith('__meta_')) {
+          markActionIdsAsPermanentlySynced([item.id]);
+        }
+        return;
+      }
 
       const entityId = item.payload?.id || (typeof item.payload === 'string' ? item.payload : item.id);
       const dedupKey = entityId ? `${item.type || 'ACTION'}:${entityId}` : item.id;
@@ -532,7 +566,7 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
     const merged = Array.from(mergedMap.values());
     const jsonStr = JSON.stringify(merged);
     localStorage.setItem(QUEUE_KEY, jsonStr);
-    syncToNativeAndroid(merged);
+    await syncToNativeAndroidAsync(merged, false);
 
     if (swSyncedIds.length > 0 || nativeSyncedIds.length > 0 || (idbActions.length === 0 && merged.length > 0)) {
       syncQueueToIndexedDb(merged).catch(() => {});
@@ -545,12 +579,15 @@ export async function getPendingQueue(): Promise<PendingAction[]> {
 }
 
 /**
- * Synchronize pending actions directly to Native Android storage & SharedPreferences
+ * Asynchronously synchronize pending actions to Native Android storage & SharedPreferences
  */
-export function syncToNativeAndroid(queue: PendingAction[]) {
+export async function syncToNativeAndroidAsync(queue: PendingAction[], triggerImmediateService = false): Promise<void> {
   if (typeof window === 'undefined') return;
   try {
-    const jsonStr = JSON.stringify(queue);
+    const cleanQueue = Array.isArray(queue)
+      ? queue.filter((i) => i && i.status !== 'synced' && !inMemorySyncedIds.has(i.id))
+      : [];
+    const jsonStr = JSON.stringify(cleanQueue);
     const serverUrl = getApiBaseUrl() || (isNativeOrApkEnvironment() ? CANDIDATE_SERVERS[0] : window.location.origin);
 
     // 1. Direct Native JavascriptInterface Bridge
@@ -561,28 +598,40 @@ export function syncToNativeAndroid(queue: PendingAction[]) {
       (window as any).AndroidBridge;
 
     if (bridge) {
-      if (typeof bridge.triggerImmediateCloseSync === 'function') {
+      if (triggerImmediateService && cleanQueue.length > 0 && typeof bridge.triggerImmediateCloseSync === 'function') {
         bridge.triggerImmediateCloseSync(jsonStr, serverUrl);
       } else if (typeof bridge.syncPendingQueueToNative === 'function') {
         bridge.syncPendingQueueToNative(jsonStr, serverUrl);
+      } else if (typeof bridge.triggerImmediateCloseSync === 'function' && cleanQueue.length > 0) {
+        bridge.triggerImmediateCloseSync(jsonStr, serverUrl);
       }
-      if (typeof bridge.triggerBackgroundSyncNow === 'function' && !isUserActivelyTypingOrInputFocused()) {
+      if (triggerImmediateService && cleanQueue.length > 0 && typeof bridge.triggerBackgroundSyncNow === 'function' && !isUserActivelyTypingOrInputFocused()) {
         bridge.triggerBackgroundSyncNow();
       }
     }
 
-    // 2. Multi-prefix Capacitor Preferences storage
+    // 2. Multi-prefix Capacitor Preferences storage (awaited cleanly so reads never see stale data)
     try {
-      Preferences.set({ key: QUEUE_KEY, value: jsonStr }).catch(() => {});
-      Preferences.set({ key: `CapacitorStorage.${QUEUE_KEY}`, value: jsonStr }).catch(() => {});
-      Preferences.set({ key: `CapacitorPreferences.${QUEUE_KEY}`, value: jsonStr }).catch(() => {});
-      Preferences.set({ key: `_cap_${QUEUE_KEY}`, value: jsonStr }).catch(() => {});
+      const prefPromises: Promise<any>[] = [
+        Preferences.set({ key: QUEUE_KEY, value: jsonStr }).catch(() => {}),
+        Preferences.set({ key: `CapacitorStorage.${QUEUE_KEY}`, value: jsonStr }).catch(() => {}),
+        Preferences.set({ key: `CapacitorPreferences.${QUEUE_KEY}`, value: jsonStr }).catch(() => {}),
+        Preferences.set({ key: `_cap_${QUEUE_KEY}`, value: jsonStr }).catch(() => {}),
+      ];
       if (serverUrl) {
-        Preferences.set({ key: 'alkarrar_backend_server_url', value: serverUrl }).catch(() => {});
-        Preferences.set({ key: 'CapacitorStorage.alkarrar_backend_server_url', value: serverUrl }).catch(() => {});
+        prefPromises.push(Preferences.set({ key: 'alkarrar_backend_server_url', value: serverUrl }).catch(() => {}));
+        prefPromises.push(Preferences.set({ key: 'CapacitorStorage.alkarrar_backend_server_url', value: serverUrl }).catch(() => {}));
       }
+      await withTimeout(Promise.allSettled(prefPromises), 1500, null);
     } catch (e) {}
   } catch (e) {}
+}
+
+/**
+ * Synchronize pending actions directly to Native Android storage & SharedPreferences
+ */
+export function syncToNativeAndroid(queue: PendingAction[], triggerImmediateService = false) {
+  syncToNativeAndroidAsync(queue, triggerImmediateService).catch(() => {});
 }
 
 // Notify Service Worker about queue changes & register Background Sync
@@ -671,8 +720,16 @@ export async function addToPendingQueue(type: string, payload: any): Promise<Pen
   // 2. Persist to IndexedDB & sync to native Android asynchronously in the background without blocking the UI or caller
   setTimeout(async () => {
     try {
+      // Prevent resurrection race if saveToPostgres/removeFromPendingQueue already removed this action before timeout ran
+      const permanentlySynced = getPermanentlySyncedIds();
+      if (inMemorySyncedIds.has(action.id) || permanentlySynced.has(action.id)) {
+        const freshList = getPendingQueueSync();
+        await syncToNativeAndroidAsync(freshList, false);
+        return;
+      }
       await saveActionToIndexedDb(action);
-      syncToNativeAndroid(currentSyncQueue);
+      const freshList = getPendingQueueSync();
+      await syncToNativeAndroidAsync(freshList, false);
       notifyServiceWorker();
     } catch (persistErr) {
       console.warn('Background persistence notice:', persistErr);
@@ -698,14 +755,26 @@ export async function addToPendingQueue(type: string, payload: any): Promise<Pen
  */
 export async function removeFromPendingQueue(id: string): Promise<void> {
   try {
+    inMemorySyncedIds.add(id);
     markActionIdsAsPermanentlySynced([id]);
+    try {
+      const raw = localStorage.getItem(QUEUE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          const quickFiltered = parsed.filter((item: any) => item && item.id !== id);
+          localStorage.setItem(QUEUE_KEY, JSON.stringify(quickFiltered));
+          notifyQueueListeners(quickFiltered.filter((i: any) => i.status !== 'synced').length, true);
+        }
+      }
+    } catch (e) {}
     await deleteActionFromIndexedDb(id);
     const queue = await getPendingQueue();
-    const filtered = queue.filter((item) => item.id !== id);
+    const filtered = queue.filter((item) => item.id !== id && !inMemorySyncedIds.has(item.id));
     const jsonStr = JSON.stringify(filtered);
     localStorage.setItem(QUEUE_KEY, jsonStr);
-    syncToNativeAndroid(filtered);
-    notifyQueueListeners(filtered.filter((i) => i.status !== 'synced').length);
+    await syncToNativeAndroidAsync(filtered, false);
+    notifyQueueListeners(filtered.filter((i) => i.status !== 'synced').length, true);
     notifyServiceWorker();
   } catch (e) {
     console.warn('Failed to remove from pending queue:', e);
@@ -717,10 +786,15 @@ export async function removeFromPendingQueue(id: string): Promise<void> {
  */
 export async function clearPendingQueue(): Promise<void> {
   try {
+    const existing = await getPendingQueue().catch(() => getPendingQueueSync());
+    const allIds = existing.map((a) => a.id).filter(Boolean);
+    if (allIds.length > 0) {
+      markActionIdsAsPermanentlySynced(allIds);
+    }
     localStorage.removeItem(QUEUE_KEY);
-    syncToNativeAndroid([]);
+    await syncToNativeAndroidAsync([], false);
     await syncQueueToIndexedDb([]);
-    notifyQueueListeners(0);
+    notifyQueueListeners(0, true);
     notifyServiceWorker();
   } catch (e) {}
 }
@@ -739,9 +813,9 @@ export async function clearPendingActionsByFilter(predicate: (action: PendingAct
     }
     const jsonStr = JSON.stringify(toKeep);
     localStorage.setItem(QUEUE_KEY, jsonStr);
-    syncToNativeAndroid(toKeep);
+    await syncToNativeAndroidAsync(toKeep, false);
     await syncQueueToIndexedDb(toKeep).catch(() => {});
-    notifyQueueListeners(toKeep.filter((i) => i.status !== 'synced').length);
+    notifyQueueListeners(toKeep.filter((i) => i.status !== 'synced').length, true);
     notifyServiceWorker();
   } catch (e) {}
 }
@@ -765,6 +839,7 @@ export async function updateActionStatus(
     if (status === 'synced') {
       action.syncedAt = syncedAt || Date.now();
       action.error = null;
+      markActionIdsAsPermanentlySynced([id]);
     } else if (status === 'pending') {
       action.retryCount = (action.retryCount || 0) + 1;
       if (error) action.error = error;
@@ -773,7 +848,7 @@ export async function updateActionStatus(
     await saveActionToIndexedDb(action);
     const jsonStr = JSON.stringify(queue);
     localStorage.setItem(QUEUE_KEY, jsonStr);
-    syncToNativeAndroid(queue);
+    await syncToNativeAndroidAsync(queue, false);
 
     notifyQueueListeners(queue.filter((i) => i.status !== 'synced').length);
   } catch (e) {
@@ -783,33 +858,42 @@ export async function updateActionStatus(
 
 async function executeActionViaRestEndpoint(action: PendingAction): Promise<boolean> {
   try {
+    if (isPoisonPillOrInvalidAction(action)) return true;
     const { type, payload } = action;
     if (!payload) return true;
     const docId = typeof payload === 'string' ? payload : (payload.id || payload.contractId);
 
     let endpoint = '';
+    let fallbackPostEndpoint = '';
     let method = 'POST';
 
     switch (type) {
       case 'CREATE_CONTRACT':
+      case 'ADD_SALE':
         endpoint = '/api/contracts';
         method = 'POST';
         break;
       case 'UPDATE_CONTRACT':
+      case 'UPDATE_SALE':
         endpoint = docId ? `/api/contracts/${docId}` : '/api/contracts';
+        fallbackPostEndpoint = '/api/contracts';
         method = docId ? 'PUT' : 'POST';
         break;
       case 'DELETE_CONTRACT':
+      case 'DELETE_SALE':
         endpoint = docId ? `/api/contracts/${docId}` : '';
         method = 'DELETE';
         break;
 
       case 'CREATE_PAYMENT':
+      case 'RECORD_PAYMENT':
+      case 'ADD_PAYMENT':
         endpoint = '/api/payments';
         method = 'POST';
         break;
       case 'UPDATE_PAYMENT':
         endpoint = docId ? `/api/payments/${docId}` : '/api/payments';
+        fallbackPostEndpoint = '/api/payments';
         method = docId ? 'PUT' : 'POST';
         break;
       case 'DELETE_PAYMENT':
@@ -823,7 +907,8 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
         break;
       case 'UPDATE_INVENTORY':
         endpoint = docId ? `/api/inventory/${docId}` : '/api/inventory';
-        method = 'PUT';
+        fallbackPostEndpoint = '/api/inventory';
+        method = docId ? 'PUT' : 'POST';
         break;
       case 'DELETE_INVENTORY':
         endpoint = docId ? `/api/inventory/${docId}` : '';
@@ -836,7 +921,8 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
         break;
       case 'UPDATE_REP':
         endpoint = docId ? `/api/reps/${docId}` : '/api/reps';
-        method = 'PUT';
+        fallbackPostEndpoint = '/api/reps';
+        method = docId ? 'PUT' : 'POST';
         break;
       case 'DELETE_REP':
         endpoint = docId ? `/api/reps/${docId}` : '';
@@ -849,7 +935,12 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
         break;
       case 'UPDATE_FUND':
         endpoint = docId ? `/api/funds/${docId}` : '/api/funds';
-        method = 'PUT';
+        fallbackPostEndpoint = '/api/funds';
+        method = docId ? 'PUT' : 'POST';
+        break;
+      case 'REORDER_FUNDS':
+        endpoint = '/api/funds/reorder';
+        method = 'POST';
         break;
       case 'DELETE_FUND':
         endpoint = docId ? `/api/funds/${docId}` : '';
@@ -862,7 +953,12 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
         break;
       case 'UPDATE_CUSTOMER_LIST':
         endpoint = docId ? `/api/customer-lists/${docId}` : '/api/customer-lists';
-        method = 'PUT';
+        fallbackPostEndpoint = '/api/customer-lists';
+        method = docId ? 'PUT' : 'POST';
+        break;
+      case 'REORDER_CUSTOMER_LISTS':
+        endpoint = '/api/customer-lists/reorder';
+        method = 'POST';
         break;
       case 'DELETE_CUSTOMER_LIST':
         endpoint = docId ? `/api/customer-lists/${docId}` : '';
@@ -875,7 +971,8 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
         break;
       case 'UPDATE_CUSTOMER':
         endpoint = docId ? `/api/customers/${docId}` : '/api/customers';
-        method = 'PUT';
+        fallbackPostEndpoint = '/api/customers';
+        method = docId ? 'PUT' : 'POST';
         break;
       case 'DELETE_CUSTOMER':
         endpoint = docId ? `/api/customers/${docId}` : '';
@@ -888,7 +985,8 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
         break;
       case 'UPDATE_EMPLOYEE':
         endpoint = docId ? `/api/employees/${docId}` : '/api/employees';
-        method = 'PUT';
+        fallbackPostEndpoint = '/api/employees';
+        method = docId ? 'PUT' : 'POST';
         break;
       case 'DELETE_EMPLOYEE':
         endpoint = docId ? `/api/employees/${docId}` : '';
@@ -903,7 +1001,8 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
       case 'UPDATE_FUND_TX':
       case 'UPDATE_FUND_TRANSACTION':
         endpoint = docId ? `/api/fund-transactions/${docId}` : '/api/fund-transactions';
-        method = 'PUT';
+        fallbackPostEndpoint = '/api/fund-transactions';
+        method = docId ? 'PUT' : 'POST';
         break;
       case 'DELETE_FUND_TX':
       case 'DELETE_FUND_TRANSACTION':
@@ -919,7 +1018,8 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
       case 'UPDATE_EMPLOYEE_TX':
       case 'UPDATE_EMPLOYEE_TRANSACTION':
         endpoint = docId ? `/api/employee-transactions/${docId}` : '/api/employee-transactions';
-        method = 'PUT';
+        fallbackPostEndpoint = '/api/employee-transactions';
+        method = docId ? 'PUT' : 'POST';
         break;
       case 'DELETE_EMPLOYEE_TX':
       case 'DELETE_EMPLOYEE_TRANSACTION':
@@ -932,10 +1032,10 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
         method = 'POST';
         break;
       case 'RESOLVE_PAYMENT_CONFLICT':
+      case 'REJECT_PAYMENT_CONFLICT':
         endpoint = docId ? `/api/payment-conflicts/${docId}` : '';
         method = 'PUT';
         break;
-      case 'REJECT_PAYMENT_CONFLICT':
       case 'DELETE_PAYMENT_CONFLICT':
         endpoint = docId ? `/api/payment-conflicts/${docId}` : '';
         method = 'DELETE';
@@ -949,6 +1049,7 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
       case 'UPDATE_APPOINTMENT':
       case 'APPOINTMENT_UPDATE':
         endpoint = docId ? `/api/appointments/${docId}` : '/api/appointments';
+        fallbackPostEndpoint = '/api/appointments';
         method = docId ? 'PUT' : 'POST';
         break;
       case 'DELETE_APPOINTMENT':
@@ -958,16 +1059,39 @@ async function executeActionViaRestEndpoint(action: PendingAction): Promise<bool
         break;
 
       default:
-        return false;
+        // Unknown legacy action type cannot succeed on server; treat as retired so it never blocks queue
+        return true;
     }
 
-    if (!endpoint) return false;
+    if (!endpoint) return true;
 
-    const res = await fetchWithFallback(endpoint, {
+    const bodyJson = method !== 'DELETE' ? JSON.stringify(typeof payload === 'object' ? payload : { id: docId, value: payload }) : undefined;
+
+    let res = await fetchWithFallback(endpoint, {
       method,
       headers: { 'Content-Type': 'application/json' },
-      body: method !== 'DELETE' ? JSON.stringify(typeof payload === 'object' ? payload : { id: docId, value: payload }) : undefined,
+      body: bodyJson,
     }, 15000);
+
+    // If DELETE target is already missing on server (404/410), consider deletion fulfilled
+    if (method === 'DELETE' && res && (res.status === 404 || res.status === 410)) {
+      return true;
+    }
+
+    // If PUT failed (e.g. record not yet created on server) and we have a POST upsert fallback, try POST
+    if ((!res || !res.ok) && method === 'PUT' && fallbackPostEndpoint && typeof payload === 'object') {
+      res = await fetchWithFallback(fallbackPostEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: bodyJson,
+      }, 15000);
+    }
+
+    // For REJECT_PAYMENT_CONFLICT if PUT returned 404/405, fallback to DELETE
+    if ((!res || !res.ok) && type === 'REJECT_PAYMENT_CONFLICT' && endpoint) {
+      res = await fetchWithFallback(endpoint, { method: 'DELETE' }, 15000);
+      if (res && (res.status === 404 || res.status === 410)) return true;
+    }
 
     if (!res || !res.ok || res.status < 200 || res.status >= 300) {
       return false;
@@ -1126,8 +1250,108 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
       }
     }
 
+    // 5.5. Reconcile any still-unconfirmed actions against server state (/api/sync/verify-match)
+    // so items whose records ALREADY exist on PostgreSQL (or were deleted on server) are purged cleanly
+    const stillUnverified = pendingFallbackActions.filter((a) => !verifiedSyncedIds.includes(a.id));
+    if (stillUnverified.length > 0) {
+      try {
+        const contractIds: string[] = [];
+        const paymentIds: string[] = [];
+        const inventoryIds: string[] = [];
+        const repIds: string[] = [];
+        const fundIds: string[] = [];
+        const customerListIds: string[] = [];
+        const employeeIds: string[] = [];
+
+        for (const a of stillUnverified) {
+          const eid = typeof a.payload === 'string' ? a.payload : a.payload?.id;
+          if (!eid) continue;
+          const sid = String(eid);
+          if (a.type.includes('CONTRACT') || a.type.includes('SALE')) contractIds.push(sid);
+          else if (a.type.includes('PAYMENT') && !a.type.includes('CONFLICT')) paymentIds.push(sid);
+          else if (a.type.includes('INVENTORY')) inventoryIds.push(sid);
+          else if (a.type.includes('REP')) repIds.push(sid);
+          else if (a.type.includes('FUND') && !a.type.includes('TX') && !a.type.includes('TRANSACTION')) fundIds.push(sid);
+          else if (a.type.includes('CUSTOMER_LIST')) customerListIds.push(sid);
+          else if (a.type.includes('EMPLOYEE') && !a.type.includes('TX') && !a.type.includes('TRANSACTION')) employeeIds.push(sid);
+        }
+
+        const vRes = await fetchWithFallback(
+          '/api/sync/verify-match',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contractIds,
+              paymentIds,
+              inventoryIds,
+              repIds,
+              fundIds,
+              customerListIds,
+              employeeIds,
+            }),
+          },
+          10000
+        ).catch(() => null);
+
+        if (vRes && vRes.ok) {
+          const vData = await vRes.json().catch(() => null);
+          if (vData && vData.success) {
+            const missingAll = new Set<string>([
+              ...(vData.missingContractIds || []),
+              ...(vData.missingPaymentIds || []),
+              ...(vData.missingInventoryIds || []),
+              ...(vData.missingRepIds || []),
+              ...(vData.missingFundIds || []),
+              ...(vData.missingCustomerListIds || []),
+              ...(vData.missingEmployeeIds || []),
+            ]);
+            const serverDeleted = new Set<string>(Array.isArray(vData.deletedRecordIds) ? vData.deletedRecordIds.map(String) : []);
+
+            for (const a of stillUnverified) {
+              const eid = String(typeof a.payload === 'string' ? a.payload : (a.payload?.id || ''));
+              let confirmedByServer = false;
+              if (a.type.startsWith('DELETE_') && (!eid || serverDeleted.has(eid))) {
+                confirmedByServer = true;
+              } else if (a.type.startsWith('CREATE_') || a.type === 'ADD_SALE' || a.type === 'RECORD_PAYMENT' || a.type === 'ADD_PAYMENT') {
+                const isVerifiedTable =
+                  a.type.includes('CONTRACT') ||
+                  a.type.includes('SALE') ||
+                  (a.type.includes('PAYMENT') && !a.type.includes('CONFLICT')) ||
+                  a.type.includes('INVENTORY') ||
+                  a.type.includes('REP') ||
+                  (a.type.includes('FUND') && !a.type.includes('TX') && !a.type.includes('TRANSACTION')) ||
+                  a.type.includes('CUSTOMER_LIST') ||
+                  (a.type.includes('EMPLOYEE') && !a.type.includes('TX') && !a.type.includes('TRANSACTION'));
+                if (isVerifiedTable && eid && (!missingAll.has(eid) || serverDeleted.has(eid))) {
+                  confirmedByServer = true;
+                }
+              } else if (eid && serverDeleted.has(eid)) {
+                confirmedByServer = true;
+              }
+
+              if (confirmedByServer) {
+                a.status = 'synced';
+                a.syncedAt = Date.now();
+                a.error = null;
+                verifiedSyncedIds.push(a.id);
+                await deleteActionFromIndexedDb(a.id).catch(() => {});
+              }
+            }
+          }
+        }
+      } catch (verifyErr) {}
+    }
+
     // 6. Clean up synced items and update global snapshot without dropping any actions added during sync
     const verifiedSet = new Set(verifiedSyncedIds);
+    const verifiedEntityIds = new Set<string>();
+    for (const act of actionsToSync) {
+      if (verifiedSet.has(act.id)) {
+        const eid = typeof act.payload === 'string' ? act.payload : act.payload?.id;
+        if (eid) verifiedEntityIds.add(String(eid));
+      }
+    }
     markActionIdsAsPermanentlySynced(verifiedSyncedIds);
 
     // Also delete verified items from IndexedDB
@@ -1137,7 +1361,7 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
 
     const freshQueue = await getPendingQueue();
     const remainingQueue = freshQueue
-      .filter((item) => !verifiedSet.has(item.id) && item.status !== 'synced')
+      .filter((item) => !verifiedSet.has(item.id) && !inMemorySyncedIds.has(item.id) && item.status !== 'synced')
       .map((item) => {
         if (item.status === 'syncing') {
           return { ...item, status: 'pending' as const };
@@ -1146,32 +1370,37 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
       });
     const jsonStr = JSON.stringify(remainingQueue);
     localStorage.setItem(QUEUE_KEY, jsonStr);
-    syncToNativeAndroid(remainingQueue);
+    await syncToNativeAndroidAsync(remainingQueue, false);
 
     await syncQueueToIndexedDb(remainingQueue);
-    notifyQueueListeners(remainingQueue.length);
+    notifyQueueListeners(remainingQueue.length, true);
 
     if (verifiedSyncedIds.length > 0) {
       console.log(`[Offline Sync Engine] Successfully synchronized & uploaded ${verifiedSyncedIds.length} records.`);
-      try {
-        const raw = localStorage.getItem('sami_offline_payments');
-        if (raw) {
+      // Clear _syncStatus and _unsynced flags across both sami_offline_payments and main local caches
+      const cacheKeysToClean = ['sami_offline_payments', 'sami_cache_payments', 'sami_cache_contracts', 'sami_cache_appointments'];
+      for (const cacheKey of cacheKeysToClean) {
+        try {
+          const raw = localStorage.getItem(cacheKey);
+          if (!raw) continue;
           const list = JSON.parse(raw);
-          if (Array.isArray(list)) {
-            let changed = false;
-            for (const p of list) {
-              if (p && (verifiedSet.has(p.id) || (!remainingQueue.some((r) => r.payload?.id === p.id) && p._syncStatus === 'pending'))) {
-                p._syncStatus = 'synced';
-                p._unsynced = false;
-                changed = true;
-              }
-            }
-            if (changed) {
-              localStorage.setItem('sami_offline_payments', JSON.stringify(list));
+          if (!Array.isArray(list)) continue;
+          let changed = false;
+          for (const rec of list) {
+            if (!rec) continue;
+            const recId = String(rec.id || '');
+            const stillQueued = remainingQueue.some((r) => String(r.payload?.id || '') === recId);
+            if ((verifiedEntityIds.has(recId) || !stillQueued) && (rec._syncStatus === 'pending' || rec._unsynced === true)) {
+              rec._syncStatus = 'synced';
+              rec._unsynced = false;
+              changed = true;
             }
           }
-        }
-      } catch (e) {}
+          if (changed) {
+            localStorage.setItem(cacheKey, JSON.stringify(list));
+          }
+        } catch (e) {}
+      }
       notifySyncSuccessListeners();
     }
 
@@ -1190,7 +1419,9 @@ export async function flushPendingQueue(): Promise<{ flushed: number; remaining:
   const finalQueue = await getPendingQueue();
   const permSet = getPermanentlySyncedIds();
   const verifiedSet = new Set(verifiedSyncedIds);
-  const activeRemaining = finalQueue.filter((i) => i.status !== 'synced' && !verifiedSet.has(i.id) && !permSet.has(i.id)).length;
+  const activeRemainingList = finalQueue.filter((i) => i.status !== 'synced' && !verifiedSet.has(i.id) && !permSet.has(i.id) && !inMemorySyncedIds.has(i.id));
+  const activeRemaining = activeRemainingList.length;
+  notifyQueueListeners(activeRemaining, true);
   return { flushed: verifiedSyncedIds.length, remaining: activeRemaining };
 }
 
@@ -1232,7 +1463,7 @@ export function sendBeaconOnExit() {
 
     // Mirror queue to Native Android storage immediately upon exit
     try {
-      syncToNativeAndroid(queue);
+      syncToNativeAndroid(pendingToSync, true);
       const bridge =
         (window as any).AndroidInterface ||
         (window as any).AndroidPrinter ||

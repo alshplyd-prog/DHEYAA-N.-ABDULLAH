@@ -300,7 +300,7 @@ function mergeRemoteWithPendingLocal<T extends { id?: string; name?: string }>(t
         if (item && item.id) {
           // If the record exists on PostgreSQL server, it is authoritative unless marked deleted locally
           if (item.id === 'rep-1' || (!pendingDeleteIds.has(item.id) && !deletedSet.has(item.id))) {
-            let mergedItem = item;
+            let mergedItem: any = item;
             if (tableName === 'contracts' && Array.isArray(existingLocal)) {
               const localMatch: any = existingLocal.find((e: any) => e && e.id === item.id);
               const itemAny: any = item;
@@ -318,6 +318,9 @@ function mergeRemoteWithPendingLocal<T extends { id?: string; name?: string }>(t
                   };
                 }
               }
+            }
+            if (mergedItem && (mergedItem._unsynced || mergedItem._syncStatus === 'pending') && !pendingCreateIds.has(String(item.id))) {
+              mergedItem = { ...mergedItem, _unsynced: false, _syncStatus: 'synced' };
             }
             map.set(item.id, mergedItem);
           }
@@ -1049,24 +1052,64 @@ export async function auditAndRequeueUnsyncedPayments(): Promise<number> {
     const pendingQueue = getPendingQueueSync();
     const queuedIds = new Set(
       pendingQueue
-        .filter((act) => act.type === 'CREATE_PAYMENT' || act.type === 'RECORD_PAYMENT' || act.type === 'UPDATE_PAYMENT')
+        .filter((act) => act.type === 'CREATE_PAYMENT' || act.type === 'RECORD_PAYMENT' || act.type === 'ADD_PAYMENT' || act.type === 'UPDATE_PAYMENT')
         .map((act) => act.payload?.id || (typeof act.payload === 'string' ? act.payload : null))
         .filter(Boolean)
     );
 
     const deletedSet = getDeletedRecordIds();
+    const flaggedPayments = localPayments.filter(
+      (p) => p && p.id && !deletedSet.has(p.id) && !queuedIds.has(p.id) && (p._unsynced === true || p._syncStatus === 'pending')
+    );
+    if (flaggedPayments.length === 0) return 0;
+
+    // If online, check /api/sync/verify-match before re-queuing so payments already saved on PostgreSQL have their stale local flag cleared instead of looping
+    let serverMissingSet: Set<string> | null = null;
+    let serverDeletedSet = new Set<string>();
+    if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+      try {
+        const vRes = await fetchWithFallback(
+          '/api/sync/verify-match',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ paymentIds: flaggedPayments.map((p) => String(p.id)) }),
+          },
+          8000
+        ).catch(() => null);
+        if (vRes && vRes.ok) {
+          const vData = await vRes.json().catch(() => null);
+          if (vData && vData.success) {
+            serverMissingSet = new Set<string>(Array.isArray(vData.missingPaymentIds) ? vData.missingPaymentIds.map(String) : []);
+            serverDeletedSet = new Set<string>(Array.isArray(vData.deletedRecordIds) ? vData.deletedRecordIds.map(String) : []);
+          }
+        }
+      } catch (e) {}
+    }
+
     let count = 0;
+    let cleanedLocal = false;
 
     for (const payment of localPayments) {
       if (!payment || !payment.id) continue;
-      if (deletedSet.has(payment.id)) continue;
-      if (queuedIds.has(payment.id)) continue;
+      if (deletedSet.has(payment.id) || queuedIds.has(payment.id)) continue;
 
-      // Only requeue payments that are genuinely unsynced or explicitly pending
       if (payment._unsynced === true || payment._syncStatus === 'pending') {
+        const pid = String(payment.id);
+        const amt = Number(payment.amountPaid ?? payment.amount ?? 0);
+        if (amt <= 0 || (serverMissingSet !== null && (!serverMissingSet.has(pid) || serverDeletedSet.has(pid)))) {
+          payment._unsynced = false;
+          payment._syncStatus = 'synced';
+          cleanedLocal = true;
+          continue;
+        }
         await addToPendingQueue('CREATE_PAYMENT', payment);
         count++;
       }
+    }
+
+    if (cleanedLocal) {
+      setLocalCache('payments', localPayments);
     }
 
     return count;
@@ -1664,12 +1707,27 @@ async function saveToPostgres(endpoint: string, method: string = 'POST', data?: 
     // Primary REST call status check
 
     if (writeSucceeded && pendingActionRef) {
+      if (docId && (rawTable === 'payments' || rawTable === 'contracts' || rawTable === 'appointments')) {
+        try {
+          const cached = getLocalCache<any>(rawTable);
+          let modified = false;
+          for (const rec of cached) {
+            if (rec && String(rec.id) === String(docId) && (rec._unsynced || rec._syncStatus === 'pending')) {
+              rec._unsynced = false;
+              rec._syncStatus = 'synced';
+              modified = true;
+            }
+          }
+          if (modified) setLocalCache(rawTable, cached);
+        } catch (e) {}
+      }
       if (typeof pendingActionRef === 'string') {
-        removeFromPendingQueue(pendingActionRef).catch(() => {});
+        await removeFromPendingQueue(pendingActionRef).catch(() => {});
       } else if (typeof pendingActionRef.then === 'function') {
-        pendingActionRef.then((act) => {
-          if (act?.id) removeFromPendingQueue(act.id).catch(() => {});
-        }).catch(() => {});
+        const act = await pendingActionRef.catch(() => null);
+        if (act?.id) {
+          await removeFromPendingQueue(act.id).catch(() => {});
+        }
       }
     }
 
