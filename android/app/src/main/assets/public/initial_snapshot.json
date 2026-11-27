@@ -1,5 +1,5 @@
 {
-  "timestamp": 1795788795097,
+  "timestamp": 1795792579638,
   "contracts": [
     {
       "id": "contract_1790064700810_j6w5e",
@@ -1973,10 +1973,7 @@
       "excessAmount": 0,
       "rawTotalPaid": 60000,
       "repName": "ضياء المحاسب",
-      "latitude": 32.0017607,
-      "longitude": 44.3490453,
-      "locationAddress": "موقع تسديد (18-11-2026)",
-      "locationUpdatedAt": "2026-11-18T12:52:04.795Z",
+      "locationAddress": "",
       "createdAt": "2026-11-15T15:29:38.331Z",
       "completedAt": null,
       "updatedAt": "2026-11-15T15:29:41.196Z",
@@ -2005,10 +2002,7 @@
       "excessAmount": 0,
       "rawTotalPaid": 10000,
       "repName": "ضياء المحاسب",
-      "latitude": 31.9637136,
-      "longitude": 44.6099027,
       "locationAddress": "",
-      "locationUpdatedAt": "2026-11-17T19:30:42.791Z",
       "createdAt": "2026-11-17T08:11:03.703Z",
       "completedAt": null,
       "updatedAt": "2026-11-17T08:11:20.712Z",

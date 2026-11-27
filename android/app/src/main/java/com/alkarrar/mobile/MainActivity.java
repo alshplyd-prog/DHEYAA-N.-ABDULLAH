@@ -2,6 +2,7 @@ package com.alkarrar.mobile;
 
 import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothClass;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothSocket;
 import android.content.BroadcastReceiver;
@@ -672,13 +673,70 @@ public class MainActivity extends BridgeActivity {
             try {
                 Set<BluetoothDevice> pairedDevices = bluetoothAdapter.getBondedDevices();
                 if (pairedDevices != null) {
+                    List<JSONObject> priorityList = new ArrayList<>();
+                    List<JSONObject> otherList = new ArrayList<>();
+
                     for (BluetoothDevice device : pairedDevices) {
-                        JSONObject obj = new JSONObject();
+                        if (device.getBondState() != BluetoothDevice.BOND_BONDED) {
+                            continue;
+                        }
                         String name = device.getName();
                         String addr = device.getAddress();
+                        String nameLower = name != null ? name.toLowerCase() : "";
+
+                        boolean looksLikePrinter =
+                            nameLower.contains("print") || nameLower.contains("pos") || nameLower.contains("thermal") ||
+                            nameLower.contains("mpt") || nameLower.contains("mtp") || nameLower.contains("pt-") ||
+                            nameLower.contains("pt2") || nameLower.contains("rpp") || nameLower.contains("rp") ||
+                            nameLower.contains("zj") || nameLower.contains("xp") || nameLower.contains("xprinter") ||
+                            nameLower.contains("gprinter") || nameLower.contains("rongta") || nameLower.contains("bixolon") ||
+                            nameLower.contains("epson") || nameLower.contains("star") || nameLower.contains("sunmi") ||
+                            nameLower.contains("58") || nameLower.contains("80") || nameLower.contains("6ba1") ||
+                            nameLower.contains("inner") || nameLower.contains("spp");
+
+                        BluetoothClass btClass = device.getBluetoothClass();
+                        int majorClass = btClass != null ? btClass.getMajorDeviceClass() : -1;
+
+                        // Exclude obvious non-printer Bluetooth devices (headphones, speakers, car audio, watches, phones)
+                        if (!looksLikePrinter && (
+                            majorClass == BluetoothClass.Device.Major.AUDIO_VIDEO ||
+                            majorClass == BluetoothClass.Device.Major.WEARABLE ||
+                            majorClass == BluetoothClass.Device.Major.HEALTH ||
+                            majorClass == BluetoothClass.Device.Major.TOY ||
+                            majorClass == BluetoothClass.Device.Major.PHONE
+                        )) {
+                            continue;
+                        }
+
+                        boolean isConnected = false;
+                        try {
+                            java.lang.reflect.Method m = device.getClass().getMethod("isConnected");
+                            Object res = m.invoke(device);
+                            if (res instanceof Boolean) {
+                                isConnected = (Boolean) res;
+                            }
+                        } catch (Throwable ignored) {}
+
+                        boolean isImagingPrinter = (majorClass == BluetoothClass.Device.Major.IMAGING);
+
+                        JSONObject obj = new JSONObject();
                         obj.put("name", name != null && !name.trim().isEmpty() ? name : "طابعة بلوتوث (" + addr + ")");
                         obj.put("address", addr != null ? addr : "");
                         obj.put("id", addr != null ? addr : "");
+                        obj.put("connected", isConnected);
+                        obj.put("isPrinter", isImagingPrinter || looksLikePrinter);
+
+                        if (isConnected || isImagingPrinter || looksLikePrinter) {
+                            priorityList.add(obj);
+                        } else {
+                            otherList.add(obj);
+                        }
+                    }
+
+                    for (JSONObject obj : priorityList) {
+                        array.put(obj);
+                    }
+                    for (JSONObject obj : otherList) {
                         array.put(obj);
                     }
                 }

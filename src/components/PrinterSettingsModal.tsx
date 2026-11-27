@@ -46,6 +46,7 @@ import {
   openNativeBluetoothSettings,
   openThermalPrintWindow,
   sendToRawBTDirectly,
+  Platform,
 } from '../lib/bluetoothPrinter';
 import { initCapacitorPush } from '../lib/capacitorPush';
 import {
@@ -93,7 +94,6 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
   const [isEnablingBackground, setIsEnablingBackground] = useState(false);
   const [pairedDevices, setPairedDevices] = useState<BluetoothDevice[] | null>(null);
   const [showDevicePicker, setShowDevicePicker] = useState<boolean>(false);
-  const [customPrinterName, setCustomPrinterName] = useState<string>('');
 
   // Keep-Alive & Anti-Sleep states
   const [isKeepAliveOn, setIsKeepAliveOn] = useState<boolean>(false);
@@ -382,46 +382,54 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
   const handleScanAndSave = async () => {
     setIsScanning(true);
     setStatusMessage({
-      text: isAr ? 'جاري الفحص وبحث أجهزة البلوتوث المتاحة...' : 'Scanning for Bluetooth devices...',
+      text: isAr ? 'جاري البحث عن الطابعات المربوطة بالبلوتوث فقط...' : 'Searching for paired Bluetooth printers...',
       type: 'info',
     });
 
     try {
-      // 1. Check Native Android / Serial Bluetooth paired devices
-      const devices = await listPairedBluetoothDevices();
+      await requestAndroidBluetoothPermissions();
+      const btState = await ensureBluetoothEnabled((msg) => {
+        setStatusMessage({ text: msg, type: 'info' });
+      });
 
-      // Standard thermal printer presets to ensure search always yields choices even on web browsers
-      const defaultPresets: BluetoothDevice[] = [
-        { name: 'MTP-II (58mm Thermal Printer)', address: '00:11:22:33:44:55', id: 'mtp_ii' },
-        { name: 'PT-210 (58mm Bluetooth)', address: '00:22:33:44:55:66', id: 'pt_210' },
-        { name: 'POS-58 (ESC/POS Printer)', address: '00:33:44:55:66:77', id: 'pos_58' },
-        { name: 'RawBT App (Android Driver)', address: 'rawbt_driver', id: 'rawbt_driver' },
-        { name: 'PDF Default System Printer', address: 'system_default_pdf', id: 'system_default' },
-      ];
-
-      // Merge native devices with presets avoiding duplicates
-      const foundList = devices && devices.length > 0 ? devices : [];
-      const combined = [...foundList];
-
-      for (const preset of defaultPresets) {
-        if (!combined.some((d) => d.name === preset.name || d.address === preset.address)) {
-          combined.push(preset);
-        }
+      if (!btState.enabled) {
+        setPairedDevices([]);
+        setShowDevicePicker(true);
+        setIsScanning(false);
+        setStatusMessage({
+          text: btState.message || (isAr ? 'يرجى تشغيل البلوتوث في الهاتف أولاً.' : 'Please turn on Bluetooth first.'),
+          type: 'error',
+        });
+        return;
       }
 
-      setPairedDevices(combined);
-      setShowDevicePicker(true);
+      // 1. Fetch ONLY genuine paired/connected Bluetooth devices (never fake presets or PDF/RawBT templates)
+      let devices = await listPairedBluetoothDevices();
 
-      // 2. Web Bluetooth Chooser
-      if (typeof window !== 'undefined' && 'bluetooth' in navigator) {
+      // 2. Web Bluetooth Chooser (only on desktop/web browsers, NOT inside native Android APK)
+      if (!Platform.isAPK && typeof window !== 'undefined' && 'bluetooth' in navigator) {
         try {
           const webRes = await requestWebBluetoothDevice();
           if (webRes.success && webRes.deviceName) {
+            const refreshed = await listPairedBluetoothDevices();
+            const merged = [...refreshed];
+            if (webRes.deviceId && !merged.some((d) => d.id === webRes.deviceId || d.address === webRes.deviceId)) {
+              merged.unshift({
+                name: webRes.deviceName,
+                id: webRes.deviceId,
+                address: webRes.deviceId,
+                connected: true,
+                isPrinter: true,
+              });
+            }
+            devices = merged;
             const updated = getSavedPrinterConfig();
             setConfig(updated);
             setPrinterProfiles(getSavedPrintersList());
+            setPairedDevices(devices);
+            setShowDevicePicker(true);
             setStatusMessage({
-              text: isAr ? `تم الربط والاعتماد بنجاح: ${webRes.deviceName}` : `Connected to: ${webRes.deviceName}`,
+              text: isAr ? `تم الربط والاعتماد بالطابعة: ${webRes.deviceName}` : `Connected to: ${webRes.deviceName}`,
               type: 'success',
             });
             setIsScanning(false);
@@ -432,19 +440,32 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
         }
       }
 
+      setPairedDevices(devices);
+      setShowDevicePicker(true);
       setIsScanning(false);
-      setStatusMessage({
-        text: isAr
-          ? `تم الفحص وعرض قائمة الطابعات والقوالب الجاهزة (${combined.length} خيار). اختر طابعتك للاعتماد:`
-          : `Scan completed (${combined.length} printers found). Select one:`,
-        type: 'success',
-      });
+
+      if (devices.length > 0) {
+        setStatusMessage({
+          text: isAr
+            ? `تم العثور على ${devices.length} طابعة مربوطة بالبلوتوث. اختر طابعتك للاعتماد:`
+            : `Found ${devices.length} paired Bluetooth printer(s). Select one:`,
+          type: 'success',
+        });
+      } else {
+        setStatusMessage({
+          text: isAr
+            ? 'لا توجد طابعات مربوطة بالبلوتوث حالياً. يرجى ربط الطابعة من إعدادات بلوتوث الهاتف أولاً.'
+            : 'No Bluetooth-paired printers found. Pair your printer in Bluetooth settings first.',
+          type: 'info',
+        });
+      }
     } catch (err: any) {
       setIsScanning(false);
+      setPairedDevices([]);
       setShowDevicePicker(true);
       setStatusMessage({
-        text: isAr ? `تنبيه: ${err.message || 'يمكنك اختيار إحدى الطابعات الجاهزة القائمة أدناه:'}` : `Notice: Select from list below:`,
-        type: 'info',
+        text: isAr ? `تنبيه: ${err.message || 'تعذر البحث عن أجهزة البلوتوث'}` : `Notice: Could not scan Bluetooth devices`,
+        type: 'error',
       });
     }
   };
@@ -452,15 +473,7 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
   const handleSelectDevice = (dev: BluetoothDevice) => {
     const deviceId = dev.address || dev.id || dev.name;
     const deviceName = dev.name || 'طابعة البلوتوث';
-    const method: PrintMethod = dev.id === 'system_default' ? 'system_default' : dev.id === 'rawbt_driver' ? 'rawbt' : 'direct_bluetooth';
-    handleSavePrinter(deviceName, deviceId, method);
-  };
-
-  const handleAddCustomPrinter = () => {
-    if (!customPrinterName.trim()) return;
-    const cleanName = customPrinterName.trim();
-    handleSavePrinter(cleanName, `bt_custom_${Date.now()}`, 'direct_bluetooth');
-    setCustomPrinterName('');
+    handleSavePrinter(deviceName, deviceId, 'direct_bluetooth');
   };
 
   const handleOpenPhoneBluetooth = () => {
@@ -629,9 +642,25 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    const updated = savePrinterConfig({ printMethod: 'direct_bluetooth' });
+                    const savedBt = getSavedPrintersList().find(
+                      (p) => p.type === 'direct_bluetooth' && p.id !== 'system_default_printer' && p.address
+                    );
+                    const isCurrentlyPdf =
+                      config.printMethod === 'system_default' ||
+                      config.deviceId === 'system_default_printer' ||
+                      config.deviceName === 'PDF';
+                    const updated = savePrinterConfig({
+                      printMethod: 'direct_bluetooth',
+                      ...(isCurrentlyPdf
+                        ? {
+                            deviceId: savedBt?.address || savedBt?.id || null,
+                            deviceName: savedBt?.name || (isAr ? 'طابعة البلوتوث المباشرة' : 'Direct Bluetooth Printer'),
+                          }
+                        : {}),
+                    });
                     if (updated) {
                       setConfig(updated);
+                      setPrinterProfiles(getSavedPrintersList());
                       setStatusMessage({
                         text: isAr ? 'تم تفعيل نمط الطباعة المباشرة عبر البلوتوث (ESC/POS)' : 'Switched to Direct Bluetooth ESC/POS',
                         type: 'success',
@@ -651,9 +680,14 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
                 <button
                   type="button"
                   onClick={() => {
-                    const updated = savePrinterConfig({ printMethod: 'system_default', deviceName: 'PDF' });
+                    const updated = savePrinterConfig({
+                      printMethod: 'system_default',
+                      deviceId: 'system_default_printer',
+                      deviceName: 'PDF',
+                    });
                     if (updated) {
                       setConfig(updated);
+                      setPrinterProfiles(getSavedPrintersList());
                       setStatusMessage({
                         text: isAr ? 'تم تفعيل طباعة PDF' : 'Switched to PDF',
                         type: 'success',
@@ -746,7 +780,7 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
               </div>
             )}
 
-            {/* زر البحث عن طابعة عبر البلوتوث */}
+            {/* زر البحث عن طابعة (يعرض الطابعات المربوطة بالبلوتوث فقط) */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2 border-t border-slate-200 dark:border-slate-700">
               <button
                 type="button"
@@ -761,8 +795,8 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
                 )}
                 <span>
                   {isScanning
-                    ? (isAr ? 'جاري فحص وبحث البلوتوث...' : 'Scanning...')
-                    : (isAr ? '🔍 البحث عن طابعة البلوتوث' : 'Search for Bluetooth')}
+                    ? (isAr ? 'جاري البحث عن طابعات البلوتوث...' : 'Scanning Bluetooth...')
+                    : (isAr ? '🔍 بحث عن طابعة (بلوتوث فقط)' : 'Search Bluetooth Printers')}
                 </span>
               </button>
 
@@ -776,13 +810,13 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
               </button>
             </div>
 
-            {/* قائمة الأجهزة المقترنة وإدخال اسم طابعة مخصص */}
+            {/* قائمة الطابعات المربوطة بالبلوتوث فقط */}
             {showDevicePicker && (
               <div className="p-4 bg-teal-50/90 dark:bg-slate-900/90 rounded-2xl border-2 border-teal-300 dark:border-teal-800 space-y-3 animate-in fade-in duration-150">
                 <div className="flex items-center justify-between pb-2 border-b border-teal-200 dark:border-teal-800">
                   <span className="text-xs font-black text-teal-900 dark:text-teal-200 flex items-center gap-1.5">
                     <Bluetooth className="w-4 h-4 text-teal-600" />
-                    {isAr ? 'اختر طابعتك المتاحة أو أدخل اسمها يدوياً:' : 'Available Printers or Enter Custom Name:'}
+                    {isAr ? 'الطابعات المربوطة بالبلوتوث فقط:' : 'Paired Bluetooth Printers Only:'}
                   </span>
                   <button
                     type="button"
@@ -793,8 +827,8 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
                   </button>
                 </div>
 
-                {pairedDevices && pairedDevices.length > 0 && (
-                  <div className="space-y-2 max-h-52 overflow-y-auto">
+                {pairedDevices && pairedDevices.length > 0 ? (
+                  <div className="space-y-2 max-h-56 overflow-y-auto">
                     {pairedDevices.map((dev, idx) => {
                       const devMac = dev.address || dev.id || '';
                       const isSelected =
@@ -812,10 +846,21 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
                               : 'bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 border-slate-200 dark:border-slate-700 hover:border-teal-500'
                           }`}
                         >
-                          <div className="flex items-center gap-2.5">
+                          <div className="flex items-center gap-2.5 min-w-0">
                             <Printer className={`w-4 h-4 shrink-0 ${isSelected ? 'text-white' : 'text-teal-600'}`} />
-                            <div>
-                              <div className="text-xs font-black">{dev.name || 'طابعة البلوتوث'}</div>
+                            <div className="min-w-0">
+                              <div className="text-xs font-black flex items-center gap-1.5 flex-wrap">
+                                <span className="truncate">{dev.name || 'طابعة البلوتوث'}</span>
+                                {dev.connected && (
+                                  <span className={`text-[9px] font-black px-1.5 py-0.5 rounded-md ${
+                                    isSelected
+                                      ? 'bg-white/20 text-white'
+                                      : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                                  }`}>
+                                    {isAr ? 'متصلة الآن' : 'Connected'}
+                                  </span>
+                                )}
+                              </div>
                               {devMac && (
                                 <div className={`text-[10px] font-mono dir-ltr text-right ${isSelected ? 'text-teal-100' : 'text-slate-400'}`}>
                                   MAC / ID: {devMac}
@@ -825,44 +870,37 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
                           </div>
 
                           {isSelected ? (
-                            <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-lg bg-white/20 text-white flex items-center gap-1">
+                            <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-lg bg-white/20 text-white flex items-center gap-1 shrink-0">
                               <CheckCircle2 className="w-3 h-3" />
                               {isAr ? 'معتمدة' : 'Active'}
                             </span>
                           ) : (
-                            <span className="text-[11px] font-extrabold text-teal-600 dark:text-teal-400">
-                              {isAr ? 'تغيير واعتماد' : 'Select'}
+                            <span className="text-[11px] font-extrabold text-teal-600 dark:text-teal-400 shrink-0">
+                              {isAr ? 'اعتماد الطابعة' : 'Select'}
                             </span>
                           )}
                         </button>
                       );
                     })}
                   </div>
-                )}
-
-                {/* قسم إدخال اسم طابعة مخصص يدوياً */}
-                <div className="pt-2 border-t border-teal-200 dark:border-teal-800 space-y-2">
-                  <span className="text-[11px] font-black text-slate-700 dark:text-slate-300 block">
-                    {isAr ? '✍️ أو أدخل اسم أو عنوان MAC الطابعة يدوياً:' : 'Or enter custom printer name / MAC:'}
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="text"
-                      value={customPrinterName}
-                      onChange={(e) => setCustomPrinterName(e.target.value)}
-                      placeholder={isAr ? 'مثال: POS-58, PT-210, MTP-II' : 'e.g. POS-58, PT-210'}
-                      className="flex-1 px-3 py-2 text-xs rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-teal-500"
-                    />
+                ) : (
+                  <div className="p-4 rounded-xl bg-white/80 dark:bg-slate-800/80 border border-teal-200 dark:border-slate-700 text-center space-y-2.5">
+                    <Bluetooth className="w-7 h-7 mx-auto text-slate-400" />
+                    <p className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                      {isAr
+                        ? 'لا توجد طابعات مربوطة بالبلوتوث حالياً. يرجى ربط الطابعة عبر بلوتوث الهاتف ثم الضغط على بحث.'
+                        : 'No Bluetooth-paired printers found. Pair your printer in Bluetooth settings first.'}
+                    </p>
                     <button
                       type="button"
-                      onClick={handleAddCustomPrinter}
-                      disabled={!customPrinterName.trim()}
-                      className="px-3.5 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-black transition-all cursor-pointer disabled:opacity-50"
+                      onClick={handleOpenPhoneBluetooth}
+                      className="px-3.5 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-black inline-flex items-center gap-1.5 cursor-pointer transition-all"
                     >
-                      {isAr ? 'اعتماد' : 'Save'}
+                      <Settings className="w-3.5 h-3.5" />
+                      <span>{isAr ? 'فتح إعدادات بلوتوث الهاتف' : 'Open Bluetooth Settings'}</span>
                     </button>
                   </div>
-                </div>
+                )}
               </div>
             )}
 

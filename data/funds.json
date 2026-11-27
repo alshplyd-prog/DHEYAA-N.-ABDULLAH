@@ -10,7 +10,7 @@
   {
     "id": "fund_1787350349137_204v6",
     "name": "صندوق الاولى",
-    "balance": 3000,
+    "balance": 0,
     "description": "",
     "orderIndex": 0,
     "createdAt": "2026-08-21T22:12:29.884Z"
@@ -74,7 +74,7 @@
   {
     "id": "fund-4",
     "name": "صندوق ماهر 1",
-    "balance": 5505000,
+    "balance": 5445000,
     "description": "",
     "orderIndex": 0,
     "createdAt": "2026-09-04T18:20:53.845Z"
