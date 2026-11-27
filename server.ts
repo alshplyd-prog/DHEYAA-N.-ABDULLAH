@@ -402,6 +402,33 @@ async function syncFromUpstreamServer(force = false): Promise<boolean> {
   return inFlightUpstreamSync;
 }
 
+const pgNormName = (col: string) =>
+  `LOWER(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(COALESCE(${col}, ''), CHR(160), ' '), CHR(8203)||'|'||CHR(8204)||'|'||CHR(8205)||'|'||CHR(8206)||'|'||CHR(8207)||'|'||CHR(65279), '', 'g'), '\\s+', ' ', 'g')))`;
+
+const pgPaymentAmtExpr = (alias = '') => {
+  const prefix = alias ? `${alias}.` : '';
+  return `COALESCE(NULLIF(${prefix}amount_paid, 0), NULLIF(${prefix}amount, 0), 0)`;
+};
+
+const pgActiveSalesWhere = (alias = 's') => {
+  const prefix = alias ? `${alias}.` : '';
+  const idCol = `${prefix}id`;
+  const nameCol = `${prefix}customer_name`;
+  return `TRIM(COALESCE(${nameCol}, '')) != ''
+    AND ${idCol} NOT LIKE 'pay_%' AND ${idCol} NOT LIKE 'fund_%' AND ${idCol} NOT LIKE 'emp_%' AND ${idCol} NOT LIKE 'item_%' AND ${idCol} NOT LIKE 'ft_%' AND ${idCol} NOT LIKE 'emptx_%' AND ${idCol} NOT LIKE 'conflict_%'
+    AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = ${idCol} AND (dr.table_name IN ('sales', 'contracts', 'unknown') OR dr.table_name IS NULL))`;
+};
+
+const pgActivePaymentsWhere = (alias = 'p') => {
+  const prefix = alias ? `${alias}.` : '';
+  const idCol = `${prefix}id`;
+  const cidCol = `${prefix}contract_id`;
+  return `${pgPaymentAmtExpr(alias)} > 0
+    AND (${idCol} LIKE 'pay_%' OR (${idCol} NOT LIKE 'contract_%' AND ${idCol} NOT LIKE 'emp_%' AND ${idCol} NOT LIKE 'item_%' AND ${idCol} NOT LIKE 'fund_%'))
+    AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = ${idCol} AND (dr.table_name IN ('payments', 'unknown') OR dr.table_name IS NULL))
+    AND (TRIM(COALESCE(${cidCol}, '')) = '' OR EXISTS (SELECT 1 FROM sales s_ref WHERE TRIM(s_ref.id) = TRIM(${cidCol}) AND ${pgActiveSalesWhere('s_ref')}))`;
+};
+
 function mapContractRow(r: any) {
   const totalPrice = Number(r.total_price ?? r.totalPrice) || 0;
   const advancePayment = Number(r.advance_payment ?? r.advancePayment) || 0;
@@ -464,7 +491,7 @@ function mapInventoryRow(r: any) {
 }
 
 function mapPaymentRow(r: any) {
-  const amt = Number(r.amountPaid ?? r.amount_paid ?? r.amount) || 0;
+  const amt = Number(r.amountPaid) || Number(r.amount_paid) || Number(r.amount) || 0;
   let cust = r.customer_name ?? r.customerName ?? r.resolved_customer_name ?? '';
   if (!cust && (r.contract_id || r.contractId)) {
     const cRow = (fileDb.get<any>("contracts") || []).find((c: any) => c.id === (r.contract_id || r.contractId));
@@ -666,9 +693,8 @@ async function recalculateAllFundBalancesInPg() {
         DELETE FROM fund_transactions
         WHERE id LIKE 'ft_pay_%'
           AND SUBSTRING(id FROM 8) NOT IN (
-            SELECT id FROM payments 
-            WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = payments.id)
-              AND COALESCE(amount_paid, amount, 0) > 0
+            SELECT id FROM payments p
+            WHERE ${pgActivePaymentsWhere('p')}
           )
       `).catch(() => {});
 
@@ -679,15 +705,14 @@ async function recalculateAllFundBalancesInPg() {
           'ft_pay_' || p.id,
           p.fund_id,
           'installment',
-          COALESCE(p.amount_paid, p.amount, 0),
+          ${pgPaymentAmtExpr('p')},
           'تسديد قسط زبون: ' || COALESCE(p.customer_name, ''),
           COALESCE(p.rep_name, ''),
           COALESCE(p.created_at, NOW()::text)
         FROM payments p
-        WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id)
-          AND COALESCE(p.amount_paid, p.amount, 0) > 0
+        WHERE ${pgActivePaymentsWhere('p')}
           AND p.fund_id IS NOT NULL 
-          AND p.fund_id != ''
+          AND TRIM(p.fund_id) != ''
         ON CONFLICT (id) DO UPDATE 
         SET amount = EXCLUDED.amount, 
             fund_id = EXCLUDED.fund_id,
@@ -2321,8 +2346,8 @@ async function startServer() {
   };
 
   const makeDeterministicCustomerId = (name: string) => {
-    const trimmed = (name || '').trim();
-    const hash = crypto.createHash('md5').update(trimmed).digest('hex');
+    const normalized = (name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    const hash = crypto.createHash('md5').update(normalized).digest('hex');
     return `cust-${hash}`;
   };
 
@@ -2403,7 +2428,7 @@ async function startServer() {
       const existingRows = await executePg(
         `SELECT id, location_cleared_at, location_updated_at FROM customers
          WHERE ($1::text IS NOT NULL AND id = $1)
-            OR TRIM(LOWER(name)) = TRIM(LOWER($2))
+            OR ${pgNormName('name')} = ${pgNormName('$2')}
          ORDER BY created_at ASC NULLS LAST
          LIMIT 1`,
         [saleData.customerId || null, cleanName]
@@ -2423,8 +2448,8 @@ async function startServer() {
            MAX(NULLIF(TRIM(list_name), '')) AS list_name,
            BOOL_OR(status = 'active') AS has_active
          FROM sales
-         WHERE (customer_id = $1 OR TRIM(LOWER(customer_name)) = TRIM(LOWER($2)))
-           AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = sales.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts'))`,
+         WHERE (customer_id = $1 OR ${pgNormName('customer_name')} = ${pgNormName('$2')})
+           AND ${pgActiveSalesWhere('sales')}`,
         [custId, cleanName]
       ).catch(() => []);
 
@@ -2509,12 +2534,21 @@ async function startServer() {
     try {
       await ensureLocationSchemaInPg();
 
-      // 1. Purge deleted records from customers table that are recorded in deleted_records
+      // 1. Purge deleted records from customers table that have NO active contract in sales
       await executePg(`
-        DELETE FROM customers 
-        WHERE id IN (
+        DELETE FROM customers c
+        WHERE c.id IN (
           SELECT record_id FROM deleted_records 
-          WHERE table_name IN ('customers', 'sales', 'contracts')
+          WHERE table_name IN ('customers', 'sales', 'contracts', 'unknown') OR table_name IS NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM sales s
+          WHERE (
+            ${pgNormName('s.customer_name')} = ${pgNormName('c.name')}
+            OR s.customer_id = c.id
+            OR s.id = c.id
+          )
+          AND ${pgActiveSalesWhere('s')}
         )
       `).catch(() => {});
 
@@ -2523,8 +2557,12 @@ async function startServer() {
         SELECT c.id FROM customers c
         WHERE NOT EXISTS (
           SELECT 1 FROM sales s 
-          WHERE (TRIM(LOWER(s.customer_name)) = TRIM(LOWER(c.name)) OR s.customer_id = c.id OR s.id = c.id)
-            AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = s.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts'))
+          WHERE (
+            ${pgNormName('s.customer_name')} = ${pgNormName('c.name')}
+            OR s.customer_id = c.id
+            OR s.id = c.id
+          )
+            AND ${pgActiveSalesWhere('s')}
         )
       `).catch(() => []);
 
@@ -2544,30 +2582,75 @@ async function startServer() {
         }
       }
 
+      // 2b. Deduplicate customers table so there is strictly 1 row per normalized customer name
+      const allCustRows = await executePg(`
+        SELECT id, name, latitude, longitude, location_address, location_updated_at, location_cleared_at, created_at
+        FROM customers
+        ORDER BY created_at ASC NULLS LAST, id ASC
+      `).catch(() => []);
+
+      if (Array.isArray(allCustRows) && allCustRows.length > 1) {
+        const custGroups = new Map<string, any[]>();
+        for (const cr of allCustRows) {
+          const nk = normalizeEntityName(cr?.name);
+          if (!nk) continue;
+          if (!custGroups.has(nk)) custGroups.set(nk, []);
+          custGroups.get(nk)!.push(cr);
+        }
+        for (const [, grp] of custGroups) {
+          if (grp.length > 1) {
+            // Prefer row with valid coordinates or deterministic ID, else earliest
+            grp.sort((a, b) => {
+              const aHasLoc = a.latitude != null && Number(a.latitude) !== 0 ? 1 : 0;
+              const bHasLoc = b.latitude != null && Number(b.latitude) !== 0 ? 1 : 0;
+              if (aHasLoc !== bHasLoc) return bHasLoc - aHasLoc;
+              const aDet = String(a.id || '').startsWith('cust-') ? 1 : 0;
+              const bDet = String(b.id || '').startsWith('cust-') ? 1 : 0;
+              if (aDet !== bDet) return bDet - aDet;
+              return String(a.id || '').localeCompare(String(b.id || ''));
+            });
+            const primary = grp[0];
+            const dupes = grp.slice(1);
+            const dupIds = dupes.map((d) => d.id).filter(Boolean);
+            if (dupIds.length > 0) {
+              await executePg(`UPDATE sales SET customer_id = $1 WHERE customer_id = ANY($2)`, [primary.id, dupIds]).catch(() => {});
+              await executePg(`DELETE FROM customers WHERE id = ANY($1)`, [dupIds]).catch(() => {});
+              await executePg(
+                `INSERT INTO deleted_records (record_id, table_name) SELECT unnest($1::text[]), 'customers' ON CONFLICT (record_id) DO NOTHING`,
+                [dupIds]
+              ).catch(() => {});
+              for (const did of dupIds) fileDb.delete("customers", did);
+            }
+          }
+        }
+      }
+
       // 3. Insert any missing customers from active sales AND sync totals/details into customers table
       const activeSales = await executePg(`
-        SELECT DISTINCT ON (TRIM(LOWER(customer_name)))
-          id, customer_id, TRIM(customer_name) AS customer_name,
+        SELECT DISTINCT ON (${pgNormName('s.customer_name')})
+          id, customer_id, TRIM(REGEXP_REPLACE(REPLACE(COALESCE(customer_name, ''), CHR(160), ' '), '\\s+', ' ', 'g')) AS customer_name,
           customer_phone, customer_address, list_id, list_name,
           latitude, longitude, location_address, location_updated_at, location_cleared_at
         FROM sales s
-        WHERE TRIM(COALESCE(customer_name, '')) != ''
-          AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = s.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts'))
-        ORDER BY TRIM(LOWER(customer_name)), updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        WHERE ${pgActiveSalesWhere('s')}
+        ORDER BY ${pgNormName('s.customer_name')}, updated_at DESC NULLS LAST, created_at DESC NULLS LAST
       `).catch(() => []);
 
       if (Array.isArray(activeSales) && activeSales.length > 0) {
         const existingCusts = await executePg(`SELECT id, name FROM customers`).catch(() => []);
         const existingByName = new Map<string, string>();
         for (const ec of (existingCusts || [])) {
-          if (ec?.name) existingByName.set(String(ec.name).trim().toLowerCase(), ec.id);
+          const nk = normalizeEntityName(ec?.name);
+          if (nk) existingByName.set(nk, ec.id);
         }
 
         for (const s of activeSales) {
-          const normKey = String(s.customer_name || '').trim().toLowerCase();
+          const normKey = normalizeEntityName(s.customer_name);
           if (!normKey) continue;
-          const targetCustId = s.customer_id || existingByName.get(normKey) || makeDeterministicCustomerId(s.customer_name);
-          if (!existingByName.has(normKey)) {
+          const existingId = existingByName.get(normKey);
+          const targetCustId = existingId || s.customer_id || makeDeterministicCustomerId(s.customer_name);
+          if (!existingId) {
+            await executePg(`DELETE FROM deleted_records WHERE record_id = $1`, [targetCustId]).catch(() => {});
             await upsertCustomerFromSaleInPg({
               id: s.id,
               customerId: targetCustId,
@@ -2582,22 +2665,63 @@ async function startServer() {
               locationUpdatedAt: s.location_updated_at,
               locationClearedAt: s.location_cleared_at,
             });
+            existingByName.set(normKey, targetCustId);
+          } else {
+            await executePg(`DELETE FROM deleted_records WHERE record_id = $1`, [existingId]).catch(() => {});
           }
         }
 
-        // Update aggregate purchases, paid, remaining, status across all customers from active sales
+        // Link sales.customer_id to canonical customer row
         await executePg(`
-          WITH sale_aggs AS (
+          UPDATE sales s
+          SET customer_id = c.id
+          FROM customers c
+          WHERE ${pgNormName('s.customer_name')} = ${pgNormName('c.name')}
+            AND (s.customer_id IS NULL OR s.customer_id = '' OR s.customer_id != c.id)
+            AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = s.id AND (dr.table_name IN ('sales', 'contracts', 'unknown') OR dr.table_name IS NULL))
+        `).catch(() => {});
+
+        // Update aggregate purchases, paid, remaining, status across all customers directly from live payments + active sales
+        await executePg(`
+          WITH active_payments AS (
+            SELECT p.contract_id,
+                   ${pgNormName('p.customer_name')} AS norm_name,
+                   ${pgPaymentAmtExpr('p')}::float AS amt
+            FROM payments p
+            WHERE ${pgActivePaymentsWhere('p')}
+          ),
+          by_contract AS (
+            SELECT TRIM(contract_id) AS contract_id, SUM(amt)::float AS sum_paid
+            FROM active_payments
+            WHERE TRIM(COALESCE(contract_id, '')) != ''
+            GROUP BY TRIM(contract_id)
+          ),
+          by_name AS (
+            SELECT norm_name, SUM(amt)::float AS sum_paid
+            FROM active_payments
+            WHERE TRIM(COALESCE(contract_id, '')) = '' AND norm_name != ''
+            GROUP BY norm_name
+          ),
+          live_cust_sales AS (
             SELECT
-              TRIM(LOWER(customer_name)) AS norm_name,
-              COALESCE(SUM(COALESCE(total_price, 0)), 0)::float AS total_purchases,
-              COALESCE(SUM(COALESCE(total_paid, 0)), 0)::float AS total_paid,
-              COALESCE(SUM(COALESCE(remaining_balance, 0)), 0)::float AS remaining_balance,
-              BOOL_OR(status = 'active') AS has_active
+              ${pgNormName('s.customer_name')} AS norm_name,
+              COALESCE(s.total_price, 0)::float AS total_price,
+              GREATEST(0, COALESCE(s.total_price, 0) - COALESCE(s.advance_payment, 0))::float AS net_price,
+              (COALESCE(bc.sum_paid, 0) + COALESCE(bn.sum_paid, 0))::float AS live_paid_sum
             FROM sales s
-            WHERE TRIM(COALESCE(customer_name, '')) != ''
-              AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = s.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts'))
-            GROUP BY TRIM(LOWER(customer_name))
+            LEFT JOIN by_contract bc ON bc.contract_id = TRIM(s.id)
+            LEFT JOIN by_name bn ON bn.norm_name = ${pgNormName('s.customer_name')}
+            WHERE ${pgActiveSalesWhere('s')}
+          ),
+          sale_aggs AS (
+            SELECT
+              norm_name,
+              COALESCE(SUM(total_price), 0)::float AS total_purchases,
+              COALESCE(SUM(CASE WHEN net_price > 0 THEN LEAST(net_price, live_paid_sum) ELSE live_paid_sum END), 0)::float AS total_paid,
+              COALESCE(SUM(GREATEST(0, net_price - live_paid_sum)), 0)::float AS remaining_balance,
+              BOOL_OR(GREATEST(0, net_price - live_paid_sum) > 0 OR (net_price > 0 AND live_paid_sum <= 0)) AS has_active
+            FROM live_cust_sales
+            GROUP BY norm_name
           )
           UPDATE customers c
           SET
@@ -2606,7 +2730,7 @@ async function startServer() {
             remaining_balance = sa.remaining_balance,
             status = CASE WHEN sa.has_active THEN 'active' ELSE 'completed' END
           FROM sale_aggs sa
-          WHERE TRIM(LOWER(c.name)) = sa.norm_name
+          WHERE ${pgNormName('c.name')} = sa.norm_name
         `).catch(() => {});
       }
 
@@ -2703,87 +2827,118 @@ async function startServer() {
 
     if (isPgConfigured()) {
       try {
-        // Purge any payments that are tombstoned in deleted_records or whose contract no longer exists
+        // Purge any payments that are tombstoned, invalid, or whose contract no longer exists in active sales
         await executePg(`
           DELETE FROM payments 
-          WHERE (contract_id IS NOT NULL AND contract_id != '' AND contract_id NOT IN (SELECT id FROM sales UNION SELECT id FROM contracts))
-             OR id IN (SELECT record_id FROM deleted_records WHERE table_name = 'payments');
+          WHERE ${pgPaymentAmtExpr('payments')} <= 0
+             OR id LIKE 'contract_%' OR id LIKE 'emp_%' OR id LIKE 'item_%' OR id LIKE 'fund_%'
+             OR (
+               TRIM(COALESCE(contract_id, '')) != ''
+               AND TRIM(contract_id) NOT IN (SELECT TRIM(id) FROM sales s_ref WHERE ${pgActiveSalesWhere('s_ref')})
+             )
+             OR id IN (SELECT record_id FROM deleted_records WHERE table_name IN ('payments', 'unknown') OR table_name IS NULL);
         `).catch(() => {});
 
-        const whereClause = hasSpecific ? `WHERE c.id = ANY($1)` : ``;
+        const whereClause = hasSpecific ? `AND c.id = ANY($1)` : ``;
         const params = hasSpecific ? [targetIds] : [];
 
         await executePg(`
+          WITH active_payments AS (
+            SELECT p.contract_id,
+                   ${pgNormName('p.customer_name')} AS norm_name,
+                   ${pgPaymentAmtExpr('p')}::float AS amt,
+                   p.payment_date
+            FROM payments p
+            WHERE ${pgActivePaymentsWhere('p')}
+          ),
+          by_contract AS (
+            SELECT TRIM(contract_id) AS contract_id, SUM(amt)::float AS sum_paid, MAX(payment_date) AS max_date
+            FROM active_payments
+            WHERE TRIM(COALESCE(contract_id, '')) != ''
+            GROUP BY TRIM(contract_id)
+          ),
+          by_name AS (
+            SELECT norm_name, SUM(amt)::float AS sum_paid, MAX(payment_date) AS max_date
+            FROM active_payments
+            WHERE TRIM(COALESCE(contract_id, '')) = '' AND norm_name != ''
+            GROUP BY norm_name
+          )
           UPDATE sales c
-          SET 
-            total_paid = LEAST(
-              GREATEST(0, COALESCE(c.total_price, 0) - COALESCE(c.advance_payment, 0)),
-              COALESCE((
-                SELECT SUM(COALESCE(p.amount_paid, p.amount, 0))
-                FROM payments p
-                WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                  AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND dr.table_name = 'payments')
-              ), 0)
-            ),
-            remaining_balance = GREATEST(0, (COALESCE(c.total_price, 0) - COALESCE(c.advance_payment, 0)) - COALESCE((
-              SELECT SUM(COALESCE(p.amount_paid, p.amount, 0))
-              FROM payments p
-              WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND dr.table_name = 'payments')
-            ), 0)),
-            last_payment_date = (
-              SELECT MAX(p.payment_date)
-              FROM payments p
-              WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND dr.table_name = 'payments')
-            ),
-            status = CASE 
-              WHEN GREATEST(0, (COALESCE(c.total_price, 0) - COALESCE(c.advance_payment, 0)) - COALESCE((
-                SELECT SUM(COALESCE(p.amount_paid, p.amount, 0))
-                FROM payments p
-                WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                  AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND dr.table_name = 'payments')
-              ), 0)) = 0 AND (
-                COALESCE((
-                  SELECT SUM(COALESCE(p.amount_paid, p.amount, 0))
-                  FROM payments p
-                  WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                    AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND dr.table_name = 'payments')
-                ), 0) > 0 OR (COALESCE(c.total_price, 0) - COALESCE(c.advance_payment, 0)) = 0
-              ) THEN 'completed' 
-              ELSE 'active' 
+          SET
+            total_paid = CASE
+              WHEN GREATEST(0, COALESCE(c.total_price, 0) - COALESCE(c.advance_payment, 0)) > 0
+              THEN LEAST(GREATEST(0, COALESCE(c.total_price, 0) - COALESCE(c.advance_payment, 0)), COALESCE(bc.sum_paid, 0) + COALESCE(bn.sum_paid, 0))
+              ELSE (COALESCE(bc.sum_paid, 0) + COALESCE(bn.sum_paid, 0))
+            END,
+            remaining_balance = GREATEST(0, GREATEST(0, COALESCE(c.total_price, 0) - COALESCE(c.advance_payment, 0)) - (COALESCE(bc.sum_paid, 0) + COALESCE(bn.sum_paid, 0))),
+            last_payment_date = CASE
+              WHEN bc.max_date IS NULL THEN bn.max_date
+              WHEN bn.max_date IS NULL THEN bc.max_date
+              WHEN bc.max_date >= bn.max_date THEN bc.max_date
+              ELSE bn.max_date
+            END,
+            status = CASE
+              WHEN GREATEST(0, GREATEST(0, COALESCE(c.total_price, 0) - COALESCE(c.advance_payment, 0)) - (COALESCE(bc.sum_paid, 0) + COALESCE(bn.sum_paid, 0))) = 0
+                AND ((COALESCE(bc.sum_paid, 0) + COALESCE(bn.sum_paid, 0)) > 0 OR GREATEST(0, COALESCE(c.total_price, 0) - COALESCE(c.advance_payment, 0)) = 0)
+              THEN 'completed'
+              ELSE 'active'
             END
-          ${whereClause}
+          FROM (
+            SELECT s.id, bc2.sum_paid, bc2.max_date, bn2.sum_paid AS name_sum_paid, bn2.max_date AS name_max_date
+            FROM sales s
+            LEFT JOIN by_contract bc2 ON bc2.contract_id = TRIM(s.id)
+            LEFT JOIN by_name bn2 ON bn2.norm_name = ${pgNormName('s.customer_name')}
+          ) agg
+          LEFT JOIN by_contract bc ON bc.contract_id = TRIM(agg.id)
+          LEFT JOIN by_name bn ON bn.norm_name = ${pgNormName('c.customer_name')}
+          WHERE c.id = agg.id ${whereClause}
         `, params);
 
         if (!hasSpecific) {
           const pgContracts = await executePg(`
-            SELECT 
+            WITH active_payments AS (
+              SELECT p.contract_id,
+                     ${pgNormName('p.customer_name')} AS norm_name,
+                     ${pgPaymentAmtExpr('p')}::float AS amt,
+                     p.payment_date
+              FROM payments p
+              WHERE ${pgActivePaymentsWhere('p')}
+            ),
+            by_contract AS (
+              SELECT TRIM(contract_id) AS contract_id, COUNT(*)::int AS cnt, SUM(amt)::float AS sum_paid, MAX(payment_date) AS max_date
+              FROM active_payments
+              WHERE TRIM(COALESCE(contract_id, '')) != ''
+              GROUP BY TRIM(contract_id)
+            ),
+            by_name AS (
+              SELECT norm_name, COUNT(*)::int AS cnt, SUM(amt)::float AS sum_paid, MAX(payment_date) AS max_date
+              FROM active_payments
+              WHERE TRIM(COALESCE(contract_id, '')) = '' AND norm_name != ''
+              GROUP BY norm_name
+            )
+            SELECT
               c.*,
-              (SELECT COUNT(*) FROM payments p WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name))) AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments' OR dr.table_name IS NULL))) AS payment_count,
-              COALESCE((
-                SELECT SUM(COALESCE(p.amount_paid, p.amount, 0))
-                FROM payments p
-                WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                  AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments' OR dr.table_name IS NULL))
-              ), 0) AS actual_total_paid,
-              (
-                SELECT MAX(p.payment_date)
-                FROM payments p
-                WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                  AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments' OR dr.table_name IS NULL))
-              ) AS actual_last_payment_date
+              COALESCE(bc.cnt, 0) + COALESCE(bn.cnt, 0) AS payment_count,
+              COALESCE(bc.sum_paid, 0) + COALESCE(bn.sum_paid, 0) AS actual_total_paid,
+              CASE
+                WHEN bc.max_date IS NULL THEN bn.max_date
+                WHEN bn.max_date IS NULL THEN bc.max_date
+                WHEN bc.max_date >= bn.max_date THEN bc.max_date
+                ELSE bn.max_date
+              END AS actual_last_payment_date
             FROM sales c
-            WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = c.id AND (dr.table_name IN ('sales', 'contracts') OR dr.table_name IS NULL))
+            LEFT JOIN by_contract bc ON bc.contract_id = TRIM(c.id)
+            LEFT JOIN by_name bn ON bn.norm_name = ${pgNormName('c.customer_name')}
+            WHERE ${pgActiveSalesWhere('c')}
             ORDER BY c.created_at ASC, c.id ASC
           `).catch(() => []);
           if (Array.isArray(pgContracts)) {
             fileDb.setAll("contracts", pgContracts.map(mapContractRow));
           }
           const pgPayments = await executePg(`
-            SELECT * FROM payments
-            WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = id AND (dr.table_name = 'payments' OR dr.table_name IS NULL))
-            ORDER BY payment_date DESC, created_at DESC
+            SELECT p.* FROM payments p
+            WHERE ${pgActivePaymentsWhere('p')}
+            ORDER BY p.payment_date DESC, p.created_at DESC, p.id DESC
           `).catch(() => []);
           if (Array.isArray(pgPayments)) {
             fileDb.setAll("payments", pgPayments.map(mapPaymentRow));
@@ -2798,10 +2953,12 @@ async function startServer() {
         const allPayments = fileDb.get("payments") || [];
         const updated = allContracts.map((c: any) => {
           const cNameNorm = normalizeEntityName(c.customerName);
-          const cPayments = allPayments.filter(
-            (p: any) => (p.contractId && p.contractId.trim()) ? p.contractId === c.id : (p.customerName && cNameNorm && normalizeEntityName(p.customerName) === cNameNorm)
-          );
-          const paymentsSum = cPayments.reduce((sum: number, p: any) => sum + (Number(p.amountPaid ?? p.amount ?? p.amount_paid) || 0), 0);
+          const cIdTrim = String(c.id || '').trim();
+          const cPayments = allPayments.filter((p: any) => {
+            const pCid = p?.contractId ? String(p.contractId).trim() : '';
+            return pCid ? pCid === cIdTrim : Boolean(p?.customerName && cNameNorm && normalizeEntityName(p.customerName) === cNameNorm);
+          });
+          const paymentsSum = cPayments.reduce((sum: number, p: any) => sum + (Number(p?.amountPaid) || Number(p?.amount_paid) || Number(p?.amount) || 0), 0);
           const net = Math.max(0, (Number(c.totalPrice) || 0) - (Number(c.advancePayment) || 0));
           const totalPaid = net > 0 ? Math.min(net, paymentsSum) : paymentsSum;
           const excessAmount = Math.max(0, paymentsSum - net);
@@ -2831,28 +2988,44 @@ async function startServer() {
       if (isPgConfigured()) {
         try {
           const sql = `
-            SELECT 
+            WITH active_payments AS (
+              SELECT p.contract_id,
+                     ${pgNormName('p.customer_name')} AS norm_name,
+                     ${pgPaymentAmtExpr('p')}::float AS amt,
+                     p.payment_date
+              FROM payments p
+              WHERE ${pgActivePaymentsWhere('p')}
+            ),
+            by_contract AS (
+              SELECT TRIM(contract_id) AS contract_id, COUNT(*)::int AS cnt, SUM(amt)::float AS sum_paid, MAX(payment_date) AS max_date
+              FROM active_payments
+              WHERE TRIM(COALESCE(contract_id, '')) != ''
+              GROUP BY TRIM(contract_id)
+            ),
+            by_name AS (
+              SELECT norm_name, COUNT(*)::int AS cnt, SUM(amt)::float AS sum_paid, MAX(payment_date) AS max_date
+              FROM active_payments
+              WHERE TRIM(COALESCE(contract_id, '')) = '' AND norm_name != ''
+              GROUP BY norm_name
+            )
+            SELECT
               c.*,
-              (SELECT COUNT(*) FROM payments p WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name))) AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments' OR dr.table_name IS NULL))) AS payment_count,
-              COALESCE((
-                SELECT SUM(COALESCE(p.amount_paid, p.amount, 0))
-                FROM payments p
-                WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                  AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments' OR dr.table_name IS NULL))
-              ), 0) AS actual_total_paid,
-              (
-                SELECT MAX(p.payment_date)
-                FROM payments p
-                WHERE ((p.contract_id = c.id) OR ((p.contract_id IS NULL OR p.contract_id = '') AND (TRIM(LOWER(p.customer_name)) = TRIM(LOWER(c.customer_name)) OR p.customer_name = c.customer_name)))
-                  AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments' OR dr.table_name IS NULL))
-              ) AS actual_last_payment_date
+              COALESCE(bc.cnt, 0) + COALESCE(bn.cnt, 0) AS payment_count,
+              COALESCE(bc.sum_paid, 0) + COALESCE(bn.sum_paid, 0) AS actual_total_paid,
+              CASE
+                WHEN bc.max_date IS NULL THEN bn.max_date
+                WHEN bn.max_date IS NULL THEN bc.max_date
+                WHEN bc.max_date >= bn.max_date THEN bc.max_date
+                ELSE bn.max_date
+              END AS actual_last_payment_date
             FROM sales c
-            WHERE c.id NOT LIKE 'pay_%' AND c.id NOT LIKE 'ft_%' AND c.id NOT LIKE 'emptx_%' AND c.id NOT LIKE 'conflict_%'
-              AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = c.id AND (dr.table_name IN ('sales', 'contracts') OR dr.table_name IS NULL))
+            LEFT JOIN by_contract bc ON bc.contract_id = TRIM(c.id)
+            LEFT JOIN by_name bn ON bn.norm_name = ${pgNormName('c.customer_name')}
+            WHERE ${pgActiveSalesWhere('c')}
             ORDER BY c.created_at ASC, c.id ASC
           `;
           const rows = await executePgStrict(sql);
-          let contracts = (rows || []).map(mapContractRow).filter(c => c && c.id && !c.id.startsWith('pay_') && !c.id.startsWith('ft_') && !c.id.startsWith('emptx_'));
+          const contracts = (rows || []).map(mapContractRow).filter((c) => c && c.id && String(c.customerName || '').trim() !== '' && !c.id.startsWith('pay_') && !c.id.startsWith('ft_') && !c.id.startsWith('emptx_'));
           if (contracts.length > 0 || (fileDb.get("contracts") || []).length === 0) {
             fileDb.setAll("contracts", contracts);
           }
@@ -2868,28 +3041,30 @@ async function startServer() {
         await syncFromUpstreamServer(false).catch(() => {});
       }
 
-      let allContracts = (fileDb.get("contracts") || []).filter((c: any) => c && c.id && !String(c.id).startsWith('pay_') && !String(c.id).startsWith('ft_') && !String(c.id).startsWith('emptx_') && !String(c.id).startsWith('conflict_'));
+      const allContracts = (fileDb.get("contracts") || []).filter((c: any) => c && c.id && String(c.customerName || c.customer_name || '').trim() !== '' && !String(c.id).startsWith('pay_') && !String(c.id).startsWith('fund_') && !String(c.id).startsWith('emp_') && !String(c.id).startsWith('item_') && !String(c.id).startsWith('ft_') && !String(c.id).startsWith('emptx_') && !String(c.id).startsWith('conflict_'));
       const allPayments = fileDb.get("payments") || [];
       const contracts = allContracts.map((c: any) => {
         const cNameNorm = normalizeEntityName(c.customerName);
-        const cPayments = allPayments.filter(
-          (p: any) => (p.contractId && p.contractId.trim()) ? p.contractId === c.id : (p.customerName && cNameNorm && normalizeEntityName(p.customerName) === cNameNorm)
-        );
-        const paymentsSum = cPayments.reduce((sum: number, p: any) => sum + (Number(p.amountPaid ?? p.amount ?? p.amount_paid) || 0), 0);
+        const cIdTrim = String(c.id || '').trim();
+        const cPayments = allPayments.filter((p: any) => {
+          const amt = Number(p?.amountPaid) || Number(p?.amount_paid) || Number(p?.amount) || 0;
+          if (amt <= 0 || !p?.id || p.id.startsWith('contract_') || p.id.startsWith('emp_') || p.id.startsWith('item_') || p.id.startsWith('fund_')) return false;
+          const pCid = p?.contractId ? String(p.contractId).trim() : '';
+          return pCid ? pCid === cIdTrim : Boolean(p?.customerName && cNameNorm && normalizeEntityName(p.customerName) === cNameNorm);
+        });
+        const paymentsSum = cPayments.reduce((sum: number, p: any) => sum + (Number(p.amountPaid) || Number(p.amount_paid) || Number(p.amount) || 0), 0);
         const net = Math.max(0, (Number(c.totalPrice) || 0) - (Number(c.advancePayment) || 0));
-        const existingPaid = Number(c.rawTotalPaid ?? c.totalPaid ?? 0) || 0;
-        const effectivePaidSum = (cPayments.length === 0 && allPayments.length === 0 && existingPaid > 0) ? existingPaid : paymentsSum;
-        const totalPaid = net > 0 ? Math.min(net, effectivePaidSum) : effectivePaidSum;
-        const excessAmount = Math.max(0, effectivePaidSum - net);
-        const remainingBalance = Math.max(0, net - effectivePaidSum);
-        const status = (remainingBalance === 0 && (net === 0 || effectivePaidSum > 0)) ? 'completed' : 'active';
+        const totalPaid = net > 0 ? Math.min(net, paymentsSum) : paymentsSum;
+        const excessAmount = Math.max(0, paymentsSum - net);
+        const remainingBalance = Math.max(0, net - paymentsSum);
+        const status = (remainingBalance === 0 && (net === 0 || paymentsSum > 0)) ? 'completed' : 'active';
         const sorted = [...cPayments].sort((a: any, b: any) => new Date(b.paymentDate).getTime() - new Date(a.paymentDate).getTime());
         const lastPaymentDate = sorted[0]?.paymentDate || c.lastPaymentDate || null;
         return {
           ...c,
           totalPaid,
           excessAmount,
-          rawTotalPaid: effectivePaidSum,
+          rawTotalPaid: paymentsSum,
           remainingBalance,
           status,
           lastPaymentDate,
@@ -3391,9 +3566,10 @@ async function startServer() {
           const custId = cd.customer_id;
           const custName = cd.customer_name;
           const hasOtherContracts = await executePg(
-            `SELECT 1 FROM sales WHERE id != $1 AND (customer_id = $2 OR customer_name = $3)
-             UNION
-             SELECT 1 FROM contracts WHERE id != $1 AND (customer_id = $2 OR customer_name = $3) LIMIT 1`,
+            `SELECT 1 FROM sales WHERE id != $1
+               AND (customer_id = $2 OR ${pgNormName('customer_name')} = ${pgNormName('$3')})
+               AND ${pgActiveSalesWhere('sales')}
+             LIMIT 1`,
             [id, custId || '', custName || '']
           ).catch(() => []);
 
@@ -3404,7 +3580,20 @@ async function startServer() {
               fileDb.delete("customers", custId);
             }
             if (custName) {
-              await executePg(`DELETE FROM customers WHERE name = $1`, [custName]).catch(() => {});
+              const matchingCusts = await executePg(
+                `SELECT id FROM customers WHERE ${pgNormName('name')} = ${pgNormName('$1')}`,
+                [custName]
+              ).catch(() => []);
+              for (const mc of (matchingCusts || [])) {
+                if (mc?.id) {
+                  await executePg(`INSERT INTO deleted_records (record_id, table_name) VALUES ($1, 'customers') ON CONFLICT (record_id) DO NOTHING`, [mc.id]).catch(() => {});
+                  fileDb.delete("customers", mc.id);
+                }
+              }
+              await executePg(
+                `DELETE FROM customers WHERE ${pgNormName('name')} = ${pgNormName('$1')}`,
+                [custName]
+              ).catch(() => {});
             }
           }
         }
@@ -3425,10 +3614,10 @@ async function startServer() {
       if (isPgConfigured()) {
         try {
           const rows = await executePgStrict(`
-            SELECT p.*, COALESCE(NULLIF(p.customer_name, ''), c.customer_name, '') AS resolved_customer_name
+            SELECT p.*, COALESCE(NULLIF(p.customer_name, ''), s.customer_name, '') AS resolved_customer_name
             FROM payments p
-            LEFT JOIN contracts c ON p.contract_id = c.id
-            WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments' OR dr.table_name = 'unknown'))
+            LEFT JOIN sales s ON TRIM(p.contract_id) = TRIM(s.id)
+            WHERE ${pgActivePaymentsWhere('p')}
             ORDER BY p.payment_date DESC, p.created_at DESC, p.id DESC
           `);
           const payments = (rows || []).map(mapPaymentRow).filter((p: any) => p.amountPaid > 0);
@@ -3442,7 +3631,7 @@ async function startServer() {
           }
         }
       }
-      const filePayments = (fileDb.get("payments") || []).map(mapPaymentRow).filter((p: any) => (p.amountPaid ?? p.amount ?? 0) > 0);
+      const filePayments = (fileDb.get("payments") || []).map(mapPaymentRow).filter((p: any) => p.amountPaid > 0);
       res.json(filePayments);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -4461,54 +4650,68 @@ async function startServer() {
   // --- Customers API (جدول الزبائن) ---
   app.get("/api/customers", async (req, res) => {
     try {
-      let rows: any[] = [];
-      try {
-        rows = await executePg(`
+      const pgOk = isPgConfigured() && (await probePgConnection().catch(() => false));
+      if (pgOk) {
+        await syncCustomersTableInPg().catch(() => {});
+        const rows = await executePgStrict(`
           SELECT 
             c.*,
-            (SELECT COUNT(*) FROM sales s WHERE s.customer_name = c.name OR s.customer_id = c.id) as sales_count
+            (
+              SELECT COUNT(*)::int FROM sales s
+              WHERE (s.customer_id = c.id OR ${pgNormName('s.customer_name')} = ${pgNormName('c.name')})
+                AND ${pgActiveSalesWhere('s')}
+            ) as sales_count
           FROM customers c
           WHERE NOT EXISTS (
             SELECT 1 FROM deleted_records dr 
-            WHERE dr.record_id = c.id AND (dr.table_name = 'customers' OR dr.table_name = 'unknown')
+            WHERE dr.record_id = c.id AND (dr.table_name IN ('customers', 'unknown') OR dr.table_name IS NULL)
           )
           ORDER BY c.name ASC
-        `);
-      } catch (pgErr) {}
+        `).catch(() => null);
+
+        if (Array.isArray(rows)) {
+          const dedupedMap = new Map<string, any>();
+          for (const r of rows) {
+            const nk = normalizeEntityName(r?.name);
+            if (!nk) continue;
+            if (!dedupedMap.has(nk)) {
+              dedupedMap.set(nk, r);
+            }
+          }
+          const authoritative = Array.from(dedupedMap.values()).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+          fileDb.setAll("customers", authoritative);
+          return res.json(authoritative);
+        }
+      }
 
       const fileCustomers = fileDb.get("customers") || [];
       const fileContracts = fileDb.get("contracts") || fileDb.get("sales") || [];
       
       const map = new Map<string, any>();
       for (const fc of fileCustomers) {
-        if (fc && fc.name) {
-          map.set(String(fc.id || fc.name), { ...fc });
-        }
-      }
-      for (const r of rows) {
-        if (r && r.name) {
-          map.set(String(r.id || r.name), { ...r });
+        const nk = normalizeEntityName(fc?.name);
+        if (fc && nk && !map.has(nk)) {
+          map.set(nk, { ...fc });
         }
       }
       for (const c of fileContracts) {
         const cName = c.customerName || c.customer_name;
-        if (cName) {
-          const cId = c.customerId || c.customer_id || `cust-${Buffer.from(cName).toString('hex')}`;
-          if (!map.has(cId) && !Array.from(map.values()).some((x: any) => x.name === cName)) {
-            map.set(cId, {
-              id: cId,
-              name: cName,
-              phone: c.customerPhone || c.customer_phone || '',
-              address: c.customerAddress || c.customer_address || '',
-              listId: c.listId || c.list_id || '',
-              listName: c.listName || c.list_name || '',
-              totalPurchases: Number(c.totalPrice || c.total_price) || 0,
-              totalPaid: Number(c.totalPaid || c.total_paid) || 0,
-              remainingBalance: Number(c.remainingBalance || c.remaining_balance) || 0,
-              status: 'active',
-              sales_count: 1
-            });
-          }
+        const nk = normalizeEntityName(cName);
+        if (cName && nk && !map.has(nk)) {
+          const cId = c.customerId || c.customer_id || makeDeterministicCustomerId(cName);
+          map.set(nk, {
+            id: cId,
+            name: cName.trim(),
+            phone: c.customerPhone || c.customer_phone || '',
+            address: c.customerAddress || c.customer_address || '',
+            listId: c.listId || c.list_id || '',
+            listName: c.listName || c.list_name || '',
+            totalPurchases: Number(c.totalPrice || c.total_price) || 0,
+            totalPaid: Number(c.totalPaid || c.total_paid) || 0,
+            remainingBalance: Number(c.remainingBalance || c.remaining_balance) || 0,
+            status: c.status || 'active',
+            sales_count: 1
+          });
         }
       }
 
@@ -6165,18 +6368,58 @@ async function startServer() {
           customerListsStatsRes,
           locationsStatsRes,
         ] = await Promise.all([
-          // 1. العقود والمبيعات (sales مع fallback إلى contracts)
+          // 1. العقود والمبيعات (حساب الواصل والباقي حياً من التسديدات الفعلية لضمان المطابقة 100% مع التطبيق)
           executePg(`
-            SELECT 
+            WITH active_payments AS (
+              SELECT p.id,
+                     p.contract_id,
+                     ${pgNormName('p.customer_name')} AS norm_name,
+                     ${pgPaymentAmtExpr('p')}::float AS amt
+              FROM payments p
+              WHERE ${pgActivePaymentsWhere('p')}
+            ),
+            by_contract AS (
+              SELECT TRIM(contract_id) AS contract_id, SUM(amt)::float AS sum_paid
+              FROM active_payments
+              WHERE TRIM(COALESCE(contract_id, '')) != ''
+              GROUP BY TRIM(contract_id)
+            ),
+            by_name AS (
+              SELECT norm_name, SUM(amt)::float AS sum_paid
+              FROM active_payments
+              WHERE TRIM(COALESCE(contract_id, '')) = '' AND norm_name != ''
+              GROUP BY norm_name
+            ),
+            live_sales AS (
+              SELECT
+                s.id,
+                COALESCE(s.total_price, 0)::float AS total_price,
+                COALESCE(s.advance_payment, 0)::float AS advance_payment,
+                GREATEST(0, COALESCE(s.total_price, 0) - COALESCE(s.advance_payment, 0))::float AS net_price,
+                (COALESCE(bc.sum_paid, 0) + COALESCE(bn.sum_paid, 0))::float AS live_paid_sum
+              FROM sales s
+              LEFT JOIN by_contract bc ON bc.contract_id = TRIM(s.id)
+              LEFT JOIN by_name bn ON bn.norm_name = ${pgNormName('s.customer_name')}
+              WHERE ${pgActiveSalesWhere('s')}
+            ),
+            computed_sales AS (
+              SELECT
+                id,
+                total_price,
+                advance_payment,
+                CASE WHEN net_price > 0 THEN LEAST(net_price, live_paid_sum) ELSE live_paid_sum END AS live_paid,
+                GREATEST(0, net_price - live_paid_sum) AS live_remaining
+              FROM live_sales
+            )
+            SELECT
               COUNT(*)::int AS total_contracts,
-              COUNT(CASE WHEN status = 'active' THEN 1 END)::int AS active_contracts,
-              COUNT(CASE WHEN status = 'completed' THEN 1 END)::int AS completed_contracts,
+              COUNT(CASE WHEN live_remaining > 0 OR live_paid = 0 THEN 1 END)::int AS active_contracts,
+              COUNT(CASE WHEN live_remaining <= 0 AND live_paid > 0 THEN 1 END)::int AS completed_contracts,
               COALESCE(SUM(total_price), 0)::float AS total_sales_amount,
-              COALESCE(SUM(total_paid), 0)::float AS total_paid_amount,
-              COALESCE(SUM(remaining_balance), 0)::float AS total_remaining_balance,
+              COALESCE(SUM(live_paid), 0)::float AS total_paid_amount,
+              COALESCE(SUM(live_remaining), 0)::float AS total_remaining_balance,
               COALESCE(SUM(advance_payment), 0)::float AS total_advance_payment
-            FROM sales
-            WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = sales.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts'))
+            FROM computed_sales
           `).catch(async (err) => {
             queryErrors["sales"] = err.message;
             console.warn("Notice: sales table query failed, trying contracts view/table:", err.message);
@@ -6190,7 +6433,8 @@ async function startServer() {
                 COALESCE(SUM(remaining_balance), 0)::float AS total_remaining_balance,
                 COALESCE(SUM(advance_payment), 0)::float AS total_advance_payment
               FROM contracts
-              WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = contracts.id)
+              WHERE TRIM(COALESCE(customer_name, '')) != ''
+                AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = contracts.id)
             `).catch((err2) => {
               queryErrors["contracts"] = err2.message;
               console.error("Error querying sales/contracts:", err2.message);
@@ -6202,13 +6446,11 @@ async function startServer() {
           executePg(`
             SELECT 
               COUNT(*)::int AS total_payments_count,
-              COALESCE(SUM(COALESCE(amount_paid, amount, 0)), 0)::float AS total_payments_amount,
-              COALESCE(SUM(CASE WHEN payment_date::text LIKE $1 || '%' THEN COALESCE(amount_paid, amount, 0) ELSE 0 END), 0)::float AS today_payments_amount,
-              COALESCE(SUM(CASE WHEN payment_date::text LIKE $2 THEN COALESCE(amount_paid, amount, 0) ELSE 0 END), 0)::float AS month_payments_amount
-            FROM payments
-            WHERE COALESCE(amount_paid, amount, 0) > 0
-              AND (id LIKE 'pay_%' OR (id NOT LIKE 'contract_%' AND id NOT LIKE 'emp_%' AND id NOT LIKE 'item_%'))
-              AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = payments.id AND (dr.table_name = 'payments' OR dr.table_name = 'unknown' OR dr.table_name IS NULL))
+              COALESCE(SUM(${pgPaymentAmtExpr('p')}), 0)::float AS total_payments_amount,
+              COALESCE(SUM(CASE WHEN p.payment_date::text LIKE $1 || '%' THEN ${pgPaymentAmtExpr('p')} ELSE 0 END), 0)::float AS today_payments_amount,
+              COALESCE(SUM(CASE WHEN p.payment_date::text LIKE $2 THEN ${pgPaymentAmtExpr('p')} ELSE 0 END), 0)::float AS month_payments_amount
+            FROM payments p
+            WHERE ${pgActivePaymentsWhere('p')}
           `, [todayStr, `${monthPrefix}%`]).catch((err) => {
             queryErrors["payments"] = err.message;
             console.error("Error querying payments:", err.message);
@@ -6278,19 +6520,47 @@ async function startServer() {
             return [{}];
           }),
 
-          // 7. الزبائن (حساب الزبائن الفريدين بأسماء الزبائن من مبيعات وعقود النشطة)
+          // 7. الزبائن (حساب الزبائن الفريدين بتطبيع كامل للأسماء والمسافات وحساب الأرصدة الحية من التسديدات)
           executePg(`
+            WITH active_payments AS (
+              SELECT p.contract_id,
+                     ${pgNormName('p.customer_name')} AS norm_name,
+                     ${pgPaymentAmtExpr('p')}::float AS amt
+              FROM payments p
+              WHERE ${pgActivePaymentsWhere('p')}
+            ),
+            by_contract AS (
+              SELECT TRIM(contract_id) AS contract_id, SUM(amt)::float AS sum_paid
+              FROM active_payments
+              WHERE TRIM(COALESCE(contract_id, '')) != ''
+              GROUP BY TRIM(contract_id)
+            ),
+            by_name AS (
+              SELECT norm_name, SUM(amt)::float AS sum_paid
+              FROM active_payments
+              WHERE TRIM(COALESCE(contract_id, '')) = '' AND norm_name != ''
+              GROUP BY norm_name
+            ),
+            live_cust_sales AS (
+              SELECT
+                ${pgNormName('s.customer_name')} AS norm_cust_name,
+                GREATEST(0, COALESCE(s.total_price, 0) - COALESCE(s.advance_payment, 0))::float AS net_price,
+                (COALESCE(bc.sum_paid, 0) + COALESCE(bn.sum_paid, 0))::float AS live_paid_sum
+              FROM sales s
+              LEFT JOIN by_contract bc ON bc.contract_id = TRIM(s.id)
+              LEFT JOIN by_name bn ON bn.norm_name = ${pgNormName('s.customer_name')}
+              WHERE ${pgActiveSalesWhere('s')}
+            )
             SELECT 
-              COUNT(DISTINCT TRIM(customer_name))::int AS total_customers,
-              COALESCE(SUM(total_paid), 0)::float AS total_paid,
-              COALESCE(SUM(remaining_balance), 0)::float AS total_remaining
-            FROM sales
-            WHERE customer_name IS NOT NULL AND TRIM(customer_name) != ''
-              AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = sales.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts'))
+              COUNT(DISTINCT norm_cust_name)::int AS total_customers,
+              COALESCE(SUM(CASE WHEN net_price > 0 THEN LEAST(net_price, live_paid_sum) ELSE live_paid_sum END), 0)::float AS total_paid,
+              COALESCE(SUM(GREATEST(0, net_price - live_paid_sum)), 0)::float AS total_remaining,
+              (SELECT COUNT(*)::int FROM customers c WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = c.id AND (dr.table_name IN ('customers', 'unknown') OR dr.table_name IS NULL))) AS registered_customers_count
+            FROM live_cust_sales
           `).catch(async () => {
             return executePg(`
               SELECT 
-                COUNT(DISTINCT TRIM(customer_name))::int AS total_customers,
+                COUNT(DISTINCT ${pgNormName('customer_name')})::int AS total_customers,
                 COALESCE(SUM(total_paid), 0)::float AS total_paid,
                 COALESCE(SUM(remaining_balance), 0)::float AS total_remaining
               FROM contracts
@@ -6328,15 +6598,15 @@ async function startServer() {
           executePg(`
             SELECT 
               COUNT(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL AND latitude != 0 AND longitude != 0 THEN 1 END)::int AS total_locations,
-              COUNT(DISTINCT CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL AND latitude != 0 AND longitude != 0 THEN TRIM(customer_name) END)::int AS unique_customers_with_locations,
+              COUNT(DISTINCT CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL AND latitude != 0 AND longitude != 0 THEN ${pgNormName('customer_name')} END)::int AS unique_customers_with_locations,
               (SELECT COUNT(*)::int FROM rep_locations WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND latitude != 0 AND longitude != 0) AS rep_locations_count
             FROM sales
-            WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = sales.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts'))
+            WHERE ${pgActiveSalesWhere('sales')}
           `).catch(async () => {
             return executePg(`
               SELECT 
                 COUNT(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL AND latitude != 0 AND longitude != 0 THEN 1 END)::int AS total_locations,
-                COUNT(DISTINCT CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL AND latitude != 0 AND longitude != 0 THEN TRIM(customer_name) END)::int AS unique_customers_with_locations,
+                COUNT(DISTINCT CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL AND latitude != 0 AND longitude != 0 THEN ${pgNormName('customer_name')} END)::int AS unique_customers_with_locations,
                 0::int AS rep_locations_count
               FROM contracts
               WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = contracts.id)
@@ -6383,17 +6653,19 @@ async function startServer() {
         }
 
         const totalContracts = pgTotalContracts > 0 ? pgTotalContracts : fdContracts.length;
-        const totalPaymentsCount = pgTotalPayments > 0 ? pgTotalPayments : fdPayments.length;
-        const totalSalesAmount = Number(salesStats.total_sales_amount || 0) > 0 ? Number(salesStats.total_sales_amount) : fdContracts.reduce((s: number, c: any) => s + (Number(c.totalPrice) || 0), 0);
-        const totalPaidAmount = Number(salesStats.total_paid_amount || 0) > 0 ? Number(salesStats.total_paid_amount) : fdContracts.reduce((s: number, c: any) => s + (Number(c.totalPaid) || 0), 0);
-        const totalRemainingBalance = Number(salesStats.total_remaining_balance || 0) > 0 ? Number(salesStats.total_remaining_balance) : fdContracts.reduce((s: number, c: any) => s + (Number(c.remainingBalance) || 0), 0);
-        const totalAdvancePayment = Number(salesStats.total_advance_payment || 0) > 0 ? Number(salesStats.total_advance_payment) : fdContracts.reduce((s: number, c: any) => s + (Number(c.advancePayment) || 0), 0);
-        const totalPaymentsAmount = Number(paymentStats.total_payments_amount || 0) > 0 ? Number(paymentStats.total_payments_amount) : fdPayments.reduce((s: number, p: any) => s + (Number(p.amount ?? p.amountPaid) || 0), 0);
+        const totalPaymentsCount = pgTotalContracts > 0 ? pgTotalPayments : (pgTotalPayments > 0 ? pgTotalPayments : fdPayments.length);
+        const totalSalesAmount = pgTotalContracts > 0 ? Number(salesStats.total_sales_amount || 0) : fdContracts.reduce((s: number, c: any) => s + (Number(c.totalPrice) || 0), 0);
+        const totalPaidAmount = pgTotalContracts > 0 ? Number(salesStats.total_paid_amount || 0) : fdContracts.reduce((s: number, c: any) => s + (Number(c.totalPaid) || 0), 0);
+        const totalRemainingBalance = pgTotalContracts > 0 ? Number(salesStats.total_remaining_balance || 0) : fdContracts.reduce((s: number, c: any) => s + (Number(c.remainingBalance) || 0), 0);
+        const totalAdvancePayment = pgTotalContracts > 0 ? Number(salesStats.total_advance_payment || 0) : fdContracts.reduce((s: number, c: any) => s + (Number(c.advancePayment) || 0), 0);
+        const totalPaymentsAmount = pgTotalContracts > 0 ? Number(paymentStats.total_payments_amount || 0) : (pgTotalPayments > 0 ? Number(paymentStats.total_payments_amount || 0) : fdPayments.reduce((s: number, p: any) => s + (Number(p.amountPaid) || Number(p.amount_paid) || Number(p.amount) || 0), 0));
         const totalFundsCount = Number(fundsStats.funds_count || 0) > 0 ? Number(fundsStats.funds_count) : fdFunds.length;
         const totalFundsBalance = Number(fundsStats.total_funds_balance || 0) !== 0 ? Number(fundsStats.total_funds_balance) : fdFunds.reduce((s: number, f: any) => s + (Number(f.balance ?? f.current_balance) || 0), 0);
         const totalRepsCount = Number(repsStats.total_reps || 0) > 0 ? Number(repsStats.total_reps) : fdReps.length;
         const totalEmployeesCount = Number(employeesStats.total_employees || 0) > 0 ? Number(employeesStats.total_employees) : fdEmployees.length;
-        const totalCustomersCount = Number(customersStats.total_customers || 0) > 0 ? Number(customersStats.total_customers) : new Set(fdContracts.map((c: any) => c.customerName?.trim()).filter(Boolean)).size;
+        const totalCustomersCount = pgTotalContracts > 0
+          ? Number(customersStats.total_customers || 0)
+          : new Set(fdContracts.map((c: any) => normalizeEntityName(c.customerName)).filter(Boolean)).size;
 
         return res.json({
           success: true,
@@ -6401,8 +6673,12 @@ async function startServer() {
           timestamp: new Date().toISOString(),
           contracts: {
             total: totalContracts,
-            active: Math.max(salesStats.active_contracts || 0, fdContracts.filter((c: any) => c.status === 'active' || !c.status).length),
-            completed: Math.max(salesStats.completed_contracts || 0, fdContracts.filter((c: any) => c.status === 'completed').length),
+            active: pgTotalContracts > 0
+              ? Number(salesStats.active_contracts || 0)
+              : fdContracts.filter((c: any) => c.status === 'active' || !c.status).length,
+            completed: pgTotalContracts > 0
+              ? Number(salesStats.completed_contracts || 0)
+              : fdContracts.filter((c: any) => c.status === 'completed').length,
             totalSalesAmount,
             totalPaidAmount,
             totalRemainingBalance,
@@ -6434,8 +6710,9 @@ async function startServer() {
           },
           customers: {
             total: totalCustomersCount,
-            totalPaid: Math.max(customersStats.total_paid || 0, totalPaidAmount),
-            totalRemaining: Math.max(customersStats.total_remaining || 0, totalRemainingBalance),
+            registeredCount: Number(customersStats.registered_customers_count ?? totalCustomersCount),
+            totalPaid: pgTotalContracts > 0 ? Number(customersStats.total_paid || 0) : totalPaidAmount,
+            totalRemaining: pgTotalContracts > 0 ? Number(customersStats.total_remaining || 0) : totalRemainingBalance,
           },
           lists: {
             count: Math.max(customerListsStats.total_lists || 0, new Set(fdContracts.map((c: any) => c.listId || c.listName).filter(Boolean)).size),
@@ -6881,9 +7158,10 @@ async function startServer() {
               const custId = cd.customer_id;
               const custName = cd.customer_name;
               const hasOtherContracts = await executePg(
-                `SELECT 1 FROM sales WHERE id != $1 AND (customer_id = $2 OR customer_name = $3)
-                 UNION
-                 SELECT 1 FROM contracts WHERE id != $1 AND (customer_id = $2 OR customer_name = $3) LIMIT 1`,
+                `SELECT 1 FROM sales WHERE id != $1
+                   AND (customer_id = $2 OR ${pgNormName('customer_name')} = ${pgNormName('$3')})
+                   AND ${pgActiveSalesWhere('sales')}
+                 LIMIT 1`,
                 [id, custId || '', custName || '']
               ).catch(() => []);
 
@@ -6894,7 +7172,20 @@ async function startServer() {
                   fileDb.delete("customers", custId);
                 }
                 if (custName) {
-                  await executePg(`DELETE FROM customers WHERE name = $1`, [custName]).catch(() => {});
+                  const matchingCusts = await executePg(
+                    `SELECT id FROM customers WHERE ${pgNormName('name')} = ${pgNormName('$1')}`,
+                    [custName]
+                  ).catch(() => []);
+                  for (const mc of (matchingCusts || [])) {
+                    if (mc?.id) {
+                      await executePg(`INSERT INTO deleted_records (record_id, table_name) VALUES ($1, 'customers') ON CONFLICT (record_id) DO NOTHING`, [mc.id]).catch(() => {});
+                      fileDb.delete("customers", mc.id);
+                    }
+                  }
+                  await executePg(
+                    `DELETE FROM customers WHERE ${pgNormName('name')} = ${pgNormName('$1')}`,
+                    [custName]
+                  ).catch(() => {});
                 }
               }
             }
@@ -7895,31 +8186,28 @@ async function startServer() {
           executePg(`
             WITH active_payments AS (
               SELECT p.contract_id,
-                     TRIM(LOWER(p.customer_name)) AS norm_name,
-                     COALESCE(p.amount_paid, p.amount, 0) AS amt,
+                     ${pgNormName('p.customer_name')} AS norm_name,
+                     ${pgPaymentAmtExpr('p')}::float AS amt,
                      p.payment_date
               FROM payments p
-              WHERE NOT EXISTS (
-                SELECT 1 FROM deleted_records dr
-                WHERE dr.record_id = p.id AND dr.table_name = 'payments'
-              )
+              WHERE ${pgActivePaymentsWhere('p')}
             ),
             by_contract AS (
-              SELECT contract_id,
-                     COUNT(*) AS cnt,
-                     SUM(amt) AS total_amt,
+              SELECT TRIM(contract_id) AS contract_id,
+                     COUNT(*)::int AS cnt,
+                     SUM(amt)::float AS total_amt,
                      MAX(payment_date) AS max_date
               FROM active_payments
-              WHERE contract_id IS NOT NULL AND contract_id != ''
-              GROUP BY contract_id
+              WHERE TRIM(COALESCE(contract_id, '')) != ''
+              GROUP BY TRIM(contract_id)
             ),
             by_name AS (
               SELECT norm_name,
-                     COUNT(*) AS cnt,
-                     SUM(amt) AS total_amt,
+                     COUNT(*)::int AS cnt,
+                     SUM(amt)::float AS total_amt,
                      MAX(payment_date) AS max_date
               FROM active_payments
-              WHERE (contract_id IS NULL OR contract_id = '') AND norm_name != ''
+              WHERE TRIM(COALESCE(contract_id, '')) = '' AND norm_name != ''
               GROUP BY norm_name
             )
             SELECT
@@ -7933,24 +8221,20 @@ async function startServer() {
                 ELSE bn.max_date
               END AS actual_last_payment_date
             FROM sales c
-            LEFT JOIN by_contract bc ON bc.contract_id = c.id
-            LEFT JOIN by_name bn ON bn.norm_name = TRIM(LOWER(c.customer_name))
-            WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = c.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts'))
-              AND TRIM(c.customer_name) != ''
-              AND c.id NOT LIKE 'pay_%' AND c.id NOT LIKE 'fund_%' AND c.id NOT LIKE 'emp_%' AND c.id NOT LIKE 'item_%' AND c.id NOT LIKE 'ft_%' AND c.id NOT LIKE 'emptx_%' AND c.id NOT LIKE 'conflict_%'
+            LEFT JOIN by_contract bc ON bc.contract_id = TRIM(c.id)
+            LEFT JOIN by_name bn ON bn.norm_name = ${pgNormName('c.customer_name')}
+            WHERE ${pgActiveSalesWhere('c')}
             ORDER BY c.created_at ASC, c.id ASC
           `).catch(() => []),
           executePg(`
             SELECT * FROM customers c
-            WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = c.id AND (dr.table_name = 'customers' OR dr.table_name = 'unknown'))
+            WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = c.id AND (dr.table_name IN ('customers', 'unknown') OR dr.table_name IS NULL))
             ORDER BY c.name ASC
           `).catch(() => []),
           executePg(`
             SELECT p.*
             FROM payments p
-            WHERE COALESCE(p.amount_paid, p.amount, 0) > 0
-              AND (p.id LIKE 'pay_%' OR (p.id NOT LIKE 'contract_%' AND p.id NOT LIKE 'emp_%' AND p.id NOT LIKE 'item_%' AND p.id NOT LIKE 'fund_%'))
-              AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = p.id AND (dr.table_name = 'payments' OR dr.table_name = 'unknown' OR dr.table_name IS NULL))
+            WHERE ${pgActivePaymentsWhere('p')}
             ORDER BY p.payment_date DESC, p.created_at DESC, p.id DESC
           `).catch(() => []),
           executePg(`
@@ -8497,12 +8781,14 @@ async function startServer() {
                 ELSE 'active'
               END
             FROM (
-              SELECT contract_id, SUM(COALESCE(amount_paid, amount, 0)) as sum_paid
+              SELECT TRIM(contract_id) AS contract_id, SUM(${pgPaymentAmtExpr('payments')}) as sum_paid
               FROM payments
-              WHERE contract_id = ANY($1)
-              GROUP BY contract_id
+              WHERE TRIM(COALESCE(contract_id, '')) = ANY($1)
+                AND ${pgPaymentAmtExpr('payments')} > 0
+                AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = payments.id AND (dr.table_name IN ('payments', 'unknown') OR dr.table_name IS NULL))
+              GROUP BY TRIM(contract_id)
             ) p
-            WHERE c.id = p.contract_id AND c.id = ANY($1)
+            WHERE TRIM(c.id) = p.contract_id AND c.id = ANY($1)
           `, [cIds]).catch(() => {});
 
           await executePg(`
@@ -8520,6 +8806,9 @@ async function startServer() {
           console.warn('Batch balance recalc notice:', balErr);
         }
         await syncContractBalancesInPgAndFileDb(cIds).catch(() => {});
+      }
+      if (affectedContractIds.size > 0 || otherActions.some((a: any) => String(a?.type || '').includes('CONTRACT') || String(a?.type || '').includes('CUSTOMER'))) {
+        await syncCustomersTableInPg().catch(() => {});
       }
 
       bumpSyncVersion();
@@ -8670,16 +8959,19 @@ async function startServer() {
               ELSE 'active'
             END
           FROM (
-            SELECT contract_id, SUM(COALESCE(amount_paid, amount, 0)) as sum_paid
+            SELECT TRIM(contract_id) AS contract_id, SUM(${pgPaymentAmtExpr('payments')}) as sum_paid
             FROM payments
-            WHERE contract_id = ANY($1)
-            GROUP BY contract_id
+            WHERE TRIM(COALESCE(contract_id, '')) = ANY($1)
+              AND ${pgPaymentAmtExpr('payments')} > 0
+              AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = payments.id AND (dr.table_name IN ('payments', 'unknown') OR dr.table_name IS NULL))
+            GROUP BY TRIM(contract_id)
           ) p
-          WHERE c.id = p.contract_id AND c.id = ANY($1)
+          WHERE TRIM(c.id) = p.contract_id AND c.id = ANY($1)
         `, [cIds]).catch(() => {});
       }
 
       await syncContractBalancesInPgAndFileDb().catch(() => {});
+      await syncCustomersTableInPg().catch(() => {});
       bumpSyncVersion();
 
       res.json({ success: true, totalInserted, message: 'Reconciliation complete' });
@@ -8811,19 +9103,37 @@ async function startServer() {
 
       const matched = totalMissing === 0;
 
-      // Query total active count on the server to detect if other reps added records
+      // Query total active count on the server to detect if other reps added or removed records
+      const clientCustomerCount = payload.customerCount != null ? Number(payload.customerCount) : null;
       let serverContractCount = Math.max(foundContractSet.size, fileDbContracts.size);
+      let serverCustomerCount = 0;
       let serverPaymentCount = Math.max(foundPaymentSet.size, fileDbPayments.size);
       try {
         const [cCountRes, pCountRes] = await Promise.all([
-          executePg(`SELECT COUNT(*) as count FROM sales WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = sales.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts' OR dr.table_name = 'unknown'))`).catch(() => []),
-          executePg(`SELECT COUNT(*) as count FROM payments WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = payments.id AND (dr.table_name = 'payments' OR dr.table_name = 'unknown'))`).catch(() => []),
+          executePg(`
+            SELECT
+              COUNT(*)::int AS count,
+              COUNT(DISTINCT ${pgNormName('customer_name')})::int AS customer_count
+            FROM sales
+            WHERE ${pgActiveSalesWhere('sales')}
+          `).catch(() => []),
+          executePg(`
+            SELECT COUNT(*)::int as count
+            FROM payments p
+            WHERE ${pgActivePaymentsWhere('p')}
+          `).catch(() => []),
         ]);
-        if (cCountRes?.[0]?.count) serverContractCount = Math.max(serverContractCount, Number(cCountRes[0].count));
-        if (pCountRes?.[0]?.count) serverPaymentCount = Math.max(serverPaymentCount, Number(pCountRes[0].count));
+        if (cCountRes?.[0]?.count !== undefined) serverContractCount = Number(cCountRes[0].count);
+        if (cCountRes?.[0]?.customer_count !== undefined) serverCustomerCount = Number(cCountRes[0].customer_count);
+        if (pCountRes?.[0]?.count !== undefined) serverPaymentCount = Number(pCountRes[0].count);
       } catch (cntErr) {}
 
-      const hasNewServerData = serverContractCount > clientContractIds.length || serverPaymentCount > clientPaymentIds.length;
+      const hasNewServerData =
+        serverContractCount !== clientContractIds.length ||
+        foundContractSet.size !== serverContractCount ||
+        serverPaymentCount !== clientPaymentIds.length ||
+        foundPaymentSet.size !== serverPaymentCount ||
+        (clientCustomerCount !== null && serverCustomerCount !== clientCustomerCount);
 
       res.json({
         success: true,
@@ -8839,6 +9149,7 @@ async function startServer() {
         confirmedContractCount: foundContractSet.size,
         confirmedPaymentCount: foundPaymentSet.size,
         serverContractCount,
+        serverCustomerCount,
         serverPaymentCount,
         hasNewServerData,
         deletedRecordIds: Array.from(deletedSet),
@@ -9181,6 +9492,7 @@ async function startServer() {
             for (const act of contractActions) {
               if (act?.id) processedIds.push(act.id);
             }
+            await syncCustomersTableInPg().catch(() => {});
           } catch (bulkContractErr) {
             console.warn('[Beacon Sync] Bulk contract upsert error, running fallback:', bulkContractErr);
             for (const act of contractActions) {

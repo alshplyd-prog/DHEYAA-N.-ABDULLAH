@@ -279,22 +279,39 @@ export async function cleanupDuplicateEntities() {
     if (isPgConfigured()) {
       await executePg(`
         DELETE FROM payments 
-        WHERE COALESCE(amount_paid, amount, 0) <= 0 
+        WHERE COALESCE(NULLIF(amount_paid, 0), NULLIF(amount, 0), 0) <= 0 
            OR id LIKE 'contract_%' 
            OR id LIKE 'emp_%' 
            OR id LIKE 'item_%'
            OR id LIKE 'fund_%'
-           OR (contract_id IS NOT NULL AND contract_id != '' AND contract_id NOT IN (SELECT id FROM sales UNION SELECT id FROM contracts))
-           OR id IN (SELECT record_id FROM deleted_records WHERE table_name = 'payments');
+           OR (
+             TRIM(COALESCE(contract_id, '')) != ''
+             AND TRIM(contract_id) NOT IN (
+               SELECT TRIM(id) FROM sales
+               WHERE TRIM(COALESCE(customer_name, '')) != ''
+                 AND id NOT LIKE 'pay_%' AND id NOT LIKE 'fund_%' AND id NOT LIKE 'emp_%' AND id NOT LIKE 'item_%' AND id NOT LIKE 'ft_%' AND id NOT LIKE 'emptx_%' AND id NOT LIKE 'conflict_%'
+                 AND NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = sales.id AND (dr.table_name IN ('sales', 'contracts', 'unknown') OR dr.table_name IS NULL))
+             )
+           )
+           OR id IN (SELECT record_id FROM deleted_records WHERE table_name IN ('payments', 'unknown') OR table_name IS NULL);
       `).catch(() => {});
     }
     const currentPayments = fileDb.get<any>('payments') || [];
-    const validContracts = new Set((fileDb.get<any>('contracts') || []).map((c: any) => c.id).filter(Boolean));
-    const validPayments = currentPayments.filter((p: any) => 
-      p && p.id && (Number(p.amountPaid ?? p.amount) > 0) &&
-      !p.id.startsWith('contract_') && !p.id.startsWith('emp_') && !p.id.startsWith('item_') && !p.id.startsWith('fund_') &&
-      (!p.contractId || validContracts.has(p.contractId))
-    );
+    const validContracts = new Set((fileDb.get<any>('contracts') || []).map((c: any) => String(c.id || '').trim()).filter(Boolean));
+    const validPayments = currentPayments.filter((p: any) => {
+      const amt = Number(p?.amountPaid) || Number(p?.amount_paid) || Number(p?.amount) || 0;
+      const pCid = p?.contractId ? String(p.contractId).trim() : '';
+      return (
+        p &&
+        p.id &&
+        amt > 0 &&
+        !p.id.startsWith('contract_') &&
+        !p.id.startsWith('emp_') &&
+        !p.id.startsWith('item_') &&
+        !p.id.startsWith('fund_') &&
+        (!pCid || validContracts.has(pCid))
+      );
+    });
     if (validPayments.length !== currentPayments.length) {
       fileDb.setAll('payments', validPayments);
     }

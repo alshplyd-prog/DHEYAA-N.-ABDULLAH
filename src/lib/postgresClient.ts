@@ -12,6 +12,7 @@ import {
   INITIAL_APPOINTMENTS,
 } from '../data/initialContracts';
 import { AppointmentRecord } from '../types';
+import { normalizeEntityName } from './nameHelpers';
 
 export function generateUniqueId(prefix = 'pay') {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -46,11 +47,25 @@ export const logoutUserAuth = async () => {
 };
 
 const refreshListeners: Set<() => void> = new Set();
+const cacheOnlyListeners: Set<() => void> = new Set();
 let notifyTimeout: any = null;
 
 function normName(s: string) {
-  if (!s) return '';
-  return s.trim().toLowerCase().replace(/\s+/g, ' ');
+  return normalizeEntityName(s);
+}
+
+export function emitCacheToSubscribersImmediate() {
+  if (notifyTimeout) {
+    clearTimeout(notifyTimeout);
+    notifyTimeout = null;
+  }
+  cacheOnlyListeners.forEach((fn) => {
+    try {
+      fn();
+    } catch (e) {
+      // ignore
+    }
+  });
 }
 
 export function notifySubscribersRefresh() {
@@ -145,14 +160,8 @@ export function getDeletedRecordIds(): Set<string> {
     if (raw) {
       const arr = JSON.parse(raw);
       if (Array.isArray(arr)) {
-        const contracts = getLocalCache<any>('contracts') || [];
-        const payments = getLocalCache<any>('payments') || [];
-        const activeSet = new Set<string>();
-        for (const c of contracts) if (c?.id) activeSet.add(String(c.id));
-        for (const p of payments) if (p?.id) activeSet.add(String(p.id));
-
         return new Set(
-          arr.filter((id) => Boolean(id) && !PROTECTED_EMPLOYEE_IDS.has(String(id)) && !activeSet.has(String(id)))
+          arr.filter((id) => Boolean(id) && !PROTECTED_EMPLOYEE_IDS.has(String(id))).map(String)
         );
       }
     }
@@ -250,6 +259,45 @@ export function markRecordAsDeleted(id: string | string[], tableName?: string) {
           }
         }
       }
+    }
+  } catch (e) {}
+}
+
+export function purgeDeletedIdsFromAllCaches(ids: string[]) {
+  if (!Array.isArray(ids) || ids.length === 0) return;
+  try {
+    const pendingActions = getPendingQueueSync().filter((a) => a && a.status !== 'synced');
+    const protectedPendingIds = new Set<string>();
+    for (const act of pendingActions) {
+      if (act.type?.startsWith('CREATE_') || act.type?.startsWith('UPDATE_') || act.type === 'ADD_PAYMENT' || act.type === 'APPOINTMENT_CREATE') {
+        const pid = act.payload?.id;
+        if (pid) protectedPendingIds.add(String(pid));
+      }
+    }
+
+    const purgeSet = new Set(
+      ids.map(String).filter((id) => Boolean(id) && id !== 'rep-1' && !PROTECTED_EMPLOYEE_IDS.has(id) && !protectedPendingIds.has(id))
+    );
+    if (purgeSet.size === 0) return;
+
+    const tables = ['contracts', 'customers', 'payments', 'customer_lists', 'funds', 'reps', 'inventory', 'employees', 'appointments'];
+    let anyChanged = false;
+    for (const tbl of tables) {
+      const cached = getLocalCache<any>(tbl);
+      if (!Array.isArray(cached) || cached.length === 0) continue;
+      const filtered = cached.filter((item: any) => {
+        if (!item || !item.id) return false;
+        if (purgeSet.has(String(item.id))) return false;
+        if (tbl === 'payments' && item.contractId && purgeSet.has(String(item.contractId))) return false;
+        return true;
+      });
+      if (filtered.length !== cached.length) {
+        setLocalCache(tbl, filtered);
+        anyChanged = true;
+      }
+    }
+    if (anyChanged) {
+      mirrorLocalSnapshotToIndexedDb(false).catch(() => {});
     }
   } catch (e) {}
 }
@@ -551,6 +599,23 @@ function mergeRemoteWithPendingLocal<T extends { id?: string; name?: string }>(t
       return items as unknown as T[];
     }
 
+    if (tableName === 'customers') {
+      const dedupedCusts: any[] = [];
+      const seenCustNames = new Set<string>();
+      for (const c of items) {
+        const nk = normName(c?.name || c?.customerName || '');
+        if (!nk) {
+          dedupedCusts.push(c);
+          continue;
+        }
+        if (!seenCustNames.has(nk)) {
+          seenCustNames.add(nk);
+          dedupedCusts.push(c);
+        }
+      }
+      return dedupedCusts as unknown as T[];
+    }
+
     return items;
   } catch (e) {
     console.warn(`[mergeRemoteWithPendingLocal] Error merging table ${tableName}:`, e);
@@ -577,31 +642,35 @@ export function recalculateAllContractsFromPayments(
 
     const deletedIds = getDeletedRecordIds();
     const activePayments = Array.isArray(payments)
-      ? payments.filter((p: any) => p && p.id && !deletedIds.has(String(p.id)))
+      ? payments.filter((p: any) => {
+          if (!p || !p.id) return false;
+          const pid = String(p.id);
+          if (deletedIds.has(pid)) return false;
+          if (pid.startsWith('contract_') || pid.startsWith('emp_') || pid.startsWith('item_') || pid.startsWith('fund_')) return false;
+          const amt = Number(p.amountPaid) || Number(p.amount_paid) || Number(p.amount) || 0;
+          return amt > 0;
+        })
       : [];
 
     const paymentsByContractId = new Map<string, any[]>();
     const paymentsByCustomerName = new Map<string, any[]>();
 
     for (const p of activePayments) {
-      const amt = Number(p.amountPaid ?? p.amount_paid ?? p.amount) || 0;
-      if (amt <= 0) continue;
-
-      const cId = p.contractId ?? p.contract_id;
+      const rawCid = p.contractId ?? p.contract_id;
+      const cId = rawCid ? String(rawCid).trim() : '';
       if (cId) {
-        const key = String(cId);
-        const list = paymentsByContractId.get(key) || [];
+        const list = paymentsByContractId.get(cId) || [];
         list.push(p);
-        paymentsByContractId.set(key, list);
-      }
-
-      const cName = p.customerName ?? p.customer_name;
-      if (cName && typeof cName === 'string') {
-        const normKey = normName(cName);
-        if (normKey) {
-          const list = paymentsByCustomerName.get(normKey) || [];
-          list.push(p);
-          paymentsByCustomerName.set(normKey, list);
+        paymentsByContractId.set(cId, list);
+      } else {
+        const cName = p.customerName ?? p.customer_name;
+        if (cName && typeof cName === 'string') {
+          const normKey = normName(cName);
+          if (normKey) {
+            const list = paymentsByCustomerName.get(normKey) || [];
+            list.push(p);
+            paymentsByCustomerName.set(normKey, list);
+          }
         }
       }
     }
@@ -611,7 +680,7 @@ export function recalculateAllContractsFromPayments(
       if (!c || !c.id) return c;
 
       const cPayments: any[] = [
-        ...(paymentsByContractId.get(String(c.id)) || []),
+        ...(paymentsByContractId.get(String(c.id).trim()) || []),
         ...(c.customerName ? paymentsByCustomerName.get(normName(c.customerName)) || [] : []),
       ];
 
@@ -622,21 +691,12 @@ export function recalculateAllContractsFromPayments(
       const advancePayment = Number(c.advancePayment ?? c.advance_payment) || 0;
       const netFinanced = Math.max(0, totalPrice - advancePayment);
 
-      const serverPaid = Number(
-        c.actual_total_paid !== undefined && c.actual_total_paid !== null
-          ? c.actual_total_paid
-          : (c.totalPaid ?? c.total_paid)
-      ) || 0;
-
       const paymentsSum = uniquePayments.reduce(
-        (acc, p) => acc + (Number(p.amountPaid ?? p.amount_paid ?? p.amount) || 0),
+        (acc, p) => acc + (Number(p.amountPaid) || Number(p.amount_paid) || Number(p.amount) || 0),
         0
       );
 
-      // Authoritative total paid: calculated from active payments, preserving snapshot/server totals when no payment rows exist
-      const rawAuthoritativePaid = (uniquePayments.length === 0 && activePayments.length === 0 && serverPaid > 0)
-        ? serverPaid
-        : paymentsSum;
+      const rawAuthoritativePaid = paymentsSum;
       const authoritativePaid = netFinanced > 0 ? Math.min(netFinanced, rawAuthoritativePaid) : rawAuthoritativePaid;
       const excessAmount = Math.max(0, rawAuthoritativePaid - netFinanced);
       // The authoritative remaining balance (الباقي)
@@ -840,9 +900,22 @@ export function enrichContractsWithCustomerLocations(contractsList: any[], custo
 export function getLocalCache<T>(tableName: string): T[] {
   try {
     const raw = localStorage.getItem(`sami_cache_${tableName}`);
-    if (raw) {
+    if (raw !== null) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      if (Array.isArray(parsed)) {
+        if (
+          parsed.length > 0 ||
+          tableName === 'contracts' ||
+          tableName === 'payments' ||
+          tableName === 'customers' ||
+          tableName === 'appointments' ||
+          tableName === 'fund_transactions' ||
+          tableName === 'employee_transactions' ||
+          tableName === 'payment_conflicts'
+        ) {
+          return parsed;
+        }
+      }
     }
   } catch (e) {}
 
@@ -1140,6 +1213,82 @@ export async function auditAndRequeueUnsyncedPayments(): Promise<number> {
   }
 }
 
+/**
+ * Audits all local contracts and guarantees any unsynced offline contract is in the pending queue
+ */
+export async function auditAndRequeueUnsyncedContracts(): Promise<number> {
+  try {
+    const localContracts = getLocalCache<any>('contracts');
+    if (!Array.isArray(localContracts) || localContracts.length === 0) return 0;
+
+    const pendingQueue = getPendingQueueSync();
+    const queuedIds = new Set(
+      pendingQueue
+        .filter((act) => act.type === 'CREATE_CONTRACT' || act.type === 'UPDATE_CONTRACT')
+        .map((act) => act.payload?.id || (typeof act.payload === 'string' ? act.payload : null))
+        .filter(Boolean)
+        .map(String)
+    );
+
+    const deletedSet = getDeletedRecordIds();
+    const flaggedContracts = localContracts.filter(
+      (c) => c && c.id && !deletedSet.has(String(c.id)) && !queuedIds.has(String(c.id)) && (c._unsynced === true || c._syncStatus === 'pending')
+    );
+    if (flaggedContracts.length === 0) return 0;
+
+    let serverMissingSet: Set<string> | null = null;
+    let serverDeletedSet = new Set<string>();
+    if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+      try {
+        const vRes = await fetchWithFallback(
+          '/api/sync/verify-match',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contractIds: flaggedContracts.map((c) => String(c.id)) }),
+          },
+          8000
+        ).catch(() => null);
+        if (vRes && vRes.ok) {
+          const vData = await vRes.json().catch(() => null);
+          if (vData && vData.success) {
+            serverMissingSet = new Set<string>(Array.isArray(vData.missingContractIds) ? vData.missingContractIds.map(String) : []);
+            serverDeletedSet = new Set<string>(Array.isArray(vData.deletedRecordIds) ? vData.deletedRecordIds.map(String) : []);
+          }
+        }
+      } catch (e) {}
+    }
+
+    let count = 0;
+    let cleanedLocal = false;
+
+    for (const contract of localContracts) {
+      if (!contract || !contract.id) continue;
+      const cid = String(contract.id);
+      if (deletedSet.has(cid) || queuedIds.has(cid)) continue;
+
+      if (contract._unsynced === true || contract._syncStatus === 'pending') {
+        if (serverMissingSet !== null && (!serverMissingSet.has(cid) || serverDeletedSet.has(cid))) {
+          contract._unsynced = false;
+          contract._syncStatus = 'synced';
+          cleanedLocal = true;
+          continue;
+        }
+        await addToPendingQueue('CREATE_CONTRACT', contract);
+        count++;
+      }
+    }
+
+    if (cleanedLocal) {
+      setLocalCache('contracts', localContracts);
+    }
+
+    return count;
+  } catch (e) {
+    return 0;
+  }
+}
+
 // Auto-check on initialization
 if (typeof window !== 'undefined') {
   setTimeout(() => {
@@ -1325,7 +1474,7 @@ function mapRow(tableName: string, r: any): any {
   }
 
   if (tableName === 'payments') {
-    const amt = Number(r.amountPaid ?? r.amount_paid ?? r.amount) || 0;
+    const amt = Number(r.amountPaid) || Number(r.amount_paid) || Number(r.amount) || 0;
     let custName = r.customer_name ?? r.customerName ?? r.resolved_customer_name ?? '';
     if (!custName && (r.contract_id || r.contractId)) {
       const contracts = getLocalCache<any>('contracts');
@@ -1787,9 +1936,10 @@ export async function reconcileAllLocalWithDatabase(options?: {
       }
     }
 
-    // 0. Audit local cache and ensure any offline payments are queued
+    // 0. Audit local cache and ensure any offline payments/contracts are queued
     try {
       await auditAndRequeueUnsyncedPayments();
+      await auditAndRequeueUnsyncedContracts();
     } catch (e) {}
 
     // 1. Flush any pending offline queue first
@@ -1866,7 +2016,7 @@ export async function reconcileAllLocalWithDatabase(options?: {
     // 2. Fetch atomic full snapshot from server (unless on cooldown after a previous timeout)
     const canTrySyncAll = Date.now() >= syncAllCooldownUntil;
     const res = canTrySyncAll
-      ? await fetchWithFallback('/api/sync/all', undefined, 8000).catch(() => null)
+      ? await fetchWithFallback('/api/sync/all', undefined, 20000).catch(() => null)
       : null;
 
     if (res && res.ok) {
@@ -1874,21 +2024,45 @@ export async function reconcileAllLocalWithDatabase(options?: {
       const hasValidSyncAllData =
         data &&
         data.success &&
-        ((Array.isArray(data.contracts) && data.contracts.length > 0) ||
-          (Array.isArray(data.payments) && data.payments.length > 0) ||
-          getLocalCache<any>('contracts').length === 0);
+        Array.isArray(data.contracts) &&
+        Array.isArray(data.payments);
 
       if (hasValidSyncAllData) {
         // Sync deleted IDs
         if (Array.isArray(data.deletedRecordIds)) {
+          purgeDeletedIdsFromAllCaches(data.deletedRecordIds);
           markRecordAsDeleted(data.deletedRecordIds);
         }
+
+        // Prune stale local tombstones for records confirmed active on server (excluding pending local deletes)
+        const pendingDeletes = new Set(
+          getPendingQueueSync()
+            .filter((a) => a.status !== 'synced' && (a.type?.startsWith('DELETE_') || a.type?.endsWith('_DELETE')))
+            .map((a) => String(typeof a.payload === 'string' ? a.payload : a.payload?.id || ''))
+            .filter(Boolean)
+        );
+        const serverDeletedSet = new Set((Array.isArray(data.deletedRecordIds) ? data.deletedRecordIds : []).map(String));
+        const activeServerIds: string[] = [];
+        for (const arr of [data.contracts, data.customers, data.payments]) {
+          if (Array.isArray(arr)) {
+            for (const row of arr) {
+              if (row?.id && !pendingDeletes.has(String(row.id)) && !serverDeletedSet.has(String(row.id))) {
+                activeServerIds.push(String(row.id));
+              }
+            }
+          }
+        }
+        if (activeServerIds.length > 0) pruneDeletedIds(activeServerIds);
 
         // Apply authoritative datasets from server cleanly
         // 1. Process payments first so incoming payments from other reps are saved
         if (Array.isArray(data.payments)) {
           const mergedPayments = mergeRemoteWithPendingLocal('payments', data.payments);
           setLocalCache('payments', mergedPayments);
+        }
+
+        if (Array.isArray(data.customers)) {
+          setLocalCache('customers', mergeRemoteWithPendingLocal('customers', data.customers));
         }
 
         // 2. Process contracts and recalculate totalPaid (الواصل) and remainingBalance (الباقي)
@@ -1900,10 +2074,6 @@ export async function reconcileAllLocalWithDatabase(options?: {
           setLocalCache('contracts', enriched);
         } else {
           recalculateAllContractsFromPayments(undefined, undefined, true);
-        }
-
-        if (Array.isArray(data.customers)) {
-          setLocalCache('customers', mergeRemoteWithPendingLocal('customers', data.customers));
         }
         if (Array.isArray(data.inventory)) {
           setLocalCache('inventory', mergeRemoteWithPendingLocal('inventory', data.inventory));
@@ -1940,7 +2110,7 @@ export async function reconcileAllLocalWithDatabase(options?: {
           cachedServerSyncVersion = incomingSyncVersion;
         }
         mirrorLocalSnapshotToIndexedDb(true);
-        notifySubscribersRefresh();
+        emitCacheToSubscribersImmediate();
         const cCount = data.contracts?.length || 0;
         const pCount = data.payments?.length || 0;
         return {
@@ -2012,6 +2182,13 @@ export async function verifyAndReconcileWithServer(): Promise<{
     const customerListIds = localCustomerLists.map((cl: any) => String(cl.id)).filter((id) => id && !deletedSet.has(id));
     const employeeIds = localEmployees.map((e: any) => String(e.id)).filter((id) => id && !deletedSet.has(id));
 
+    const customerCount = new Set(
+      localContracts
+        .filter((c: any) => c && c.id && !deletedSet.has(String(c.id)))
+        .map((c: any) => normName(c.customerName || ''))
+        .filter(Boolean)
+    ).size;
+
     const response = await fetchWithFallback(
       '/api/sync/verify-match',
       {
@@ -2025,6 +2202,7 @@ export async function verifyAndReconcileWithServer(): Promise<{
           fundIds,
           customerListIds,
           employeeIds,
+          customerCount,
         }),
       },
       15000
@@ -2053,10 +2231,14 @@ export async function verifyAndReconcileWithServer(): Promise<{
 
     // Process deleted records reported by the server to guarantee 100% bi-directional deletion parity
     if (Array.isArray(resData.deletedRecordIds) && resData.deletedRecordIds.length > 0) {
+      purgeDeletedIdsFromAllCaches(resData.deletedRecordIds);
       markRecordAsDeleted(resData.deletedRecordIds);
     }
 
     if (resData.matched) {
+      if (resData.hasNewServerData) {
+        await forceRefreshAllDataFromPostgres().catch(() => false);
+      }
       console.log(
         `[Auto Match Verification] 100% matched with PostgreSQL! (${resData.confirmedContractCount} contracts, ${resData.confirmedPaymentCount} payments)`
       );
@@ -2082,10 +2264,16 @@ export async function verifyAndReconcileWithServer(): Promise<{
       };
     }
 
-    // Discrepancy found! Immediately upload missing records to the server
-    console.warn(
-      `[Auto Match Verification] Discrepancy detected: ${resData.totalMissing} records missing on server! Uploading missing data immediately...`
+    // Discrepancy found! Only upload records that are genuinely pending offline creations/edits;
+    // any non-unsynced local record missing on the server is stale and will be cleaned by forceRefreshAllDataFromPostgres.
+    const pendingQueue = getPendingQueueSync().filter((a) => a && a.status !== 'synced');
+    const pendingIds = new Set<string>(
+      pendingQueue
+        .map((a) => String(typeof a.payload === 'string' ? a.payload : a.payload?.id || ''))
+        .filter(Boolean)
     );
+    const isGenuinelyUnsynced = (item: any) =>
+      Boolean(item && (item._unsynced === true || item._syncStatus === 'pending' || pendingIds.has(String(item.id))));
 
     const missingContractSet = new Set<string>(resData.missingContractIds || []);
     const missingPaymentSet = new Set<string>(resData.missingPaymentIds || []);
@@ -2095,32 +2283,46 @@ export async function verifyAndReconcileWithServer(): Promise<{
     const missingCustomerListSet = new Set<string>(resData.missingCustomerListIds || []);
     const missingEmployeeSet = new Set<string>(resData.missingEmployeeIds || []);
 
-    const missingContracts = localContracts.filter((c: any) => missingContractSet.has(String(c.id)));
-    const missingPayments = localPayments.filter((p: any) => missingPaymentSet.has(String(p.id)));
-    const missingInventory = localInventory.filter((i: any) => missingInventorySet.has(String(i.id)));
-    const missingReps = localReps.filter((r: any) => missingRepSet.has(String(r.id)));
-    const missingFunds = localFunds.filter((f: any) => missingFundSet.has(String(f.id)));
-    const missingCustomerLists = localCustomerLists.filter((cl: any) => missingCustomerListSet.has(String(cl.id)));
-    const missingEmployees = localEmployees.filter((e: any) => missingEmployeeSet.has(String(e.id)));
+    const missingContracts = localContracts.filter((c: any) => missingContractSet.has(String(c.id)) && isGenuinelyUnsynced(c));
+    const missingPayments = localPayments.filter((p: any) => missingPaymentSet.has(String(p.id)) && isGenuinelyUnsynced(p));
+    const missingInventory = localInventory.filter((i: any) => missingInventorySet.has(String(i.id)) && isGenuinelyUnsynced(i));
+    const missingReps = localReps.filter((r: any) => missingRepSet.has(String(r.id)) && isGenuinelyUnsynced(r));
+    const missingFunds = localFunds.filter((f: any) => missingFundSet.has(String(f.id)) && isGenuinelyUnsynced(f));
+    const missingCustomerLists = localCustomerLists.filter((cl: any) => missingCustomerListSet.has(String(cl.id)) && isGenuinelyUnsynced(cl));
+    const missingEmployees = localEmployees.filter((e: any) => missingEmployeeSet.has(String(e.id)) && isGenuinelyUnsynced(e));
 
-    await fetchWithFallback(
-      '/api/sync/reconcile',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contracts: missingContracts,
-          payments: missingPayments,
-          inventory: missingInventory,
-          reps: missingReps,
-          funds: missingFunds,
-          customer_lists: missingCustomerLists,
-          employees: missingEmployees,
-          deletedIds: getSafeDeletedIds(),
-        }),
-      },
-      25000
-    ).catch(() => {});
+    const unsyncedMissingTotal =
+      missingContracts.length +
+      missingPayments.length +
+      missingInventory.length +
+      missingReps.length +
+      missingFunds.length +
+      missingCustomerLists.length +
+      missingEmployees.length;
+
+    if (unsyncedMissingTotal > 0) {
+      await fetchWithFallback(
+        '/api/sync/reconcile',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contracts: missingContracts,
+            payments: missingPayments,
+            inventory: missingInventory,
+            reps: missingReps,
+            funds: missingFunds,
+            customer_lists: missingCustomerLists,
+            employees: missingEmployees,
+            deletedIds: getSafeDeletedIds(),
+          }),
+        },
+        25000
+      ).catch(() => {});
+    }
+
+    // Pull authoritative state from PostgreSQL whenever counts/IDs differ or stale local items were detected
+    await forceRefreshAllDataFromPostgres().catch(() => false);
 
     if (typeof window !== 'undefined') {
       window.dispatchEvent(
@@ -2128,7 +2330,7 @@ export async function verifyAndReconcileWithServer(): Promise<{
           detail: {
             matched: false,
             totalMissing: resData.totalMissing,
-            reconciledNow: resData.totalMissing,
+            reconciledNow: unsyncedMissingTotal,
             timestamp: Date.now(),
           },
         })
@@ -2140,7 +2342,7 @@ export async function verifyAndReconcileWithServer(): Promise<{
       totalMissing: resData.totalMissing,
       confirmedContracts: resData.confirmedContractCount || 0,
       confirmedPayments: resData.confirmedPaymentCount || 0,
-      message: `تم رفع ${resData.totalMissing} سجل غير مطابق`,
+      message: `تمت مطابقة ${unsyncedMissingTotal} سجل معلق وتحديث البيانات من السيرفر`,
     };
   } catch (err: any) {
     console.warn('[Auto Match Verification] Error:', err);
@@ -2229,54 +2431,19 @@ export function prunePaymentsOlderThanOneYearFromLocalCache(): {
   remainingCount: number;
   cutoffDate: string;
 } {
+  // Never prune historical payments from local cache because live contract totals (الواصل / الباقي)
+  // are computed across all active payments to match PostgreSQL totals 100%.
   try {
     const rawPayments = getLocalCache<any>('payments');
     const oneYearAgo = new Date();
     oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
     const cutoffDate = oneYearAgo.toISOString().split('T')[0];
-
-    if (!Array.isArray(rawPayments) || rawPayments.length === 0) {
-      return { prunedCount: 0, remainingCount: 0, cutoffDate };
-    }
-
-    // Pending offline payments must NEVER be pruned
-    const pendingIds = new Set<string>();
-    try {
-      const qRaw = localStorage.getItem('alkarrar_offline_pending_queue') || localStorage.getItem('sami_pending_queue') || '[]';
-      const q = JSON.parse(qRaw);
-      if (Array.isArray(q)) {
-        for (const item of q) {
-          if (item?.payload?.id) pendingIds.add(String(item.payload.id));
-        }
-      }
-    } catch (e) {}
-
-    const kept: any[] = [];
-    let prunedCount = 0;
-
-    for (const p of rawPayments) {
-      if (!p || !p.id) continue;
-      if (pendingIds.has(String(p.id))) {
-        kept.push(p);
-        continue;
-      }
-      const pDate = p.paymentDate || (p.createdAt ? String(p.createdAt).split('T')[0] : '');
-      if (pDate && pDate < cutoffDate) {
-        prunedCount++;
-      } else {
-        kept.push(p);
-      }
-    }
-
-    if (prunedCount > 0) {
-      setLocalCache('payments', kept);
-      mirrorLocalSnapshotToIndexedDb(true).catch(() => {});
-      console.log(`[5-Day Pruning] Pruned ${prunedCount} payments older than 1 year from local cache. Kept ${kept.length} payments.`);
-    }
-
-    return { prunedCount, remainingCount: kept.length, cutoffDate };
+    return {
+      prunedCount: 0,
+      remainingCount: Array.isArray(rawPayments) ? rawPayments.length : 0,
+      cutoffDate,
+    };
   } catch (err) {
-    console.warn('Error in prunePaymentsOlderThanOneYearFromLocalCache:', err);
     return { prunedCount: 0, remainingCount: 0, cutoffDate: '' };
   }
 }
@@ -2440,12 +2607,10 @@ function createSubscriber<T extends { id?: string }>(tableName: string, apiEndpo
       emitIfChanged([]);
     }
 
-    const fetchData = async () => {
+    const emitFromCacheOnly = () => {
       if (isCancelled) return;
-
-      // 1. Emit from local memory cache instantly for 0ms UI lag
       const current = getLocalCache<T>(tableName);
-      if (current && current.length > 0) {
+      if (Array.isArray(current)) {
         if (tableName === 'payment_conflicts') {
           const filtered = (current as any[]).filter(
             (c: any) => c.id !== '__appointments_sync_master__' && c.status !== 'appointment_sync_record' && c.contractId !== 'appointments_container'
@@ -2457,6 +2622,13 @@ function createSubscriber<T extends { id?: string }>(tableName: string, apiEndpo
           emitIfChanged(current);
         }
       }
+    };
+
+    const fetchData = async () => {
+      if (isCancelled) return;
+
+      // 1. Emit from local memory cache instantly for 0ms UI lag (including empty arrays after deletions)
+      emitFromCacheOnly();
 
       // In offline mode, skip unnecessary network roundtrips to prevent UI freezing
       const isOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
@@ -2511,6 +2683,7 @@ function createSubscriber<T extends { id?: string }>(tableName: string, apiEndpo
     };
 
     refreshListeners.add(fetchData);
+    cacheOnlyListeners.add(emitFromCacheOnly);
 
     // Schedule unified atomic sync on mount (debounced so multiple mounting subscribers only make 1 request)
     scheduleUnifiedDataSync(50);
@@ -2532,6 +2705,7 @@ function createSubscriber<T extends { id?: string }>(tableName: string, apiEndpo
       activeSubscriberCount--;
       stopUnifiedPollingLoop();
       refreshListeners.delete(fetchData);
+      cacheOnlyListeners.delete(emitFromCacheOnly);
       if (typeof window !== 'undefined') {
         window.removeEventListener('online', handleOnlineEvent);
       }
@@ -3849,8 +4023,10 @@ export const silentBackgroundSync = async (..._args: any[]) => {
 
 export async function forceRefreshAllDataFromPostgres(): Promise<boolean> {
   try {
-    // 1. Flush any pending offline queue first to guarantee all offline additions are saved in Postgres
+    // 1. Audit and flush any pending offline queue first to guarantee all offline additions are saved in Postgres
     try {
+      await auditAndRequeueUnsyncedPayments();
+      await auditAndRequeueUnsyncedContracts();
       await flushPendingQueue();
     } catch (flushErr) {
       console.warn('Pre-refresh flush note:', flushErr);
@@ -3859,21 +4035,43 @@ export async function forceRefreshAllDataFromPostgres(): Promise<boolean> {
     // Try atomic full sync endpoint first unless in cooldown after timeout
     if (Date.now() >= syncAllCooldownUntil) {
       try {
-        const allRes = await fetchWithFallback('/api/sync/all', undefined, 8000);
+        const allRes = await fetchWithFallback('/api/sync/all', undefined, 20000);
         if (allRes && allRes.ok) {
           const data = await allRes.json();
           if (data && data.success) {
             if (Array.isArray(data.deletedRecordIds)) {
+              purgeDeletedIdsFromAllCaches(data.deletedRecordIds);
               markRecordAsDeleted(data.deletedRecordIds);
             }
+            const pendingDeletes = new Set(
+              getPendingQueueSync()
+                .filter((a) => a.status !== 'synced' && (a.type?.startsWith('DELETE_') || a.type?.endsWith('_DELETE')))
+                .map((a) => String(typeof a.payload === 'string' ? a.payload : a.payload?.id || ''))
+                .filter(Boolean)
+            );
+            const serverDeletedSet = new Set((Array.isArray(data.deletedRecordIds) ? data.deletedRecordIds : []).map(String));
+            const activeServerIds: string[] = [];
+            for (const arr of [data.contracts, data.customers, data.payments]) {
+              if (Array.isArray(arr)) {
+                for (const row of arr) {
+                  if (row?.id && !pendingDeletes.has(String(row.id)) && !serverDeletedSet.has(String(row.id))) {
+                    activeServerIds.push(String(row.id));
+                  }
+                }
+              }
+            }
+            if (activeServerIds.length > 0) pruneDeletedIds(activeServerIds);
+
             // Process payments first so payments from other reps are saved
             if (Array.isArray(data.payments)) setLocalCache('payments', mergeRemoteWithPendingLocal('payments', data.payments));
+            if (Array.isArray(data.customers)) setLocalCache('customers', mergeRemoteWithPendingLocal('customers', data.customers));
             // Recalculate contracts with all payments
             if (Array.isArray(data.contracts)) {
               const mergedContracts = mergeRemoteWithPendingLocal('contracts', data.contracts);
               const currentPayments = getLocalCache<any>('payments');
               const recalculated = recalculateAllContractsFromPayments(mergedContracts, currentPayments, false);
-              setLocalCache('contracts', recalculated);
+              const enriched = enrichContractsWithCustomerLocations(recalculated, data.customers);
+              setLocalCache('contracts', enriched);
             } else {
               recalculateAllContractsFromPayments(undefined, undefined, true);
             }
@@ -3894,7 +4092,7 @@ export async function forceRefreshAllDataFromPostgres(): Promise<boolean> {
             }
             recalculateLocalFundBalances(true);
             mirrorLocalSnapshotToIndexedDb(true);
-            notifySubscribersRefresh();
+            emitCacheToSubscribersImmediate();
             return true;
           }
         }
@@ -3959,8 +4157,10 @@ export async function forceRefreshAllDataFromPostgres(): Promise<boolean> {
       recalculateAllContractsFromPayments(undefined, undefined, true);
       recalculateLocalFundBalances(true);
       mirrorLocalSnapshotToIndexedDb(true);
+      emitCacheToSubscribersImmediate();
+    } else {
+      notifySubscribersRefresh();
     }
-    notifySubscribersRefresh();
     return successCount > 0;
   } catch (e) {
     console.warn('Force refresh error:', e);

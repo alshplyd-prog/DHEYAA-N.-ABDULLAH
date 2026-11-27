@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { fetchWithFallback } from '../lib/apiConfig';
+import { normalizeEntityName } from '../lib/nameHelpers';
 import {
   Database,
   RefreshCw,
@@ -88,6 +89,7 @@ interface ServerTotalsData {
   };
   customers: {
     total: number;
+    registeredCount?: number;
     totalPaid: number;
     totalRemaining: number;
   };
@@ -144,6 +146,7 @@ export const ServerQueriesModal: React.FC<ServerQueriesModalProps> = ({
     try {
       if (onRefreshApp) {
         await Promise.resolve(onRefreshApp()).catch(() => {});
+        await new Promise((r) => setTimeout(r, 260));
       }
 
       let lastErr: any = null;
@@ -207,12 +210,30 @@ export const ServerQueriesModal: React.FC<ServerQueriesModalProps> = ({
   const localPaidAmount = appContracts.reduce((sum, c) => sum + (Number(c.totalPaid) || 0), 0);
   const localRemainingAmount = appContracts.reduce((sum, c) => sum + (Number(c.remainingBalance) || 0), 0);
 
-  const uniqueLocalCustomersCount = new Set(appContracts.map(c => c.customerName?.trim()).filter(Boolean)).size;
+  const uniqueLocalCustomersCount = new Set(
+    appContracts
+      .map((c) => normalizeEntityName(c.customerName))
+      .filter(Boolean)
+  ).size;
   const displayLocalCustomersCount = uniqueLocalCustomersCount;
 
-  const cleanAppPayments = appPayments.filter(p => p && p.id && (Number(p.amountPaid ?? p.amount) > 0) && !p.id.startsWith('contract_') && !p.id.startsWith('emp_') && !p.id.startsWith('item_'));
+  const validAppContractIds = new Set(appContracts.map((c) => String(c.id || '').trim()).filter(Boolean));
+  const cleanAppPayments = appPayments.filter((p: any) => {
+    const amt = Number(p?.amountPaid) || Number(p?.amount_paid) || Number(p?.amount) || 0;
+    const pCid = p?.contractId ? String(p.contractId).trim() : '';
+    return (
+      p &&
+      p.id &&
+      amt > 0 &&
+      !p.id.startsWith('contract_') &&
+      !p.id.startsWith('emp_') &&
+      !p.id.startsWith('item_') &&
+      !p.id.startsWith('fund_') &&
+      (!pCid || validAppContractIds.has(pCid))
+    );
+  });
   const localPaymentsCount = cleanAppPayments.length;
-  const localPaymentsAmount = cleanAppPayments.reduce((sum, p) => sum + (Number(p.amountPaid ?? p.amount) || 0), 0);
+  const localPaymentsAmount = cleanAppPayments.reduce((sum, p: any) => sum + (Number(p.amountPaid) || Number(p.amount_paid) || Number(p.amount) || 0), 0);
 
   const localRepsCount = appReps.length;
   const localEmployeesCount = appEmployees.filter(e => e.id && !e.id.startsWith('item_') && !e.id.startsWith('contract_') && !e.id.startsWith('pay_') && !e.id.startsWith('ft_')).length;
@@ -568,7 +589,33 @@ export const ServerQueriesModal: React.FC<ServerQueriesModalProps> = ({
                           </div>
                         </td>
                         <td className="p-3 text-center">
-                          {renderStatusBadge(data.customers.total, displayLocalCustomersCount)}
+                          <div className="flex flex-col items-center gap-1">
+                            {(() => {
+                              const countMatch = Math.abs(data.customers.total - displayLocalCustomersCount) < 0.01;
+                              const paidMatch = Math.abs(data.customers.totalPaid - localPaidAmount) < 0.01;
+                              const remMatch = Math.abs(data.customers.totalRemaining - localRemainingAmount) < 0.01;
+                              if (countMatch && paidMatch && remMatch) {
+                                return renderStatusBadge(data.customers.total, displayLocalCustomersCount);
+                              }
+                              return (
+                                <>
+                                  {!countMatch && renderStatusBadge(data.customers.total, displayLocalCustomersCount)}
+                                  {!paidMatch && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-100 text-amber-900 dark:bg-amber-950/80 dark:text-amber-300 border border-amber-300 dark:border-amber-800">
+                                      <AlertTriangle className="w-3 h-3 text-amber-600 dark:text-amber-400" />
+                                      فارق الواصل: {(data.customers.totalPaid - localPaidAmount) > 0 ? '+' : ''}{(data.customers.totalPaid - localPaidAmount).toLocaleString('en-US')} د.ع
+                                    </span>
+                                  )}
+                                  {!remMatch && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-100 text-amber-900 dark:bg-amber-950/80 dark:text-amber-300 border border-amber-300 dark:border-amber-800">
+                                      <AlertTriangle className="w-3 h-3 text-amber-600 dark:text-amber-400" />
+                                      فارق الباقي: {(data.customers.totalRemaining - localRemainingAmount) > 0 ? '+' : ''}{(data.customers.totalRemaining - localRemainingAmount).toLocaleString('en-US')} د.ع
+                                    </span>
+                                  )}
+                                </>
+                              );
+                            })()}
+                          </div>
                         </td>
                       </tr>
 

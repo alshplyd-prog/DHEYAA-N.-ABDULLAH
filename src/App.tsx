@@ -143,6 +143,7 @@ import {
   forceRefreshAllDataFromPostgres,
   updateCustomerLocation,
   reconcileAllLocalWithDatabase,
+  verifyAndReconcileWithServer,
   deleteAllCustomersAndPayments,
   deleteAllEmployees,
   loadSnapshotFromIndexedDbIfAvailable,
@@ -932,7 +933,19 @@ export default function App() {
 
     const unsubContracts = subscribeToContracts(
       (updatedContracts) => {
-        const list = updatedContracts || [];
+        const list = (updatedContracts || []).filter(
+          (c: any) =>
+            c &&
+            c.id &&
+            String(c.customerName || '').trim() !== '' &&
+            !String(c.id).startsWith('pay_') &&
+            !String(c.id).startsWith('fund_') &&
+            !String(c.id).startsWith('emp_') &&
+            !String(c.id).startsWith('item_') &&
+            !String(c.id).startsWith('ft_') &&
+            !String(c.id).startsWith('emptx_') &&
+            !String(c.id).startsWith('conflict_')
+        );
         if (isFirstContractsLoadRef.current) {
           isFirstContractsLoadRef.current = false;
           list.forEach((c) => knownContractIdsRef.current.add(c.id));
@@ -993,9 +1006,18 @@ export default function App() {
 
     const unsubPayments = subscribeToPayments(
       (updatedPayments) => {
-        const valid = (updatedPayments || []).filter((p: any) => 
-          p && p.id && (Number(p.amountPaid ?? p.amount) > 0) && !p.id.startsWith('contract_') && !p.id.startsWith('emp_') && !p.id.startsWith('item_')
-        );
+        const valid = (updatedPayments || []).filter((p: any) => {
+          const amt = Number(p?.amountPaid) || Number(p?.amount_paid) || Number(p?.amount) || 0;
+          return (
+            p &&
+            p.id &&
+            amt > 0 &&
+            !p.id.startsWith('contract_') &&
+            !p.id.startsWith('emp_') &&
+            !p.id.startsWith('item_') &&
+            !p.id.startsWith('fund_')
+          );
+        });
         if (isFirstPaymentsLoadRef.current) {
           isFirstPaymentsLoadRef.current = false;
           valid.forEach((p) => knownPaymentIdsRef.current.add(p.id));
@@ -1377,26 +1399,38 @@ export default function App() {
   const contractsWithLiveBalances = useMemo(() => {
     return contracts.map((c) => {
       const cNameNorm = normalizeEntityName(c.customerName);
-      const cPayments = payments.filter((p) => {
-        if (p.contractId && String(p.contractId).trim()) {
-          return p.contractId === c.id;
+      const cIdTrim = String(c.id || '').trim();
+      const cPayments = payments.filter((p: any) => {
+        const amt = Number(p?.amountPaid) || Number(p?.amount_paid) || Number(p?.amount) || 0;
+        if (
+          !p ||
+          !p.id ||
+          amt <= 0 ||
+          p.id.startsWith('contract_') ||
+          p.id.startsWith('emp_') ||
+          p.id.startsWith('item_') ||
+          p.id.startsWith('fund_')
+        ) {
+          return false;
+        }
+        const pCid = p.contractId ? String(p.contractId).trim() : '';
+        if (pCid) {
+          return pCid === cIdTrim;
         }
         if (p.customerName && cNameNorm && normalizeEntityName(p.customerName) === cNameNorm) {
           return true;
         }
         return false;
       });
-      const paymentsSum = cPayments.reduce((sum, p) => sum + (Number(p.amountPaid ?? p.amount ?? p.amount_paid) || 0), 0);
+      const paymentsSum = cPayments.reduce(
+        (sum, p: any) => sum + (Number(p.amountPaid) || Number(p.amount_paid) || Number(p.amount) || 0),
+        0
+      );
       const net = Math.max(0, (Number(c.totalPrice) || 0) - (Number(c.advancePayment) || 0));
-      const existingPaid = Number((c as any).rawTotalPaid ?? c.totalPaid ?? 0) || 0;
-      const effectivePaidSum = (cPayments.length === 0 && payments.length === 0 && existingPaid > 0) ? existingPaid : paymentsSum;
-      const totalPaid = net > 0 ? Math.min(net, effectivePaidSum) : effectivePaidSum;
-      const excessAmount = Math.max(0, effectivePaidSum - net);
-      let remainingBalance = Math.max(0, net - effectivePaidSum);
-      if (remainingBalance > 0 && remainingBalance <= 2 && (Number(c.remainingBalance || 0) <= 5 || effectivePaidSum >= net - 2)) {
-        remainingBalance = 0;
-      }
-      const status: 'active' | 'completed' = (remainingBalance === 0 && effectivePaidSum > 0 && net > 0) ? 'completed' : 'active';
+      const totalPaid = net > 0 ? Math.min(net, paymentsSum) : paymentsSum;
+      const excessAmount = Math.max(0, paymentsSum - net);
+      const remainingBalance = Math.max(0, net - paymentsSum);
+      const status: 'active' | 'completed' = (remainingBalance === 0 && (net === 0 || paymentsSum > 0)) ? 'completed' : 'active';
 
       // Fallback coordinate resolution from customers state (respecting locationClearedAt)
       let lat = c.latitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0 ? Number(c.latitude) : undefined;
@@ -2012,25 +2046,25 @@ export default function App() {
       // Optimistically update payment record in local state
       setPayments(updatedPayments);
 
+      const payCid = payment.contractId ? String(payment.contractId).trim() : '';
       const targetContract = contracts.find(
         (c) =>
-          (payment.contractId && c.id && payment.contractId === c.id) ||
-          (!payment.contractId && payment.customerName && c.customerName && normalizeEntityName(payment.customerName) === normalizeEntityName(c.customerName))
+          (payCid && c.id && payCid === String(c.id).trim()) ||
+          (!payCid && payment.customerName && c.customerName && normalizeEntityName(payment.customerName) === normalizeEntityName(c.customerName))
       );
       if (targetContract) {
-        const cPayments = updatedPayments.filter(
-          (p) =>
-            (p.contractId && targetContract.id && p.contractId === targetContract.id) ||
-            (!p.contractId && p.customerName && targetContract.customerName && normalizeEntityName(p.customerName) === normalizeEntityName(targetContract.customerName))
-        );
-        const paymentsSum = cPayments.reduce((sum, p) => sum + (Number(p.amountPaid ?? p.amount) || 0), 0);
-        const newTotalPaid = cPayments.length > 0 ? paymentsSum : 0;
+        const tcId = String(targetContract.id || '').trim();
+        const cPayments = updatedPayments.filter((p: any) => {
+          const pCid = p.contractId ? String(p.contractId).trim() : '';
+          return pCid
+            ? pCid === tcId
+            : Boolean(p.customerName && targetContract.customerName && normalizeEntityName(p.customerName) === normalizeEntityName(targetContract.customerName));
+        });
+        const paymentsSum = cPayments.reduce((sum, p: any) => sum + (Number(p.amountPaid) || Number(p.amount_paid) || Number(p.amount) || 0), 0);
         const netFinanced = Math.max(0, targetContract.totalPrice - targetContract.advancePayment);
-        let newRemaining = Math.max(0, netFinanced - newTotalPaid);
-        if (newRemaining > 0 && newRemaining <= 2 && (Number(targetContract.remainingBalance || 0) <= 5 || newTotalPaid >= netFinanced - 2)) {
-          newRemaining = 0;
-        }
-        const newStatus = newRemaining === 0 ? 'completed' : 'active';
+        const newTotalPaid = netFinanced > 0 ? Math.min(netFinanced, paymentsSum) : paymentsSum;
+        const newRemaining = Math.max(0, netFinanced - paymentsSum);
+        const newStatus = (newRemaining === 0 && (netFinanced === 0 || paymentsSum > 0)) ? 'completed' : 'active';
         
         let newLastDate: string | undefined = undefined;
         if (cPayments.length > 0) {
@@ -2149,16 +2183,18 @@ export default function App() {
 
       if (targetContract) {
         const remainingPayments = payments.filter((p) => p.id !== payment.id);
-        const cPayments = remainingPayments.filter(
-          (p) =>
-            (p.contractId && targetContract.id && String(p.contractId).trim() === String(targetContract.id).trim()) ||
-            (p.customerName && targetContract.customerName && normalizeEntityName(p.customerName) === normalizeEntityName(targetContract.customerName))
-        );
-        const paymentsSum = cPayments.reduce((sum, p) => sum + (Number(p.amountPaid ?? p.amount) || 0), 0);
-        const newTotalPaid = cPayments.length > 0 ? paymentsSum : 0;
+        const tcId = String(targetContract.id || '').trim();
+        const cPayments = remainingPayments.filter((p: any) => {
+          const pCid = p.contractId ? String(p.contractId).trim() : '';
+          return pCid
+            ? pCid === tcId
+            : Boolean(p.customerName && targetContract.customerName && normalizeEntityName(p.customerName) === normalizeEntityName(targetContract.customerName));
+        });
+        const paymentsSum = cPayments.reduce((sum, p: any) => sum + (Number(p.amountPaid) || Number(p.amount_paid) || Number(p.amount) || 0), 0);
         const netFinanced = Math.max(0, targetContract.totalPrice - targetContract.advancePayment);
-        const newRemaining = Math.max(0, netFinanced - newTotalPaid);
-        const newStatus = (newRemaining === 0 && paymentsSum > 0 && netFinanced > 0) ? 'completed' : 'active';
+        const newTotalPaid = netFinanced > 0 ? Math.min(netFinanced, paymentsSum) : paymentsSum;
+        const newRemaining = Math.max(0, netFinanced - paymentsSum);
+        const newStatus = (newRemaining === 0 && (paymentsSum > 0 || netFinanced === 0)) ? 'completed' : 'active';
 
         setContracts((prev) =>
           prev.map((c) =>
@@ -2221,16 +2257,18 @@ export default function App() {
             const isTarget = affectedContracts.some((ac) => ac.id === c.id);
             if (!isTarget) return c;
 
-            const cPayments = remainingAll.filter(
-              (p) =>
-                (p.contractId && c.id && String(p.contractId).trim() === String(c.id).trim()) ||
-                (p.customerName && c.customerName && normalizeEntityName(p.customerName) === normalizeEntityName(c.customerName))
-            );
-            const paymentsSum = cPayments.reduce((sum, p) => sum + (Number(p.amountPaid ?? p.amount) || 0), 0);
-            const newTotalPaid = cPayments.length > 0 ? paymentsSum : 0;
+            const cIdTrim = String(c.id || '').trim();
+            const cPayments = remainingAll.filter((p: any) => {
+              const pCid = p.contractId ? String(p.contractId).trim() : '';
+              return pCid
+                ? pCid === cIdTrim
+                : Boolean(p.customerName && c.customerName && normalizeEntityName(p.customerName) === normalizeEntityName(c.customerName));
+            });
+            const paymentsSum = cPayments.reduce((sum, p: any) => sum + (Number(p.amountPaid) || Number(p.amount_paid) || Number(p.amount) || 0), 0);
             const netFinanced = Math.max(0, c.totalPrice - c.advancePayment);
-            const newRemaining = Math.max(0, netFinanced - newTotalPaid);
-            const newStatus = (newRemaining === 0 && paymentsSum > 0 && netFinanced > 0) ? 'completed' : 'active';
+            const newTotalPaid = netFinanced > 0 ? Math.min(netFinanced, paymentsSum) : paymentsSum;
+            const newRemaining = Math.max(0, netFinanced - paymentsSum);
+            const newStatus = (newRemaining === 0 && (paymentsSum > 0 || netFinanced === 0)) ? 'completed' : 'active';
 
             return {
               ...c,
@@ -4664,6 +4702,7 @@ export default function App() {
         appReps={reps}
         appCustomerLists={customerLists}
         onRefreshApp={async () => {
+          await verifyAndReconcileWithServer().catch(() => {});
           await forceRefreshAllDataFromPostgres();
         }}
         onDeleteAllCustomersAndPayments={handleDeleteAllCustomersAndPayments}

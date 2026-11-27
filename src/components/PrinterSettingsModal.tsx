@@ -31,6 +31,7 @@ import {
   savePrinterConfig,
   scanAndSaveBluetoothPrinter,
   listPairedBluetoothDevices,
+  listPairedBluetoothDevicesWithStatus,
   requestWebBluetoothDevice,
   requestAndroidBluetoothPermissions,
   ensureBluetoothEnabled,
@@ -93,6 +94,9 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
   const [isRequestingPerms, setIsRequestingPerms] = useState(false);
   const [isEnablingBackground, setIsEnablingBackground] = useState(false);
   const [pairedDevices, setPairedDevices] = useState<BluetoothDevice[] | null>(null);
+  const [otherPairedDevices, setOtherPairedDevices] = useState<BluetoothDevice[]>([]);
+  const [showAllBondedDevices, setShowAllBondedDevices] = useState<boolean>(false);
+  const [btPermissionMissing, setBtPermissionMissing] = useState<boolean>(false);
   const [showDevicePicker, setShowDevicePicker] = useState<boolean>(false);
 
   // Keep-Alive & Anti-Sleep states
@@ -258,10 +262,40 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
       flushPendingQueue().catch(() => {});
       setStatusMessage(null);
       setPairedDevices(null);
+      setOtherPairedDevices([]);
+      setShowAllBondedDevices(false);
+      setBtPermissionMissing(false);
       setShowDevicePicker(false);
       setServerHealth(null);
     }
   }, [isOpen]);
+
+  // Auto-refresh paired Bluetooth devices when user returns from Phone Bluetooth Settings or Permission dialog
+  useEffect(() => {
+    if (!isOpen || !showDevicePicker) return;
+    const refreshOnReturn = async () => {
+      if (document.visibilityState === 'hidden') return;
+      try {
+        const res = await listPairedBluetoothDevicesWithStatus();
+        if (!res.permissionDenied && !res.bluetoothOff) {
+          setBtPermissionMissing(false);
+          if (res.devices.length > 0) {
+            setPairedDevices(res.devices);
+            setOtherPairedDevices(res.otherDevices);
+          } else if (res.otherDevices.length > 0) {
+            setPairedDevices(res.otherDevices);
+            setOtherPairedDevices([]);
+          }
+        }
+      } catch {}
+    };
+    window.addEventListener('focus', refreshOnReturn);
+    document.addEventListener('visibilitychange', refreshOnReturn);
+    return () => {
+      window.removeEventListener('focus', refreshOnReturn);
+      document.removeEventListener('visibilitychange', refreshOnReturn);
+    };
+  }, [isOpen, showDevicePicker]);
 
   const handleTestServerConnection = async () => {
     setIsTestingServer(true);
@@ -381,13 +415,28 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
 
   const handleScanAndSave = async () => {
     setIsScanning(true);
+    setBtPermissionMissing(false);
+    setOtherPairedDevices([]);
+    setShowAllBondedDevices(false);
     setStatusMessage({
-      text: isAr ? 'جاري البحث عن الطابعات المربوطة بالبلوتوث فقط...' : 'Searching for paired Bluetooth printers...',
+      text: isAr ? 'جاري البحث عن الطابعات المربوطة بالبلوتوث...' : 'Searching for paired Bluetooth printers...',
       type: 'info',
     });
 
     try {
-      await requestAndroidBluetoothPermissions();
+      const permRes = await requestAndroidBluetoothPermissions();
+      if (!permRes.granted) {
+        setBtPermissionMissing(true);
+        setPairedDevices([]);
+        setShowDevicePicker(true);
+        setIsScanning(false);
+        setStatusMessage({
+          text: permRes.message || (isAr ? 'يرجى السماح بصلاحية البلوتوث (الأجهزة القريبة) لعرض الطابعات المربوطة.' : 'Bluetooth permission is required.'),
+          type: 'error',
+        });
+        return;
+      }
+
       const btState = await ensureBluetoothEnabled((msg) => {
         setStatusMessage({ text: msg, type: 'info' });
       });
@@ -403,8 +452,38 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
         return;
       }
 
-      // 1. Fetch ONLY genuine paired/connected Bluetooth devices (never fake presets or PDF/RawBT templates)
-      let devices = await listPairedBluetoothDevices();
+      // 1. Fetch genuine paired/connected Bluetooth devices with diagnostic status
+      const statusRes = await listPairedBluetoothDevicesWithStatus();
+      if (statusRes.permissionDenied) {
+        setBtPermissionMissing(true);
+        setPairedDevices([]);
+        setShowDevicePicker(true);
+        setIsScanning(false);
+        setStatusMessage({
+          text: statusRes.message || (isAr ? 'يرجى السماح بصلاحية الأجهزة القريبة (البلوتوث) من إعدادات التطبيق.' : 'Bluetooth permission denied.'),
+          type: 'error',
+        });
+        return;
+      }
+      if (statusRes.bluetoothOff) {
+        setPairedDevices([]);
+        setShowDevicePicker(true);
+        setIsScanning(false);
+        setStatusMessage({
+          text: statusRes.message || (isAr ? 'البلوتوث مغلق. يرجى تشغيله أولاً.' : 'Bluetooth is off.'),
+          type: 'error',
+        });
+        return;
+      }
+
+      let devices = statusRes.devices;
+      let extraDevices = statusRes.otherDevices || [];
+
+      // If no device matched printer keywords/class, surface all paired Bluetooth devices so a custom-named printer is never hidden
+      if (devices.length === 0 && extraDevices.length > 0) {
+        devices = extraDevices;
+        extraDevices = [];
+      }
 
       // 2. Web Bluetooth Chooser (only on desktop/web browsers, NOT inside native Android APK)
       if (!Platform.isAPK && typeof window !== 'undefined' && 'bluetooth' in navigator) {
@@ -427,6 +506,7 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
             setConfig(updated);
             setPrinterProfiles(getSavedPrintersList());
             setPairedDevices(devices);
+            setOtherPairedDevices(extraDevices);
             setShowDevicePicker(true);
             setStatusMessage({
               text: isAr ? `تم الربط والاعتماد بالطابعة: ${webRes.deviceName}` : `Connected to: ${webRes.deviceName}`,
@@ -441,20 +521,26 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
       }
 
       setPairedDevices(devices);
+      setOtherPairedDevices(extraDevices);
       setShowDevicePicker(true);
       setIsScanning(false);
 
       if (devices.length > 0) {
         setStatusMessage({
           text: isAr
-            ? `تم العثور على ${devices.length} طابعة مربوطة بالبلوتوث. اختر طابعتك للاعتماد:`
+            ? `تم العثور على ${devices.length} جهاز مربوط بالبلوتوث. اختر طابعتك للاعتماد:`
             : `Found ${devices.length} paired Bluetooth printer(s). Select one:`,
           type: 'success',
+        });
+      } else if (statusRes.webUnsupported && statusRes.message) {
+        setStatusMessage({
+          text: statusRes.message,
+          type: 'info',
         });
       } else {
         setStatusMessage({
           text: isAr
-            ? 'لا توجد طابعات مربوطة بالبلوتوث حالياً. يرجى ربط الطابعة من إعدادات بلوتوث الهاتف أولاً.'
+            ? 'لا توجد طابعات مربوطة بالبلوتوث حالياً. يرجى ربط الطابعة من إعدادات بلوتوث الهاتف ثم العودة والضغط على بحث.'
             : 'No Bluetooth-paired printers found. Pair your printer in Bluetooth settings first.',
           type: 'info',
         });
@@ -827,78 +913,126 @@ export const PrinterSettingsModal: React.FC<PrinterSettingsModalProps> = ({
                   </button>
                 </div>
 
-                {pairedDevices && pairedDevices.length > 0 ? (
-                  <div className="space-y-2 max-h-56 overflow-y-auto">
-                    {pairedDevices.map((dev, idx) => {
-                      const devMac = dev.address || dev.id || '';
-                      const isSelected =
-                        config.deviceId === devMac ||
-                        (config.deviceName && dev.name && config.deviceName.toLowerCase() === dev.name.toLowerCase());
+                {((pairedDevices && pairedDevices.length > 0) || (showAllBondedDevices && otherPairedDevices.length > 0)) ? (
+                  <div className="space-y-2">
+                    <div className="space-y-2 max-h-56 overflow-y-auto">
+                      {[...(pairedDevices || []), ...(showAllBondedDevices ? otherPairedDevices : [])].map((dev, idx) => {
+                        const devMac = dev.address || dev.id || '';
+                        const isSelected =
+                          config.deviceId === devMac ||
+                          (config.deviceName && dev.name && config.deviceName.toLowerCase() === dev.name.toLowerCase());
 
-                      return (
-                        <button
-                          key={devMac || idx}
-                          type="button"
-                          onClick={() => handleSelectDevice(dev)}
-                          className={`w-full p-3 rounded-xl border transition-all text-right flex items-center justify-between cursor-pointer ${
-                            isSelected
-                              ? 'bg-teal-600 text-white border-teal-700 shadow-sm'
-                              : 'bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 border-slate-200 dark:border-slate-700 hover:border-teal-500'
-                          }`}
-                        >
-                          <div className="flex items-center gap-2.5 min-w-0">
-                            <Printer className={`w-4 h-4 shrink-0 ${isSelected ? 'text-white' : 'text-teal-600'}`} />
-                            <div className="min-w-0">
-                              <div className="text-xs font-black flex items-center gap-1.5 flex-wrap">
-                                <span className="truncate">{dev.name || 'طابعة البلوتوث'}</span>
-                                {dev.connected && (
-                                  <span className={`text-[9px] font-black px-1.5 py-0.5 rounded-md ${
-                                    isSelected
-                                      ? 'bg-white/20 text-white'
-                                      : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
-                                  }`}>
-                                    {isAr ? 'متصلة الآن' : 'Connected'}
-                                  </span>
+                        return (
+                          <button
+                            key={devMac || idx}
+                            type="button"
+                            onClick={() => handleSelectDevice(dev)}
+                            className={`w-full p-3 rounded-xl border transition-all text-right flex items-center justify-between cursor-pointer ${
+                              isSelected
+                                ? 'bg-teal-600 text-white border-teal-700 shadow-sm'
+                                : 'bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 border-slate-200 dark:border-slate-700 hover:border-teal-500'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <Printer className={`w-4 h-4 shrink-0 ${isSelected ? 'text-white' : 'text-teal-600'}`} />
+                              <div className="min-w-0">
+                                <div className="text-xs font-black flex items-center gap-1.5 flex-wrap">
+                                  <span className="truncate">{dev.name || 'طابعة البلوتوث'}</span>
+                                  {dev.connected && (
+                                    <span className={`text-[9px] font-black px-1.5 py-0.5 rounded-md ${
+                                      isSelected
+                                        ? 'bg-white/20 text-white'
+                                        : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300'
+                                    }`}>
+                                      {isAr ? 'متصلة الآن' : 'Connected'}
+                                    </span>
+                                  )}
+                                </div>
+                                {devMac && (
+                                  <div className={`text-[10px] font-mono dir-ltr text-right ${isSelected ? 'text-teal-100' : 'text-slate-400'}`}>
+                                    MAC / ID: {devMac}
+                                  </div>
                                 )}
                               </div>
-                              {devMac && (
-                                <div className={`text-[10px] font-mono dir-ltr text-right ${isSelected ? 'text-teal-100' : 'text-slate-400'}`}>
-                                  MAC / ID: {devMac}
-                                </div>
-                              )}
                             </div>
-                          </div>
 
-                          {isSelected ? (
-                            <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-lg bg-white/20 text-white flex items-center gap-1 shrink-0">
-                              <CheckCircle2 className="w-3 h-3" />
-                              {isAr ? 'معتمدة' : 'Active'}
-                            </span>
-                          ) : (
-                            <span className="text-[11px] font-extrabold text-teal-600 dark:text-teal-400 shrink-0">
-                              {isAr ? 'اعتماد الطابعة' : 'Select'}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
+                            {isSelected ? (
+                              <span className="text-[10px] font-extrabold px-2 py-0.5 rounded-lg bg-white/20 text-white flex items-center gap-1 shrink-0">
+                                <CheckCircle2 className="w-3 h-3" />
+                                {isAr ? 'معتمدة' : 'Active'}
+                              </span>
+                            ) : (
+                              <span className="text-[11px] font-extrabold text-teal-600 dark:text-teal-400 shrink-0">
+                                {isAr ? 'اعتماد الطابعة' : 'Select'}
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {otherPairedDevices.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAllBondedDevices((v) => !v)}
+                        className="w-full py-1.5 px-3 rounded-xl bg-white/80 dark:bg-slate-800/80 border border-teal-200 dark:border-slate-700 text-[11px] font-bold text-teal-700 dark:text-teal-300 hover:bg-teal-100/60 cursor-pointer transition-all"
+                      >
+                        {showAllBondedDevices
+                          ? (isAr ? 'إخفاء الأجهزة الأخرى' : 'Hide other devices')
+                          : (isAr ? `إظهار باقي أجهزة البلوتوث المقترنة (${otherPairedDevices.length})` : `Show other paired Bluetooth devices (${otherPairedDevices.length})`)}
+                      </button>
+                    )}
                   </div>
                 ) : (
                   <div className="p-4 rounded-xl bg-white/80 dark:bg-slate-800/80 border border-teal-200 dark:border-slate-700 text-center space-y-2.5">
                     <Bluetooth className="w-7 h-7 mx-auto text-slate-400" />
                     <p className="text-xs font-bold text-slate-700 dark:text-slate-300">
-                      {isAr
-                        ? 'لا توجد طابعات مربوطة بالبلوتوث حالياً. يرجى ربط الطابعة عبر بلوتوث الهاتف ثم الضغط على بحث.'
-                        : 'No Bluetooth-paired printers found. Pair your printer in Bluetooth settings first.'}
+                      {btPermissionMissing
+                        ? (isAr
+                            ? 'صلاحية (الأجهزة القريبة / البلوتوث) غير مفعلة للتطبيق. يرجى منح الصلاحية من إعدادات التطبيق ثم إعادة البحث.'
+                            : 'Bluetooth (Nearby devices) permission is required.')
+                        : (!Platform.isAPK && typeof window !== 'undefined' && !('bluetooth' in navigator))
+                          ? (isAr
+                              ? 'لا يمكن للمتصفح قراءة أجهزة البلوتوث المقترنة بالهاتف مباشرة. يرجى البحث من داخل تطبيق الأندرويد المثبت على الهاتف.'
+                              : 'Browser cannot list paired phone Bluetooth printers. Use the Android app.')
+                          : (isAr
+                              ? 'لا توجد طابعات مربوطة بالبلوتوث حالياً. يرجى ربط الطابعة عبر بلوتوث الهاتف ثم الضغط على تحديث.'
+                              : 'No Bluetooth-paired printers found. Pair your printer in Bluetooth settings first.')}
                     </p>
-                    <button
-                      type="button"
-                      onClick={handleOpenPhoneBluetooth}
-                      className="px-3.5 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-black inline-flex items-center gap-1.5 cursor-pointer transition-all"
-                    >
-                      <Settings className="w-3.5 h-3.5" />
-                      <span>{isAr ? 'فتح إعدادات بلوتوث الهاتف' : 'Open Bluetooth Settings'}</span>
-                    </button>
+                    <div className="flex flex-wrap items-center justify-center gap-2">
+                      {btPermissionMissing ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const androidBridge = (window as any).AndroidPrinter || (window as any).AndroidInterface || (window as any).Android;
+                            if (androidBridge && typeof androidBridge.openAppSettings === 'function') {
+                              androidBridge.openAppSettings();
+                            }
+                          }}
+                          className="px-3.5 py-2 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-black inline-flex items-center gap-1.5 cursor-pointer transition-all"
+                        >
+                          <ShieldCheck className="w-3.5 h-3.5" />
+                          <span>{isAr ? 'فتح صلاحيات التطبيق' : 'Open App Permissions'}</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={handleOpenPhoneBluetooth}
+                          className="px-3.5 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-black inline-flex items-center gap-1.5 cursor-pointer transition-all"
+                        >
+                          <Settings className="w-3.5 h-3.5" />
+                          <span>{isAr ? 'فتح إعدادات بلوتوث الهاتف' : 'Open Bluetooth Settings'}</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={handleScanAndSave}
+                        className="px-3.5 py-2 rounded-xl bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-800 dark:text-slate-100 text-xs font-black inline-flex items-center gap-1.5 cursor-pointer transition-all"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>{isAr ? 'تحديث القائمة' : 'Refresh'}</span>
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>

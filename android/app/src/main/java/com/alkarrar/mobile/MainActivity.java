@@ -4,6 +4,8 @@ import android.Manifest;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothClass;
 import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothProfile;
 import android.bluetooth.BluetoothSocket;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -12,6 +14,7 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.ParcelUuid;
 import android.provider.Settings;
 import android.util.Base64;
 import android.util.Log;
@@ -53,7 +56,7 @@ public class MainActivity extends BridgeActivity {
         super.onCreate(savedInstanceState);
 
         try {
-            bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+            bluetoothAdapter = getBtAdapter();
         } catch (Throwable e) {
             Log.w(TAG, "BluetoothAdapter init error: " + e.getMessage());
         }
@@ -103,7 +106,6 @@ public class MainActivity extends BridgeActivity {
         super.onResume();
         setupWebViewInterface();
         triggerWebSync();
-        checkAndRequestPermissions();
         try {
             ForegroundSyncService.startSyncService(this);
         } catch (Throwable ignored) {}
@@ -201,6 +203,61 @@ public class MainActivity extends BridgeActivity {
         super.onBackPressed();
     }
 
+    private BluetoothAdapter getBtAdapter() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                BluetoothManager bm = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+                if (bm != null && bm.getAdapter() != null) {
+                    bluetoothAdapter = bm.getAdapter();
+                    return bluetoothAdapter;
+                }
+            }
+            if (bluetoothAdapter == null) {
+                bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+            }
+        } catch (Throwable e) {
+            Log.w(TAG, "getBtAdapter error: " + e.getMessage());
+        }
+        return bluetoothAdapter;
+    }
+
+    private boolean hasBtConnectPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+        }
+        return ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.BLUETOOTH) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestBtPermissionsOnly() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                List<String> permissions = new ArrayList<>();
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    if (ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                        permissions.add(Manifest.permission.BLUETOOTH_CONNECT);
+                    }
+                    if (ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                        permissions.add(Manifest.permission.BLUETOOTH_SCAN);
+                    }
+                } else {
+                    if (ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.BLUETOOTH) != PackageManager.PERMISSION_GRANTED) {
+                        permissions.add(Manifest.permission.BLUETOOTH);
+                    }
+                    if (ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.BLUETOOTH_ADMIN) != PackageManager.PERMISSION_GRANTED) {
+                        permissions.add(Manifest.permission.BLUETOOTH_ADMIN);
+                    }
+                    if (ContextCompat.checkSelfPermission(MainActivity.this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION);
+                    }
+                }
+                if (!permissions.isEmpty()) {
+                    ActivityCompat.requestPermissions(MainActivity.this, permissions.toArray(new String[0]), PERMISSION_REQUEST_CODE);
+                }
+            }
+        });
+    }
+
     private void checkAndRequestPermissions() {
         runOnUiThread(new Runnable() {
             @Override
@@ -255,9 +312,6 @@ public class MainActivity extends BridgeActivity {
                 if (!permissions.isEmpty()) {
                     ActivityCompat.requestPermissions(MainActivity.this, permissions.toArray(new String[0]), PERMISSION_REQUEST_CODE);
                 }
-
-                // 5. Check and prompt to ignore battery optimizations for persistent background sync
-                checkAndPromptBatteryOptimization();
             }
         });
     }
@@ -296,21 +350,57 @@ public class MainActivity extends BridgeActivity {
 
         @JavascriptInterface
         public boolean isBluetoothEnabled() {
-            if (bluetoothAdapter == null) return false;
-            return bluetoothAdapter.isEnabled();
+            BluetoothAdapter adapter = getBtAdapter();
+            if (adapter == null) return false;
+            try {
+                return adapter.isEnabled();
+            } catch (Throwable e) {
+                return false;
+            }
+        }
+
+        @JavascriptInterface
+        public boolean hasBluetoothPermissions() {
+            return hasBtConnectPermission();
+        }
+
+        @JavascriptInterface
+        public void requestBluetoothPermissionsOnly() {
+            requestBtPermissionsOnly();
         }
 
         @JavascriptInterface
         public boolean enableBluetooth() {
-            if (bluetoothAdapter == null) return false;
-            if (!bluetoothAdapter.isEnabled()) {
-                try {
-                    return bluetoothAdapter.enable();
-                } catch (SecurityException se) {
-                    Log.w(TAG, "SecurityException on enable(): " + se.getMessage());
+            BluetoothAdapter adapter = getBtAdapter();
+            if (adapter == null) return false;
+            try {
+                if (adapter.isEnabled()) return true;
+                if (!hasBtConnectPermission()) {
+                    requestBtPermissionsOnly();
+                    return false;
                 }
+                if (Build.VERSION.SDK_INT < 33) {
+                    try {
+                        if (adapter.enable()) {
+                            return true;
+                        }
+                    } catch (SecurityException se) {
+                        Log.w(TAG, "SecurityException on enable(): " + se.getMessage());
+                    }
+                }
+                // Android 13+ (or if programmatic enable fails): prompt user with standard Bluetooth enable dialog
+                try {
+                    Intent enableBtIntent = new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE);
+                    enableBtIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(enableBtIntent);
+                } catch (Throwable t) {
+                    Log.w(TAG, "ACTION_REQUEST_ENABLE fallback failed: " + t.getMessage());
+                }
+                return adapter.isEnabled();
+            } catch (SecurityException se) {
+                Log.w(TAG, "SecurityException on enableBluetooth(): " + se.getMessage());
+                return false;
             }
-            return true;
         }
 
         @JavascriptInterface
@@ -321,6 +411,7 @@ public class MainActivity extends BridgeActivity {
         @JavascriptInterface
         public void requestAllAndroidPermissions() {
             checkAndRequestPermissions();
+            checkAndPromptBatteryOptimization();
         }
 
         @JavascriptInterface
@@ -656,96 +747,227 @@ public class MainActivity extends BridgeActivity {
             }
         }
 
-        @JavascriptInterface
-        public String getBondedDevices() {
-            JSONArray array = new JSONArray();
-            if (bluetoothAdapter == null) {
-                return array.toString();
+        private boolean looksLikeThermalPrinter(BluetoothDevice device, String nameLower) {
+            if (nameLower != null && !nameLower.isEmpty()) {
+                if (nameLower.contains("print") || nameLower.contains("pos") || nameLower.contains("thermal") ||
+                    nameLower.contains("mpt") || nameLower.contains("mtp") || nameLower.contains("pt-") ||
+                    nameLower.contains("pt2") || nameLower.contains("rpp") || nameLower.contains("rp") ||
+                    nameLower.contains("zj") || nameLower.contains("xp") || nameLower.contains("xprinter") ||
+                    nameLower.contains("gprinter") || nameLower.contains("rongta") || nameLower.contains("bixolon") ||
+                    nameLower.contains("epson") || nameLower.contains("star") || nameLower.contains("sunmi") ||
+                    nameLower.contains("58") || nameLower.contains("80") || nameLower.contains("6ba1") ||
+                    nameLower.contains("inner") || nameLower.contains("spp") || nameLower.contains("hoin") ||
+                    nameLower.contains("gooj") || nameLower.contains("peripage") || nameLower.contains("phomemo") ||
+                    nameLower.contains("munbyn") || nameLower.contains("nyear") || nameLower.contains("zebra") ||
+                    nameLower.contains("tsc") || nameLower.contains("seiko") || nameLower.contains("citizen") ||
+                    nameLower.contains("brother") || nameLower.contains("honeywell") || nameLower.contains("cashino") ||
+                    nameLower.contains("sprt") || nameLower.contains("xinye") || nameLower.contains("mht") ||
+                    nameLower.contains("gp-") || nameLower.contains("qs-") || nameLower.contains("b21") ||
+                    nameLower.contains("d11") || nameLower.contains("m110") || nameLower.contains("hc-0") ||
+                    nameLower.contains("bt-0") || nameLower.contains("label") || nameLower.contains("receipt") ||
+                    nameLower.contains("ticket") || nameLower.contains("طابعة")) {
+                    return true;
+                }
             }
-
-            // Auto enable if disabled
-            if (!bluetoothAdapter.isEnabled()) {
-                try {
-                    bluetoothAdapter.enable();
-                } catch (Exception ignored) {}
-            }
-
             try {
-                Set<BluetoothDevice> pairedDevices = bluetoothAdapter.getBondedDevices();
-                if (pairedDevices != null) {
-                    List<JSONObject> priorityList = new ArrayList<>();
-                    List<JSONObject> otherList = new ArrayList<>();
-
-                    for (BluetoothDevice device : pairedDevices) {
-                        if (device.getBondState() != BluetoothDevice.BOND_BONDED) {
-                            continue;
-                        }
-                        String name = device.getName();
-                        String addr = device.getAddress();
-                        String nameLower = name != null ? name.toLowerCase() : "";
-
-                        boolean looksLikePrinter =
-                            nameLower.contains("print") || nameLower.contains("pos") || nameLower.contains("thermal") ||
-                            nameLower.contains("mpt") || nameLower.contains("mtp") || nameLower.contains("pt-") ||
-                            nameLower.contains("pt2") || nameLower.contains("rpp") || nameLower.contains("rp") ||
-                            nameLower.contains("zj") || nameLower.contains("xp") || nameLower.contains("xprinter") ||
-                            nameLower.contains("gprinter") || nameLower.contains("rongta") || nameLower.contains("bixolon") ||
-                            nameLower.contains("epson") || nameLower.contains("star") || nameLower.contains("sunmi") ||
-                            nameLower.contains("58") || nameLower.contains("80") || nameLower.contains("6ba1") ||
-                            nameLower.contains("inner") || nameLower.contains("spp");
-
-                        BluetoothClass btClass = device.getBluetoothClass();
-                        int majorClass = btClass != null ? btClass.getMajorDeviceClass() : -1;
-
-                        // Exclude obvious non-printer Bluetooth devices (headphones, speakers, car audio, watches, phones)
-                        if (!looksLikePrinter && (
-                            majorClass == BluetoothClass.Device.Major.AUDIO_VIDEO ||
-                            majorClass == BluetoothClass.Device.Major.WEARABLE ||
-                            majorClass == BluetoothClass.Device.Major.HEALTH ||
-                            majorClass == BluetoothClass.Device.Major.TOY ||
-                            majorClass == BluetoothClass.Device.Major.PHONE
-                        )) {
-                            continue;
-                        }
-
-                        boolean isConnected = false;
-                        try {
-                            java.lang.reflect.Method m = device.getClass().getMethod("isConnected");
-                            Object res = m.invoke(device);
-                            if (res instanceof Boolean) {
-                                isConnected = (Boolean) res;
+                ParcelUuid[] uuids = device.getUuids();
+                if (uuids != null) {
+                    for (ParcelUuid pu : uuids) {
+                        if (pu != null && pu.getUuid() != null) {
+                            String u = pu.getUuid().toString().toLowerCase();
+                            if (u.startsWith("00001101") || u.startsWith("000018f0") || u.startsWith("e7810a71")) {
+                                return true;
                             }
-                        } catch (Throwable ignored) {}
-
-                        boolean isImagingPrinter = (majorClass == BluetoothClass.Device.Major.IMAGING);
-
-                        JSONObject obj = new JSONObject();
-                        obj.put("name", name != null && !name.trim().isEmpty() ? name : "طابعة بلوتوث (" + addr + ")");
-                        obj.put("address", addr != null ? addr : "");
-                        obj.put("id", addr != null ? addr : "");
-                        obj.put("connected", isConnected);
-                        obj.put("isPrinter", isImagingPrinter || looksLikePrinter);
-
-                        if (isConnected || isImagingPrinter || looksLikePrinter) {
-                            priorityList.add(obj);
-                        } else {
-                            otherList.add(obj);
                         }
-                    }
-
-                    for (JSONObject obj : priorityList) {
-                        array.put(obj);
-                    }
-                    for (JSONObject obj : otherList) {
-                        array.put(obj);
                     }
                 }
+            } catch (Throwable ignored) {}
+            return false;
+        }
+
+        @JavascriptInterface
+        public String getBondedDevicesStatus() {
+            JSONObject result = new JSONObject();
+            JSONArray devicesArray = new JSONArray();
+            JSONArray excludedArray = new JSONArray();
+            try {
+                result.put("ok", false);
+                result.put("permissionDenied", false);
+                result.put("bluetoothOff", false);
+                result.put("adapterUnavailable", false);
+                result.put("totalBondedRaw", 0);
+
+                BluetoothAdapter adapter = getBtAdapter();
+                if (adapter == null) {
+                    result.put("adapterUnavailable", true);
+                    result.put("error", "جهاز البلوتوث غير متوفر في هذا الهاتف");
+                    result.put("devices", devicesArray);
+                    result.put("otherDevices", excludedArray);
+                    return result.toString();
+                }
+
+                if (!hasBtConnectPermission()) {
+                    result.put("permissionDenied", true);
+                    result.put("error", "يرجى السماح بصلاحية الأجهزة القريبة (البلوتوث) لعرض الطابعات المقترنة");
+                    result.put("devices", devicesArray);
+                    result.put("otherDevices", excludedArray);
+                    return result.toString();
+                }
+
+                if (!adapter.isEnabled()) {
+                    result.put("bluetoothOff", true);
+                    result.put("error", "البلوتوث مغلق حالياً. يرجى تشغيل البلوتوث أولاً");
+                    result.put("devices", devicesArray);
+                    result.put("otherDevices", excludedArray);
+                    return result.toString();
+                }
+
+                List<BluetoothDevice> allCandidates = new ArrayList<>();
+                java.util.HashSet<String> seenAddresses = new java.util.HashSet<>();
+
+                Set<BluetoothDevice> pairedDevices = adapter.getBondedDevices();
+                if (pairedDevices != null) {
+                    for (BluetoothDevice d : pairedDevices) {
+                        if (d != null && d.getBondState() == BluetoothDevice.BOND_BONDED) {
+                            String a = d.getAddress() != null ? d.getAddress() : "";
+                            if (!a.isEmpty() && seenAddresses.add(a)) {
+                                allCandidates.add(d);
+                            }
+                        }
+                    }
+                }
+
+                // Also include currently connected BLE GATT devices (e.g. BLE-only printers)
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        BluetoothManager bm = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+                        if (bm != null) {
+                            List<BluetoothDevice> gattConnected = bm.getConnectedDevices(BluetoothProfile.GATT);
+                            if (gattConnected != null) {
+                                for (BluetoothDevice d : gattConnected) {
+                                    if (d != null) {
+                                        String a = d.getAddress() != null ? d.getAddress() : "";
+                                        if (!a.isEmpty() && seenAddresses.add(a)) {
+                                            allCandidates.add(d);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable ignored) {}
+
+                result.put("totalBondedRaw", allCandidates.size());
+
+                List<JSONObject> priorityList = new ArrayList<>();
+                List<JSONObject> otherList = new ArrayList<>();
+                List<JSONObject> filteredOutList = new ArrayList<>();
+
+                for (BluetoothDevice device : allCandidates) {
+                    String name = null;
+                    try {
+                        name = device.getName();
+                    } catch (Throwable ignored) {}
+                    if ((name == null || name.trim().isEmpty()) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        try {
+                            name = device.getAlias();
+                        } catch (Throwable ignored) {}
+                    }
+                    String addr = device.getAddress() != null ? device.getAddress() : "";
+                    String nameLower = name != null ? name.toLowerCase().trim() : "";
+
+                    boolean looksLikePrinter = looksLikeThermalPrinter(device, nameLower);
+                    BluetoothClass btClass = null;
+                    try {
+                        btClass = device.getBluetoothClass();
+                    } catch (Throwable ignored) {}
+                    int majorClass = btClass != null ? btClass.getMajorDeviceClass() : -1;
+
+                    boolean isConnected = false;
+                    try {
+                        java.lang.reflect.Method m = device.getClass().getMethod("isConnected");
+                        Object res = m.invoke(device);
+                        if (res instanceof Boolean) {
+                            isConnected = (Boolean) res;
+                        }
+                    } catch (Throwable ignored) {}
+
+                    boolean isImagingPrinter = (majorClass == BluetoothClass.Device.Major.IMAGING);
+
+                    JSONObject obj = new JSONObject();
+                    obj.put("name", name != null && !name.trim().isEmpty() ? name.trim() : "طابعة بلوتوث (" + addr + ")");
+                    obj.put("address", addr);
+                    obj.put("id", addr);
+                    obj.put("connected", isConnected);
+                    obj.put("isPrinter", isImagingPrinter || looksLikePrinter);
+
+                    boolean isObviousNonPrinter = !looksLikePrinter && !isImagingPrinter && (
+                        majorClass == BluetoothClass.Device.Major.AUDIO_VIDEO ||
+                        majorClass == BluetoothClass.Device.Major.WEARABLE ||
+                        majorClass == BluetoothClass.Device.Major.HEALTH ||
+                        majorClass == BluetoothClass.Device.Major.TOY ||
+                        majorClass == BluetoothClass.Device.Major.PHONE
+                    );
+
+                    if (isObviousNonPrinter) {
+                        filteredOutList.add(obj);
+                    } else if (isConnected || isImagingPrinter || looksLikePrinter) {
+                        priorityList.add(obj);
+                    } else {
+                        otherList.add(obj);
+                    }
+                }
+
+                for (JSONObject obj : priorityList) {
+                    devicesArray.put(obj);
+                }
+                for (JSONObject obj : otherList) {
+                    devicesArray.put(obj);
+                }
+                for (JSONObject obj : filteredOutList) {
+                    excludedArray.put(obj);
+                }
+
+                result.put("ok", true);
+                result.put("devices", devicesArray);
+                result.put("otherDevices", excludedArray);
             } catch (SecurityException se) {
-                Log.w(TAG, "SecurityException in getBondedDevices: " + se.getMessage());
+                Log.w(TAG, "SecurityException in getBondedDevicesStatus: " + se.getMessage());
+                try {
+                    result.put("permissionDenied", true);
+                    result.put("error", "صلاحية البلوتوث مرفوضة من النظام");
+                    result.put("devices", devicesArray);
+                    result.put("otherDevices", excludedArray);
+                } catch (Exception ignored) {}
+            } catch (Exception e) {
+                Log.e(TAG, "Error in getBondedDevicesStatus: " + e.getMessage());
+                try {
+                    result.put("error", e.getMessage());
+                    result.put("devices", devicesArray);
+                    result.put("otherDevices", excludedArray);
+                } catch (Exception ignored) {}
+            }
+            return result.toString();
+        }
+
+        @JavascriptInterface
+        public String getBondedDevices() {
+            try {
+                String statusStr = getBondedDevicesStatus();
+                JSONObject status = new JSONObject(statusStr);
+                JSONArray devices = status.optJSONArray("devices");
+                if (devices != null && devices.length() > 0) {
+                    return devices.toString();
+                }
+                JSONArray otherDevices = status.optJSONArray("otherDevices");
+                if (otherDevices != null && otherDevices.length() > 0 && (devices == null || devices.length() == 0)) {
+                    // Fallback: if all bonded devices were filtered out by BluetoothClass, still return them so paired printers are never hidden
+                    return otherDevices.toString();
+                }
             } catch (Exception e) {
                 Log.e(TAG, "Error in getBondedDevices: " + e.getMessage());
             }
-            return array.toString();
+            return "[]";
         }
 
         @JavascriptInterface

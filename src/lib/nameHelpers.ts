@@ -5,9 +5,11 @@
 
 export const normalizeEntityName = (name?: string | null): string => {
   if (!name) return '';
-  return name
-    .trim()
+  return String(name)
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\u200B-\u200F\uFEFF]/g, '')
     .replace(/\s+/g, ' ')
+    .trim()
     .toLowerCase();
 };
 

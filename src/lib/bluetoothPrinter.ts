@@ -2358,13 +2358,20 @@ export async function ensureBluetoothEnabled(onProgress?: (status: string) => vo
       if (typeof androidBridge.enableBluetooth === 'function') {
         const enabledOk = androidBridge.enableBluetooth();
         if (enabledOk) {
-          await new Promise((r) => setTimeout(r, 600));
+          await new Promise((r) => setTimeout(r, 500));
           return { enabled: true };
+        }
+        // On Android 13+, ACTION_REQUEST_ENABLE dialog may be shown to user; poll briefly
+        for (let attempt = 0; attempt < 15; attempt++) {
+          await new Promise((r) => setTimeout(r, 350));
+          if (androidBridge.isBluetoothEnabled()) {
+            return { enabled: true };
+          }
         }
       }
       return {
         enabled: false,
-        message: 'يرجى تشغيل البلوتوث في الهاتف للتمكن من البحث والطباعة.',
+        message: 'البلوتوث مغلق. يرجى تشغيل البلوتوث في الهاتف للتمكن من عرض الطابعات المقترنة.',
       };
     } catch (e) {
       console.warn('androidBridge Bluetooth check error:', e);
@@ -2439,13 +2446,36 @@ export async function ensureBluetoothEnabled(onProgress?: (status: string) => vo
 export async function requestAndroidBluetoothPermissions(): Promise<{ granted: boolean; message?: string }> {
   if (typeof window === 'undefined') return { granted: true };
 
-  // 0. Trigger native Android MainActivity permission request when running inside APK
+  // 0. Native Android MainActivity Bluetooth permission check & wait (avoids SecurityException race)
   const androidBridge = (window as any).AndroidPrinter || (window as any).AndroidInterface || (window as any).Android;
-  if (androidBridge && typeof androidBridge.requestPermissions === 'function') {
+  if (androidBridge) {
     try {
-      androidBridge.requestPermissions();
+      if (typeof androidBridge.hasBluetoothPermissions === 'function') {
+        if (androidBridge.hasBluetoothPermissions()) {
+          return { granted: true };
+        }
+        if (typeof androidBridge.requestBluetoothPermissionsOnly === 'function') {
+          androidBridge.requestBluetoothPermissionsOnly();
+        } else if (typeof androidBridge.requestPermissions === 'function') {
+          androidBridge.requestPermissions();
+        }
+        // Wait for user to respond to Android runtime permission dialog
+        for (let i = 0; i < 35; i++) {
+          await new Promise((r) => setTimeout(r, 350));
+          if (androidBridge.hasBluetoothPermissions()) {
+            return { granted: true };
+          }
+        }
+        return {
+          granted: false,
+          message: 'يرجى السماح بصلاحية (الأجهزة القريبة / البلوتوث) للتطبيق من إعدادات الهاتف لعرض الطابعات المربوطة.',
+        };
+      } else if (typeof androidBridge.requestPermissions === 'function') {
+        androidBridge.requestPermissions();
+        await new Promise((r) => setTimeout(r, 400));
+      }
     } catch (e) {
-      console.warn('androidBridge.requestPermissions error:', e);
+      console.warn('androidBridge Bluetooth permission error:', e);
     }
   }
 
@@ -2602,10 +2632,19 @@ export interface BluetoothDevice {
   isPrinter?: boolean;
 }
 
+export interface PairedBluetoothResult {
+  devices: BluetoothDevice[];
+  otherDevices: BluetoothDevice[];
+  permissionDenied?: boolean;
+  bluetoothOff?: boolean;
+  webUnsupported?: boolean;
+  message?: string;
+}
+
 /**
- * Lists ONLY genuine paired/connected Bluetooth devices from native Android Bluetooth, Bluetooth Serial, or Web Bluetooth
+ * Lists ONLY genuine paired/connected Bluetooth devices with diagnostic status
  */
-export async function listPairedBluetoothDevices(): Promise<BluetoothDevice[]> {
+export async function listPairedBluetoothDevicesWithStatus(): Promise<PairedBluetoothResult> {
   const isFakeId = (addrOrId: string) => {
     const v = (addrOrId || '').trim().toLowerCase();
     return (
@@ -2620,66 +2659,78 @@ export async function listPairedBluetoothDevices(): Promise<BluetoothDevice[]> {
     );
   };
 
+  const mapList = (arr: any[]): BluetoothDevice[] =>
+    (Array.isArray(arr) ? arr : [])
+      .filter((d: any) => !isFakeId(d.address || d.id || ''))
+      .map((d: any) => ({
+        name: d.name || d.id || 'طابعة بلوتوث',
+        address: d.address || d.id || '',
+        id: d.id || d.address || '',
+        connected: Boolean(d.connected),
+        isPrinter: d.isPrinter !== false,
+      }));
+
   // 0. Native Android Bridge (MainActivity.java)
   const androidBridge = (window as any).AndroidPrinter || (window as any).AndroidInterface || (window as any).Android;
+  if (androidBridge && typeof androidBridge.getBondedDevicesStatus === 'function') {
+    try {
+      const raw = androidBridge.getBondedDevicesStatus();
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (parsed && typeof parsed === 'object') {
+        return {
+          devices: mapList(parsed.devices),
+          otherDevices: mapList(parsed.otherDevices),
+          permissionDenied: Boolean(parsed.permissionDenied),
+          bluetoothOff: Boolean(parsed.bluetoothOff),
+          message: parsed.error || undefined,
+        };
+      }
+    } catch (e) {
+      console.warn('Native Android bridge getBondedDevicesStatus error:', e);
+    }
+  }
+
   if (androidBridge && typeof androidBridge.getBondedDevices === 'function') {
     try {
       const raw = androidBridge.getBondedDevices();
       const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
       if (Array.isArray(parsed)) {
-        return parsed
-          .filter((d: any) => !isFakeId(d.address || d.id || ''))
-          .map((d: any) => ({
-            name: d.name || d.id || 'طابعة بلوتوث',
-            address: d.address || d.id || '',
-            id: d.id || d.address || '',
-            connected: Boolean(d.connected),
-            isPrinter: d.isPrinter !== false,
-          }));
+        return { devices: mapList(parsed), otherDevices: [] };
       }
-      return [];
+      return { devices: [], otherDevices: [] };
     } catch (e) {
       console.warn('Native Android bridge getBondedDevices error:', e);
-      return [];
+      return { devices: [], otherDevices: [] };
     }
   }
 
   // 1. Cordova/Capacitor Bluetooth Serial
   const btSerial = (window as any).bluetoothSerial || (navigator as any).bluetoothSerial;
   if (btSerial && typeof btSerial.list === 'function') {
-    // Request Android runtime permissions first to avoid SecurityException crash
     const permRes = await requestAndroidBluetoothPermissions();
     if (!permRes.granted) {
-      console.warn('Bluetooth permissions not granted:', permRes.message);
-      return [];
+      return {
+        devices: [],
+        otherDevices: [],
+        permissionDenied: true,
+        message: permRes.message,
+      };
     }
 
     return new Promise((resolve) => {
       try {
         btSerial.list(
           (devices: any[]) => {
-            if (Array.isArray(devices) && devices.length > 0) {
-              const mapped: BluetoothDevice[] = devices
-                .filter((d) => !isFakeId(d.address || d.id || ''))
-                .map((d) => ({
-                  name: d.name || d.id || 'طابعة بلوتوث',
-                  address: d.address || d.id || '',
-                  id: d.id || d.address || '',
-                  connected: Boolean(d.connected),
-                }));
-              resolve(mapped);
-            } else {
-              resolve([]);
-            }
+            resolve({ devices: mapList(devices), otherDevices: [] });
           },
           (err: any) => {
             console.warn('btSerial.list failed cleanly:', err);
-            resolve([]);
+            resolve({ devices: [], otherDevices: [] });
           }
         );
       } catch (e) {
         console.warn('btSerial.list exception caught safely:', e);
-        resolve([]);
+        resolve({ devices: [], otherDevices: [] });
       }
     });
   }
@@ -2689,19 +2740,40 @@ export async function listPairedBluetoothDevices(): Promise<BluetoothDevice[]> {
     try {
       const webDevices = await (navigator as any).bluetooth.getDevices();
       if (Array.isArray(webDevices) && webDevices.length > 0) {
-        return webDevices.map((d: any) => ({
-          name: d.name || 'طابعة بلوتوث',
-          address: d.id || '',
-          id: d.id || '',
-          connected: Boolean(d.gatt?.connected),
-        }));
+        return {
+          devices: webDevices.map((d: any) => ({
+            name: d.name || 'طابعة بلوتوث',
+            address: d.id || '',
+            id: d.id || '',
+            connected: Boolean(d.gatt?.connected),
+          })),
+          otherDevices: [],
+        };
       }
     } catch (e) {
       console.warn('Web Bluetooth getDevices error:', e);
     }
   }
 
-  return [];
+  if (!Platform.isAPK && typeof window !== 'undefined' && !('bluetooth' in navigator)) {
+    return {
+      devices: [],
+      otherDevices: [],
+      webUnsupported: true,
+      message: 'متصفح الويب الحالي لا يدعم قراءة طابعات البلوتوث المقترنة بالهاتف. يرجى استخدام تطبيق الأندرويد (APK) للبحث والطباعة المباشرة عبر البلوتوث.',
+    };
+  }
+
+  return { devices: [], otherDevices: [] };
+}
+
+/**
+ * Lists ONLY genuine paired/connected Bluetooth devices from native Android Bluetooth, Bluetooth Serial, or Web Bluetooth
+ */
+export async function listPairedBluetoothDevices(): Promise<BluetoothDevice[]> {
+  const res = await listPairedBluetoothDevicesWithStatus();
+  if (res.devices.length > 0) return res.devices;
+  return res.otherDevices;
 }
 
 export async function requestWebBluetoothDevice(): Promise<{ success: boolean; deviceName?: string; deviceId?: string; message?: string }> {
