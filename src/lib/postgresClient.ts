@@ -308,7 +308,18 @@ function mergeRemoteWithPendingLocal<T extends { id?: string; name?: string }>(t
                 const localLat = localMatch.latitude ?? localMatch.lat;
                 const localLng = localMatch.longitude ?? localMatch.lng;
                 const serverLat = itemAny.latitude ?? itemAny.lat;
-                if (localLat != null && !isNaN(Number(localLat)) && Number(localLat) !== 0 && (serverLat == null || isNaN(Number(serverLat)) || Number(serverLat) === 0)) {
+                const serverClearedAt = itemAny.locationClearedAt ?? itemAny.location_cleared_at ?? '';
+                const localUpdatedAt = localMatch.locationUpdatedAt ?? localMatch.location_updated_at ?? '';
+                const isLocalLocationNewerThanClear = Boolean(localUpdatedAt && (!serverClearedAt || localUpdatedAt > serverClearedAt));
+                const isLocalUnsyncedLocation = Boolean(localMatch._unsynced) && (!serverClearedAt || isLocalLocationNewerThanClear);
+                if (
+                  localLat != null &&
+                  !isNaN(Number(localLat)) &&
+                  Number(localLat) !== 0 &&
+                  (serverLat == null || isNaN(Number(serverLat)) || Number(serverLat) === 0) &&
+                  !serverClearedAt &&
+                  isLocalUnsyncedLocation
+                ) {
                   mergedItem = {
                     ...item,
                     latitude: Number(localLat),
@@ -784,24 +795,31 @@ export function enrichContractsWithCustomerLocations(contractsList: any[], custo
     let lng = c.longitude ?? c.lng;
     let locAddr = c.locationAddress ?? c.location_address;
     let locUpdated = c.locationUpdatedAt ?? c.location_updated_at;
+    const contractClearedAt = c.locationClearedAt ?? c.location_cleared_at ?? '';
 
-    if (lat == null || isNaN(Number(lat)) || Number(lat) === 0) {
+    if (lat == null || lng == null || isNaN(Number(lat)) || isNaN(Number(lng)) || Number(lat) === 0 || Number(lng) === 0) {
       const matchedCust = (c.customerId && custMap.get(String(c.customerId).trim())) ||
                           (c.customerName && custMap.get(String(c.customerName).trim().toLowerCase())) ||
                           (c.id && custMap.get(String(c.id).trim()));
       if (matchedCust) {
-        const cLat = matchedCust.latitude ?? matchedCust.lat;
-        const cLng = matchedCust.longitude ?? matchedCust.lng;
-        if (cLat != null && !isNaN(Number(cLat)) && Number(cLat) !== 0) {
-          lat = Number(cLat);
-          lng = Number(cLng);
-          locAddr = locAddr || matchedCust.location_address || matchedCust.locationAddress || matchedCust.address || '';
-          locUpdated = locUpdated || matchedCust.location_updated_at || matchedCust.locationUpdatedAt || matchedCust.updated_at;
+        const custUpdatedAt = matchedCust.location_updated_at || matchedCust.locationUpdatedAt || matchedCust.updated_at || '';
+        const custClearedAt = matchedCust.location_cleared_at || matchedCust.locationClearedAt || '';
+        const clearedOnContract = Boolean(contractClearedAt && (!custUpdatedAt || custUpdatedAt <= contractClearedAt));
+        const clearedOnCustomer = Boolean(custClearedAt && (!custUpdatedAt || custUpdatedAt <= custClearedAt));
+        if (!clearedOnContract && !clearedOnCustomer) {
+          const cLat = matchedCust.latitude ?? matchedCust.lat;
+          const cLng = matchedCust.longitude ?? matchedCust.lng;
+          if (cLat != null && cLng != null && !isNaN(Number(cLat)) && !isNaN(Number(cLng)) && Number(cLat) !== 0 && Number(cLng) !== 0) {
+            lat = Number(cLat);
+            lng = Number(cLng);
+            locAddr = locAddr || matchedCust.location_address || matchedCust.locationAddress || matchedCust.address || '';
+            locUpdated = locUpdated || custUpdatedAt;
+          }
         }
       }
     }
 
-    if (lat != null && !isNaN(Number(lat)) && Number(lat) !== 0) {
+    if (lat != null && lng != null && !isNaN(Number(lat)) && !isNaN(Number(lng)) && Number(lat) !== 0 && Number(lng) !== 0) {
       return {
         ...c,
         latitude: Number(lat),
@@ -810,7 +828,11 @@ export function enrichContractsWithCustomerLocations(contractsList: any[], custo
         locationUpdatedAt: locUpdated,
       };
     }
-    return c;
+    return {
+      ...c,
+      latitude: undefined,
+      longitude: undefined,
+    };
   });
 }
 
@@ -1281,6 +1303,7 @@ function mapRow(tableName: string, r: any): any {
       longitude: r.longitude != null ? Number(r.longitude) : (r.lng != null ? Number(r.lng) : undefined),
       locationAddress: r.location_address ?? r.locationAddress ?? '',
       locationUpdatedAt: r.location_updated_at ?? r.locationUpdatedAt ?? undefined,
+      locationClearedAt: r.location_cleared_at ?? r.locationClearedAt ?? null,
       createdAt: r.created_at ?? r.createdAt ?? new Date().toISOString(),
       completedAt: r.completed_at ?? r.completedAt ?? null,
       updatedAt: r.updated_at ?? r.updatedAt ?? null,
@@ -2559,6 +2582,36 @@ export const addContractToDatabase = async (contract: any, quantityDeducted: num
 
   unmarkRecordAsDeleted(id);
   updateLocalCacheItem('contracts', payload);
+  try {
+    const cleanName = (payload.customerName || '').trim();
+    if (cleanName) {
+      const localCusts = getLocalCache<any>('customers');
+      const existingCust = localCusts.find((cu: any) => cu.name && normName(cu.name) === normName(cleanName));
+      const custId = existingCust?.id || `cust_${id}`;
+      updateLocalCacheItem('customers', {
+        ...(existingCust || {}),
+        id: custId,
+        name: cleanName,
+        phone: payload.customerPhone || existingCust?.phone || '',
+        address: payload.customerAddress || existingCust?.address || '',
+        listId: payload.listId || existingCust?.listId || null,
+        listName: payload.listName || existingCust?.listName || null,
+        totalPurchases: (Number(existingCust?.totalPurchases || existingCust?.total_purchases || 0) || 0) + Number(payload.totalPrice || 0),
+        totalPaid: (Number(existingCust?.totalPaid || existingCust?.total_paid || 0) || 0) + Number(payload.totalPaid || 0),
+        remainingBalance: (Number(existingCust?.remainingBalance || existingCust?.remaining_balance || 0) || 0) + Number(payload.remainingBalance || 0),
+        status: payload.status || 'active',
+        ...(payload.latitude != null && payload.longitude != null && Number(payload.latitude) !== 0 && Number(payload.longitude) !== 0
+          ? {
+              latitude: Number(payload.latitude),
+              longitude: Number(payload.longitude),
+              location_address: payload.locationAddress || '',
+              location_updated_at: payload.locationUpdatedAt || new Date().toISOString(),
+              location_cleared_at: null,
+            }
+          : {}),
+      });
+    }
+  } catch (e) {}
   const qPromise = addToPendingQueue('CREATE_CONTRACT', payload);
   const savePromise = saveToPostgres('contracts', 'POST', payload, qPromise);
 
@@ -2588,18 +2641,89 @@ export const addContractToFirestore = addContractToDatabase;
 export const updateContractInDatabase = async (id: string | any, updates?: any, ..._rest: any[]) => {
   const docId = typeof id === 'string' ? id : id?.id;
   if (!docId) return;
-  const payload = typeof id === 'string' ? { ...updates, id: docId } : id;
+  const rawPayload = typeof id === 'string' ? { ...updates, id: docId } : id;
 
   const currentContracts = getLocalCache<any>('contracts');
   const existing = currentContracts.find((c) => c.id === docId);
+
+  const hasLocationChange =
+    rawPayload.latitude !== undefined ||
+    rawPayload.longitude !== undefined ||
+    rawPayload.lat !== undefined ||
+    rawPayload.lng !== undefined;
+
+  let payload = { ...rawPayload };
+  let matchedCustomer: any = null;
+
+  if (hasLocationChange) {
+    const rawLat = payload.latitude !== undefined ? payload.latitude : payload.lat;
+    const rawLng = payload.longitude !== undefined ? payload.longitude : payload.lng;
+    const isClearing = rawLat == null || rawLng == null || Number(rawLat) === 0 || Number(rawLng) === 0 || isNaN(Number(rawLat)) || isNaN(Number(rawLng));
+    const nowIso = new Date().toISOString();
+    payload = {
+      ...payload,
+      latitude: isClearing ? null : Number(rawLat),
+      longitude: isClearing ? null : Number(rawLng),
+      locationAddress: isClearing ? null : (payload.locationAddress ?? payload.customerAddress ?? existing?.customerAddress ?? ''),
+      locationUpdatedAt: isClearing ? null : (payload.locationUpdatedAt || nowIso),
+      locationClearedAt: isClearing ? (payload.locationClearedAt || nowIso) : null,
+    };
+
+    const targetName = payload.customerName || existing?.customerName;
+    const localCustomers = getLocalCache<any>('customers');
+    matchedCustomer = localCustomers.find((cu: any) =>
+      (cu.id && (cu.id === docId || cu.id === existing?.customerId)) ||
+      (targetName && cu.name && normName(cu.name) === normName(targetName))
+    );
+    if (matchedCustomer) {
+      updateLocalCacheItem('customers', {
+        ...matchedCustomer,
+        latitude: payload.latitude,
+        longitude: payload.longitude,
+        location_address: payload.locationAddress,
+        location_updated_at: payload.locationUpdatedAt,
+        location_cleared_at: payload.locationClearedAt,
+      });
+    }
+
+    if (isClearing) {
+      const localPayments = getLocalCache<any>('payments');
+      let payChanged = false;
+      const updatedPayments = localPayments.map((p: any) => {
+        if (p.contractId === docId || (targetName && p.customerName && normName(p.customerName) === normName(targetName))) {
+          if (p.latitude != null || p.longitude != null) {
+            payChanged = true;
+            return { ...p, latitude: null, longitude: null };
+          }
+        }
+        return p;
+      });
+      if (payChanged) setLocalCache('payments', updatedPayments);
+    }
+  }
+
   const merged = existing ? { ...existing, ...payload } : payload;
 
   unmarkRecordAsDeleted(docId);
   updateLocalCacheItem('contracts', merged);
   const qPromise = addToPendingQueue('UPDATE_CONTRACT', payload);
+  const custPromise = matchedCustomer
+    ? fetchWithFallback(`/api/customers/${matchedCustomer.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          latitude: payload.latitude,
+          longitude: payload.longitude,
+          location_address: payload.locationAddress,
+          location_updated_at: payload.locationUpdatedAt,
+          location_cleared_at: payload.locationClearedAt,
+        }),
+      }, 8000).catch(() => null)
+    : Promise.resolve(null);
+
   await Promise.race([
-    saveToPostgres(`contracts/${docId}`, 'PUT', payload, qPromise),
-    new Promise((resolve) => setTimeout(resolve, 2000)),
+    Promise.all([saveToPostgres(`contracts/${docId}`, 'PUT', payload, qPromise), custPromise]),
+    new Promise((resolve) => setTimeout(resolve, hasLocationChange ? 8000 : 2000)),
   ]);
 };
 export const updateContractInFirestore = updateContractInDatabase;
@@ -3784,6 +3908,7 @@ export async function forceRefreshAllDataFromPostgres(): Promise<boolean> {
     // Fetch payments and core tables first in small batches of 3 (prevents overloading server pool & timeouts)
     const tableEndpoints: { table: string; endpoint: string }[] = [
       { table: 'payments', endpoint: 'payments' },
+      { table: 'customers', endpoint: 'customers' },
       { table: 'contracts', endpoint: 'contracts' },
       { table: 'customer_lists', endpoint: 'customer-lists' },
       { table: 'funds', endpoint: 'funds' },
@@ -4037,16 +4162,17 @@ export const updateCustomerLocation = async (
   locationAddress?: string | null
 ): Promise<boolean> => {
   if (!contractId) return false;
-  const isClearing = latitude == null || longitude == null || (latitude === 0 && longitude === 0);
-  const nowIso = isClearing ? null : new Date().toISOString();
+  const isClearing = latitude == null || longitude == null || isNaN(Number(latitude)) || isNaN(Number(longitude)) || Number(latitude) === 0 || Number(longitude) === 0;
+  const nowIso = new Date().toISOString();
   const currentContracts = getLocalCache<any>('contracts');
   const contract = currentContracts.find((c: any) => c.id === contractId);
 
   const updates = {
-    latitude: isClearing ? null : latitude,
-    longitude: isClearing ? null : longitude,
+    latitude: isClearing ? null : Number(latitude),
+    longitude: isClearing ? null : Number(longitude),
     locationAddress: isClearing ? null : (locationAddress || contract?.customerAddress || ''),
-    locationUpdatedAt: nowIso,
+    locationUpdatedAt: isClearing ? null : nowIso,
+    locationClearedAt: isClearing ? nowIso : null,
   };
 
   if (contract) {
@@ -4054,36 +4180,23 @@ export const updateCustomerLocation = async (
     updateLocalCacheItem('contracts', updated);
   }
 
-  // Update in customers cache and push to /api/customers/:id
+  // Update all matching records in customers cache
   const localCustomers = getLocalCache<any>('customers');
-  const matchedCustomer = localCustomers.find((cu: any) =>
+  const matchedCustomers = localCustomers.filter((cu: any) =>
     (cu.id && (cu.id === contractId || cu.id === (contract as any)?.customerId)) ||
     (contract?.customerName && cu.name && normName(cu.name) === normName(contract.customerName))
   );
 
-  if (matchedCustomer) {
+  for (const matchedCustomer of matchedCustomers) {
     const custUpdates = {
       ...matchedCustomer,
       latitude: updates.latitude,
       longitude: updates.longitude,
       location_address: updates.locationAddress,
       location_updated_at: updates.locationUpdatedAt,
+      location_cleared_at: updates.locationClearedAt,
     };
     updateLocalCacheItem('customers', custUpdates);
-
-    // Push to server /api/customers/:id
-    try {
-      fetchWithFallback(`/api/customers/${matchedCustomer.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          latitude: updates.latitude,
-          longitude: updates.longitude,
-          location_address: updates.locationAddress,
-          location_updated_at: updates.locationUpdatedAt,
-        }),
-      }, 8000).catch(() => {});
-    } catch (e) {}
   }
 
   if (isClearing) {
@@ -4107,20 +4220,42 @@ export const updateCustomerLocation = async (
   mirrorLocalSnapshotToIndexedDb(true);
   notifySubscribersRefresh();
 
-  let resOk = true;
+  let resOk = false;
   try {
-    const res = await fetchWithFallback(`/api/contracts/${contractId}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updates),
-    }, 8000);
-    resOk = Boolean(res && res.ok);
+    const customerRequests = matchedCustomers.map((mc: any) =>
+      fetchWithFallback(`/api/customers/${mc.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          latitude: updates.latitude,
+          longitude: updates.longitude,
+          location_address: updates.locationAddress,
+          location_updated_at: updates.locationUpdatedAt,
+          location_cleared_at: updates.locationClearedAt,
+        }),
+      }, 10000).catch(() => null)
+    );
+
+    const [contractRes] = await Promise.all([
+      fetchWithFallback(`/api/contracts/${contractId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      }, 10000),
+      ...customerRequests,
+    ]);
+    resOk = Boolean(contractRes && contractRes.ok);
+    if (!resOk) {
+      try {
+        addToPendingQueue('UPDATE_CONTRACT', { id: contractId, ...updates });
+      } catch (e) {}
+    }
   } catch (err) {
     console.warn('[updateCustomerLocation] Offline or network error, queued in pendingQueue:', err);
     try {
       addToPendingQueue('UPDATE_CONTRACT', { id: contractId, ...updates });
     } catch (e) {}
-    resOk = true;
+    resOk = false;
   }
 
   reconcileAllLocalWithDatabase({ force: true }).catch(() => {});

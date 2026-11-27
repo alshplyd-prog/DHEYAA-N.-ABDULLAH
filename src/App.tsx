@@ -1398,25 +1398,34 @@ export default function App() {
       }
       const status: 'active' | 'completed' = (remainingBalance === 0 && effectivePaidSum > 0 && net > 0) ? 'completed' : 'active';
 
-      // Fallback coordinate resolution from customers state or payments
+      // Fallback coordinate resolution from customers state (respecting locationClearedAt)
       let lat = c.latitude != null && !isNaN(Number(c.latitude)) && Number(c.latitude) !== 0 ? Number(c.latitude) : undefined;
       let lng = c.longitude != null && !isNaN(Number(c.longitude)) && Number(c.longitude) !== 0 ? Number(c.longitude) : undefined;
       let locationAddress = c.locationAddress || '';
       let locationUpdatedAt = c.locationUpdatedAt;
+      const contractClearedAt = (c as any).locationClearedAt || (c as any).location_cleared_at || '';
 
-      if (lat == null) {
+      if (lat == null || lng == null) {
+        lat = undefined;
+        lng = undefined;
         const matchedCust = customers.find((cu) =>
           (cu.id && (cu.id === c.id || cu.id === (c as any).customerId)) ||
           (cu.name && cNameNorm && normalizeEntityName(cu.name) === cNameNorm)
         );
         if (matchedCust) {
-          const cLat = Number(matchedCust.latitude ?? matchedCust.lat);
-          const cLng = Number(matchedCust.longitude ?? matchedCust.lng);
-          if (!isNaN(cLat) && !isNaN(cLng) && cLat !== 0 && cLng !== 0) {
-            lat = cLat;
-            lng = cLng;
-            locationAddress = locationAddress || matchedCust.location_address || matchedCust.locationAddress || matchedCust.address || '';
-            locationUpdatedAt = locationUpdatedAt || matchedCust.location_updated_at || matchedCust.locationUpdatedAt;
+          const custUpdatedAt = matchedCust.location_updated_at || matchedCust.locationUpdatedAt || '';
+          const custClearedAt = matchedCust.location_cleared_at || matchedCust.locationClearedAt || '';
+          const clearedOnContract = Boolean(contractClearedAt && (!custUpdatedAt || custUpdatedAt <= contractClearedAt));
+          const clearedOnCustomer = Boolean(custClearedAt && (!custUpdatedAt || custUpdatedAt <= custClearedAt));
+          if (!clearedOnContract && !clearedOnCustomer) {
+            const cLat = Number(matchedCust.latitude ?? matchedCust.lat);
+            const cLng = Number(matchedCust.longitude ?? matchedCust.lng);
+            if (!isNaN(cLat) && !isNaN(cLng) && cLat !== 0 && cLng !== 0) {
+              lat = cLat;
+              lng = cLng;
+              locationAddress = locationAddress || matchedCust.location_address || matchedCust.locationAddress || matchedCust.address || '';
+              locationUpdatedAt = locationUpdatedAt || custUpdatedAt || undefined;
+            }
           }
         }
       }
@@ -1480,7 +1489,8 @@ export default function App() {
         c.longitude != null &&
         !isNaN(Number(c.latitude)) &&
         !isNaN(Number(c.longitude)) &&
-        Number(c.latitude) !== 0
+        Number(c.latitude) !== 0 &&
+        Number(c.longitude) !== 0
     ).length;
   }, [contractsWithLiveBalances, currentRep]);
 

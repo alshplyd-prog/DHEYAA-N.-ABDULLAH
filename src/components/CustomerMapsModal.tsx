@@ -23,6 +23,8 @@ import {
   ExternalLink,
   LocateFixed,
   RefreshCw,
+  Plus,
+  Minus,
 } from 'lucide-react';
 import { InstallmentContract, CustomerList, SalesRepresentative, Language } from '../types';
 import { updateCustomerLocation, getLocalCache, reconcileAllLocalWithDatabase } from '../lib/postgresClient';
@@ -165,8 +167,10 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
   onViewCustomerPayments,
 }) => {
   const isAr = lang === 'ar';
+  const mapViewportRef = useRef<HTMLDivElement | null>(null);
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRotationWrapperRef = useRef<HTMLDivElement | null>(null);
+  const viewportSizeRef = useRef<{ width: number; height: number; diag: number }>({ width: 0, height: 0, diag: 0 });
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
   const routeLayerRef = useRef<L.LayerGroup | null>(null);
@@ -176,8 +180,9 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
   // Navigation & Turn Tracking Refs
   const currentCourseRef = useRef<number>(0);
   const smoothedHeadingRef = useRef<number>(0);
+  const continuousHeadingRef = useRef<number>(0);
   const lastHeadingUpdateRef = useRef<number>(0);
-  const positionHistoryRef = useRef<Array<{ lat: number; lng: number; time: number }>>([]);
+  const headingAnchorRef = useRef<{ lat: number; lng: number } | null>(null);
   const lastValidLocationRef = useRef<{ lat: number; lng: number } | null>(null);
   const userCoordsRef = useRef<{ lat: number; lng: number } | null>(null);
   const routeLatLngsRef = useRef<[number, number][]>([]);
@@ -226,11 +231,13 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     return (brng + 360) % 360;
   }, []);
 
-  // Helper to extract valid coords from a contract (supports latitude/longitude or lat/lng or customers lookup)
+  // Helper to extract valid coords from a contract (supports latitude/longitude or lat/lng or customers lookup, respecting locationClearedAt)
   const getCustomerCoords = useCallback((c: InstallmentContract): { lat: number; lng: number } | null => {
     const lat = Number(c.latitude ?? (c as any).lat);
     const lng = Number(c.longitude ?? (c as any).lng);
     if (!isNaN(lat) && !isNaN(lng) && lat !== 0 && lng !== 0) return { lat, lng };
+
+    const contractClearedAt = (c as any).locationClearedAt || (c as any).location_cleared_at || '';
 
     // Fallback: check matching customer in customers prop or local cache
     const custList = (customers && customers.length > 0) ? customers : getLocalCache<any>('customers');
@@ -239,6 +246,14 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
       (cu.name && c.customerName && cu.name.trim().toLowerCase() === c.customerName.trim().toLowerCase())
     );
     if (matched) {
+      const custUpdatedAt = matched.location_updated_at || matched.locationUpdatedAt || '';
+      const custClearedAt = matched.location_cleared_at || matched.locationClearedAt || '';
+      if (contractClearedAt && (!custUpdatedAt || custUpdatedAt <= contractClearedAt)) {
+        return null;
+      }
+      if (custClearedAt && (!custUpdatedAt || custUpdatedAt <= custClearedAt)) {
+        return null;
+      }
       const cLat = Number(matched.latitude ?? matched.lat);
       const cLng = Number(matched.longitude ?? matched.lng);
       if (!isNaN(cLat) && !isNaN(cLng) && cLat !== 0 && cLng !== 0) {
@@ -354,7 +369,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
   };
 
   // Helper to create custom HTML pin icon with permanently visible customer name
-  // Labels are counter-rotated using CSS variable --counter-rotate so they ALWAYS remain level and upright
+  // Labels are counter-rotated using CSS variable --counter-rotate so they ALWAYS remain upright pointing upward
   const createCustomPinIcon = useCallback((contract: InstallmentContract, isSelected: boolean) => {
     const isCompleted = contract.status === 'completed' || contract.remainingBalance <= 0;
     const isLate = contract.status === 'late';
@@ -372,20 +387,20 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
       dotColor = 'bg-rose-400';
     }
 
-    const scaleClass = isSelected ? 'scale-125 z-50 ring-4' : 'hover:scale-110';
+    const scaleClass = isSelected ? 'scale-115 ring-4' : 'hover:scale-105';
     const initialLetter = (contract.customerName || 'ز').trim().charAt(0);
 
     return L.divIcon({
       className: 'custom-customer-pin',
       html: `
-        <div class="custom-customer-pin-inner relative flex flex-col items-center group cursor-pointer transition-transform duration-200 ${scaleClass}" style="transform: rotate(var(--counter-rotate, 0deg)); transform-origin: 50% 80%; will-change: transform;">
+        <div class="custom-customer-pin-inner relative flex flex-col items-center group cursor-pointer" style="transform: rotate(var(--counter-rotate, 0deg)); transform-origin: 100px 70px; will-change: transform;">
           <!-- Customer Full Name Badge (Permanently Visible & Always Upright) -->
           <div class="px-2.5 py-1 mb-1 bg-slate-950/95 text-white text-[11px] font-black rounded-xl shadow-xl border border-slate-700/90 flex items-center justify-center gap-1.5 whitespace-nowrap pointer-events-none drop-shadow-md">
             <span class="w-2 h-2 rounded-full ${dotColor} shrink-0"></span>
             <span class="max-w-[150px] truncate text-white">${contract.customerName}</span>
           </div>
           <!-- Pin Circle -->
-          <div class="w-9 h-9 rounded-full ${bgClass} border-2 shadow-lg flex items-center justify-center font-black text-sm ${ringClass}">
+          <div class="w-9 h-9 rounded-full ${bgClass} border-2 shadow-lg flex items-center justify-center font-black text-sm transition-transform duration-200 ${ringClass} ${scaleClass}">
             ${initialLetter}
           </div>
           <div class="w-2.5 h-2.5 bg-slate-900 rotate-45 -mt-1 shadow-xs"></div>
@@ -397,19 +412,19 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     });
   }, []);
 
-  // Update user marker with GPS Navigation Chevron
+  // Update user marker with GPS Navigation Chevron (always pointing straight UP on screen)
   const updateUserMarker = useCallback((lat: number, lng: number, speedVal: number | null) => {
     const map = mapInstanceRef.current;
     if (!isMapValid(map)) return;
 
     const headingArrowHtml = `
-      <div class="relative flex flex-col items-center select-none pointer-events-none">
-        <div class="user-gps-badge px-2.5 py-0.5 mb-1.5 bg-blue-600 text-white font-black text-[10px] rounded-full shadow-lg whitespace-nowrap border border-blue-400" style="transform: rotate(var(--counter-rotate, 0deg)); transform-origin: 50% 50%; will-change: transform;">
+      <div class="user-gps-counter-wrap relative flex flex-col items-center select-none pointer-events-none" style="transform: rotate(var(--counter-rotate, 0deg)); transform-origin: 60px 52px; will-change: transform;">
+        <div class="user-gps-badge px-2.5 py-0.5 mb-1.5 bg-blue-600 text-white font-black text-[10px] rounded-full shadow-lg whitespace-nowrap border border-blue-400">
           🎯 موقعي ${speedVal && speedVal > 0.5 ? `(${(speedVal * 3.6).toFixed(0)} كم/س)` : ''}
         </div>
         <div class="relative flex items-center justify-center">
-          <!-- Direction Chevron pointing in direction of travel -->
-          <div class="user-gps-arrow relative w-10 h-10 flex items-center justify-center transform transition-transform duration-200" style="transform: rotate(var(--user-arrow-rot, 0deg)); transform-origin: 50% 50%; will-change: transform;">
+          <!-- Direction Chevron pointing straight UP -->
+          <div class="user-gps-arrow relative w-10 h-10 flex items-center justify-center">
             <svg viewBox="0 0 24 24" class="w-9 h-9 drop-shadow-[0_2px_8px_rgba(37,99,235,0.7)]" fill="#2563eb" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polygon points="12 2 19 21 12 17 5 21 12 2" />
             </svg>
@@ -441,39 +456,68 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     } catch (e) {}
   }, []);
 
-  // Smooth GPS motion heading update engine (Pure GPS velocity/displacement - Zero compass jitter)
-  // Direct DOM transform updates guarantee 60fps rotation without triggering component re-renders or dropping input focus
+  // Heading-Up map rotation engine: ONLY the map rotates (-heading) on >= 3m displacement,
+  // while customer pins/names and the user's location arrow counter-rotate (+heading) to always face UP.
   const applyHeadingUpdate = useCallback((newDeg: number) => {
     const now = Date.now();
     if (now - lastHeadingUpdateRef.current < 200) return;
 
-    const current = smoothedHeadingRef.current || currentCourseRef.current || 0;
-    const diff = ((((newDeg - current) % 360) + 540) % 360) - 180;
+    const currentMod = ((smoothedHeadingRef.current % 360) + 360) % 360;
+    const diff = ((((newDeg - currentMod) % 360) + 540) % 360) - 180;
 
     // Deadband threshold: ignore minor jitter (< 5 deg)
     if (Math.abs(diff) < 5.0) return;
 
-    const smoothed = Math.round((current + diff * 0.5 + 360) % 360);
+    const nextContinuous = continuousHeadingRef.current + diff * 0.75;
+    const normalizedDeg = ((Math.round(nextContinuous) % 360) + 360) % 360;
 
-    currentCourseRef.current = smoothed;
-    smoothedHeadingRef.current = smoothed;
+    continuousHeadingRef.current = nextContinuous;
+    currentCourseRef.current = normalizedDeg;
+    smoothedHeadingRef.current = normalizedDeg;
     lastHeadingUpdateRef.current = now;
 
-    if (mapContainerRef.current) {
-      mapContainerRef.current.style.setProperty('--user-arrow-rot', `${smoothed}deg`);
-      mapContainerRef.current.style.setProperty('--counter-rotate', `${smoothed}deg`);
+    if (mapViewportRef.current) {
+      mapViewportRef.current.style.setProperty('--map-rotate', `${-nextContinuous}deg`);
+      mapViewportRef.current.style.setProperty('--counter-rotate', `${nextContinuous}deg`);
     }
 
     if (headingBadgeRef.current) {
-      if (smoothed !== 0) {
+      if (normalizedDeg !== 0) {
         headingBadgeRef.current.style.display = 'flex';
         if (headingDegreeTextRef.current) {
-          headingDegreeTextRef.current.textContent = `${smoothed}°`;
+          headingDegreeTextRef.current.textContent = `${normalizedDeg}°`;
         }
       } else {
         headingBadgeRef.current.style.display = 'none';
       }
     }
+  }, []);
+
+  const resetMapHeading = useCallback(() => {
+    continuousHeadingRef.current = 0;
+    currentCourseRef.current = 0;
+    smoothedHeadingRef.current = 0;
+    lastHeadingUpdateRef.current = Date.now();
+    if (userCoordsRef.current) {
+      headingAnchorRef.current = { ...userCoordsRef.current };
+    }
+    if (mapViewportRef.current) {
+      mapViewportRef.current.style.setProperty('--map-rotate', '0deg');
+      mapViewportRef.current.style.setProperty('--counter-rotate', '0deg');
+    }
+    if (headingBadgeRef.current) {
+      headingBadgeRef.current.style.display = 'none';
+    }
+  }, []);
+
+  // Compute safe fitBounds padding accounting for oversized rotated square vs visible viewport
+  const getSafeFitPadding = useCallback((): [number, number] => {
+    const { width, height, diag } = viewportSizeRef.current;
+    if (width > 0 && height > 0 && diag > 0) {
+      const safePad = Math.max(48, Math.round((diag - Math.min(width, height)) / 2 + 44));
+      return [safePad, safePad];
+    }
+    return [50, 50];
   }, []);
 
   // Pre-cache customer map tiles in the background
@@ -492,8 +536,27 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     let timer2: any = null;
     let timer3: any = null;
 
+    const syncRotationWrapperSize = () => {
+      const vp = mapViewportRef.current;
+      const wrapper = mapRotationWrapperRef.current;
+      if (!vp || !wrapper) return;
+      const rect = vp.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const diag = Math.ceil(Math.sqrt(rect.width * rect.width + rect.height * rect.height) + 48);
+      viewportSizeRef.current = { width: rect.width, height: rect.height, diag };
+      wrapper.style.width = `${diag}px`;
+      wrapper.style.height = `${diag}px`;
+      wrapper.style.marginLeft = `${-diag / 2}px`;
+      wrapper.style.marginTop = `${-diag / 2}px`;
+      if (isMapValid(mapInstanceRef.current)) {
+        try { mapInstanceRef.current.invalidateSize({ animate: false }); } catch (e) {}
+      }
+    };
+
     const initMap = () => {
       if (isDisposed || !mapContainerRef.current) return;
+
+      syncRotationWrapperSize();
 
       if (mapInstanceRef.current && isMapValid(mapInstanceRef.current)) {
         try {
@@ -541,6 +604,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
           center: [initLat, initLng],
           zoom: initZoom,
           zoomControl: false,
+          attributionControl: false,
           preferCanvas: true,
         });
 
@@ -551,12 +615,32 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
             keepBuffer: 6,
             updateWhenIdle: false,
             updateWhenZooming: false,
-            attribution: '&copy; OpenStreetMap contributors',
           }
         );
         offlineTileLayer.addTo(map);
 
-        L.control.zoom({ position: 'bottomright' }).addTo(map);
+        // Compensate drag vector when mapRotationWrapperRef is rotated so panning always matches finger/mouse direction 1:1
+        const draggable = (map.dragging as any)?._draggable;
+        if (draggable) {
+          const origOnDown = draggable._onDown;
+          if (typeof origOnDown === 'function') {
+            draggable._onDown = function (...args: any[]) {
+              origOnDown.apply(this, args);
+              this._parentScale = { x: 1, y: 1 };
+            };
+          }
+          draggable.on('predrag', () => {
+            const headingDeg = continuousHeadingRef.current;
+            if (!headingDeg) return;
+            const dx = draggable._newPos.x - draggable._startPos.x;
+            const dy = draggable._newPos.y - draggable._startPos.y;
+            const rad = (headingDeg * Math.PI) / 180;
+            const cos = Math.cos(rad);
+            const sin = Math.sin(rad);
+            draggable._newPos.x = draggable._startPos.x + dx * cos - dy * sin;
+            draggable._newPos.y = draggable._startPos.y + dx * sin + dy * cos;
+          });
+        }
 
         const markersLayer = L.layerGroup().addTo(map);
         markersLayerRef.current = markersLayer;
@@ -581,33 +665,27 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     initMap();
 
     let resizeObserver: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== 'undefined' && mapContainerRef.current) {
+    if (typeof ResizeObserver !== 'undefined' && mapViewportRef.current) {
       try {
         resizeObserver = new ResizeObserver(() => {
-          if (!isDisposed && isMapValid(mapInstanceRef.current)) {
-            try { mapInstanceRef.current.invalidateSize(); } catch (e) {}
+          if (!isDisposed) {
+            syncRotationWrapperSize();
           }
         });
-        resizeObserver.observe(mapContainerRef.current);
+        resizeObserver.observe(mapViewportRef.current);
       } catch (e) {}
     }
 
     timer1 = setTimeout(() => {
-      if (!isDisposed && isMapValid(mapInstanceRef.current)) {
-        try { mapInstanceRef.current.invalidateSize(); } catch (e) {}
-      }
+      if (!isDisposed) syncRotationWrapperSize();
     }, 60);
 
     timer2 = setTimeout(() => {
-      if (!isDisposed && isMapValid(mapInstanceRef.current)) {
-        try { mapInstanceRef.current.invalidateSize(); } catch (e) {}
-      }
+      if (!isDisposed) syncRotationWrapperSize();
     }, 200);
 
     timer3 = setTimeout(() => {
-      if (!isDisposed && isMapValid(mapInstanceRef.current)) {
-        try { mapInstanceRef.current.invalidateSize(); } catch (e) {}
-      }
+      if (!isDisposed) syncRotationWrapperSize();
     }, 450);
 
     return () => {
@@ -627,6 +705,10 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
       userMarkerRef.current = null;
       markersLayerRef.current = null;
       routeLayerRef.current = null;
+      continuousHeadingRef.current = 0;
+      currentCourseRef.current = 0;
+      smoothedHeadingRef.current = 0;
+      headingAnchorRef.current = null;
 
       if (mapInstanceRef.current) {
         const mapToDestroy = mapInstanceRef.current;
@@ -753,11 +835,11 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
         if (bounds.length === 1) {
           map.setView(bounds[0], 16);
         } else {
-          map.fitBounds(L.latLngBounds(bounds), { padding: [50, 50], maxZoom: 16 });
+          map.fitBounds(L.latLngBounds(bounds), { padding: getSafeFitPadding(), maxZoom: 16 });
         }
       } catch (e) {}
     }
-  }, [contractsOnMap, selectedCustomer, selectedListId, createCustomPinIcon, getCustomerCoords]);
+  }, [contractsOnMap, selectedCustomer, selectedListId, createCustomPinIcon, getCustomerCoords, getSafeFitPadding]);
 
   // Start Live Real-Time Navigation Tracking & Heading
   const startLiveTracking = useCallback(async (isAutoStart: boolean = false) => {
@@ -780,7 +862,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     const { latitude, longitude } = initialPos.location;
     userCoordsRef.current = { lat: latitude, lng: longitude };
     lastValidLocationRef.current = { lat: latitude, lng: longitude };
-    positionHistoryRef.current = [{ lat: latitude, lng: longitude, time: Date.now() }];
+    headingAnchorRef.current = { lat: latitude, lng: longitude };
     updateUserMarker(latitude, longitude, null);
 
     const map = mapInstanceRef.current;
@@ -792,51 +874,44 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
 
     setIsLiveTracking(true);
 
-    // Start continuous live GPS watcher with accurate movement filtering (Zero stationary jitter)
+    // Start continuous live GPS watcher: map rotates ONLY after >= 3 meters of displacement (right/left/forward)
     if (typeof navigator !== 'undefined' && navigator.geolocation) {
       watchPositionIdRef.current = navigator.geolocation.watchPosition(
         (pos) => {
           const lat = pos.coords.latitude;
           const lng = pos.coords.longitude;
           const speed = pos.coords.speed;
-          const rawHeading = pos.coords.heading;
+          const accuracy = pos.coords.accuracy;
           userSpeedRef.current = speed;
           userCoordsRef.current = { lat, lng };
 
           const lastAnchor = lastValidLocationRef.current;
-          const distFromAnchor = lastAnchor ? calculateDistanceMeters(lastAnchor.lat, lastAnchor.lng, lat, lng) : 999;
-          
-          // Determine if user is genuinely moving (speed >= 0.8 m/s or displacement >= 3.5 meters)
-          const isGenuineMovement = (speed !== null && speed >= 0.8) || (distFromAnchor >= 3.5);
+          const distFromLast = lastAnchor ? calculateDistanceMeters(lastAnchor.lat, lastAnchor.lng, lat, lng) : 999;
 
-          if (isGenuineMovement) {
-            const now = Date.now();
-            const history = positionHistoryRef.current;
-            history.push({ lat, lng, time: now });
-            if (history.length > 5) {
-              history.shift();
-            }
-
-            // Calculate motion bearing when turning right, left, or returning
-            if (history.length >= 2) {
-              const oldest = history[0];
-              const moveDist = calculateDistanceMeters(oldest.lat, oldest.lng, lat, lng);
-              if (moveDist >= 3.0) {
-                const motionBearing = calculateBearing(oldest.lat, oldest.lng, lat, lng);
-                applyHeadingUpdate(motionBearing);
-              }
-            } else if (rawHeading !== null && rawHeading !== undefined && !isNaN(rawHeading) && rawHeading >= 0 && (speed === null || speed >= 0.8)) {
-              applyHeadingUpdate(rawHeading);
-            }
-
+          // Update user marker & camera follow when moving
+          if (distFromLast >= 1.5 || (speed !== null && speed >= 0.5)) {
             lastValidLocationRef.current = { lat, lng };
             updateUserMarker(lat, lng, speed);
 
-            // Smooth camera follow only when moving
             if (!isUserManuallyPanningRef.current && isMapValid(mapInstanceRef.current)) {
               try {
                 mapInstanceRef.current.setView([lat, lng], mapInstanceRef.current.getZoom(), { animate: false });
               } catch (e) {}
+            }
+          }
+
+          // Rotate ONLY the map when user moves >= 3.0 meters (turning right, left, or traveling)
+          if (!accuracy || accuracy <= 45) {
+            const headingAnchor = headingAnchorRef.current;
+            if (!headingAnchor) {
+              headingAnchorRef.current = { lat, lng };
+            } else {
+              const turnDist = calculateDistanceMeters(headingAnchor.lat, headingAnchor.lng, lat, lng);
+              if (turnDist >= 3.0) {
+                const motionBearing = calculateBearing(headingAnchor.lat, headingAnchor.lng, lat, lng);
+                applyHeadingUpdate(motionBearing);
+                headingAnchorRef.current = { lat, lng };
+              }
             }
           }
         },
@@ -1011,7 +1086,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
 
       // Fit map bounds to show route clearly
       const boundsPoly = L.polyline(routeLatLngs);
-      map.fitBounds(boundsPoly.getBounds(), { padding: [60, 60], maxZoom: 16 });
+      map.fitBounds(boundsPoly.getBounds(), { padding: getSafeFitPadding(), maxZoom: 16 });
 
       setActiveRoute({
         contract,
@@ -1173,44 +1248,86 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
         <div className="relative flex-1 w-full h-full overflow-hidden flex flex-row">
           
           {/* Map Container */}
-          <div className="relative flex-1 w-full h-full bg-slate-950 overflow-hidden">
+          <div
+            ref={mapViewportRef}
+            className="relative flex-1 w-full h-full bg-slate-950 overflow-hidden"
+            style={{
+              '--map-rotate': '0deg',
+              '--counter-rotate': '0deg',
+            } as React.CSSProperties}
+          >
             <style>{`
+              .map-rotation-surface {
+                transform: rotate(var(--map-rotate, 0deg));
+                transform-origin: 50% 50%;
+                transition: transform 0.35s ease-out;
+                will-change: transform;
+              }
               .custom-customer-pin-inner {
                 transform: rotate(var(--counter-rotate, 0deg)) !important;
-                transform-origin: 50% 80% !important;
-                transition: transform 0.2s ease-out !important;
+                transform-origin: 100px 70px !important;
+                transition: transform 0.35s ease-out !important;
               }
-              .user-gps-badge {
+              .user-gps-counter-wrap {
                 transform: rotate(var(--counter-rotate, 0deg)) !important;
-                transform-origin: 50% 50% !important;
-                transition: transform 0.2s ease-out !important;
-              }
-              .user-gps-arrow {
-                transform: rotate(var(--user-arrow-rot, 0deg)) !important;
-                transform-origin: 50% 50% !important;
-                transition: transform 0.2s ease-out !important;
+                transform-origin: 60px 52px !important;
+                transition: transform 0.35s ease-out !important;
               }
             `}</style>
 
-            {/* Map Container: Full-viewport hardware-accelerated surface */}
+            {/* Oversized Centered Square Map Wrapper: ONLY the map rotates while corners never clip */}
             <div
-              ref={mapContainerRef}
-              className="absolute inset-0 w-full h-full z-0"
+              ref={mapRotationWrapperRef}
+              className="map-rotation-surface absolute top-1/2 left-1/2 z-0"
               style={{
-                '--counter-rotate': '0deg',
-                '--user-arrow-rot': '0deg',
-              } as React.CSSProperties}
-            />
-
-            {/* GPS Direction / Movement Badge in Top-Right */}
-            <div
-              ref={headingBadgeRef}
-              style={{ display: 'none' }}
-              className="absolute top-3 right-3 z-20 flex items-center gap-1.5 px-3 py-1.5 bg-slate-900/95 backdrop-blur-md rounded-2xl border border-slate-700/80 shadow-2xl"
+                width: '160vmax',
+                height: '160vmax',
+                marginLeft: '-80vmax',
+                marginTop: '-80vmax',
+              }}
             >
-              <Navigation className="w-3.5 h-3.5 text-amber-400 transform transition-transform" />
+              <div
+                ref={mapContainerRef}
+                className="w-full h-full"
+              />
+            </div>
+
+            {/* GPS Direction / Heading-Up Badge in Top-Right (tap to reset North-Up) */}
+            <button
+              type="button"
+              ref={headingBadgeRef as any}
+              onClick={resetMapHeading}
+              style={{ display: 'none' }}
+              title={isAr ? 'اضغط لإعادة توجيه الخريطة للشمال' : 'Tap to reset North-Up'}
+              className="absolute top-3 right-3 z-20 flex items-center gap-1.5 px-3 py-1.5 bg-slate-900/95 backdrop-blur-md rounded-2xl border border-slate-700/80 shadow-2xl cursor-pointer hover:bg-slate-800 active:scale-95 transition-all"
+            >
+              <Compass className="w-3.5 h-3.5 text-amber-400" />
               <span ref={headingDegreeTextRef} className="text-xs font-black text-amber-400 font-mono">0°</span>
-              <span className="text-[10px] font-bold text-slate-300">{isAr ? 'تدوير مع المسار' : 'Heading-Up'}</span>
+              <span className="text-[10px] font-bold text-slate-300">{isAr ? 'تدوير الخريطة' : 'Map Rotated'}</span>
+            </button>
+
+            {/* Fixed Upright Zoom Controls (+ / -) */}
+            <div className="absolute bottom-20 left-3 z-20 flex flex-col gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  if (isMapValid(mapInstanceRef.current)) mapInstanceRef.current.zoomIn();
+                }}
+                className="w-9 h-9 rounded-xl bg-slate-900/95 hover:bg-slate-800 text-slate-100 border border-slate-700/80 shadow-xl flex items-center justify-center cursor-pointer active:scale-95 transition-all"
+                title={isAr ? 'تكبير' : 'Zoom in'}
+              >
+                <Plus className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (isMapValid(mapInstanceRef.current)) mapInstanceRef.current.zoomOut();
+                }}
+                className="w-9 h-9 rounded-xl bg-slate-900/95 hover:bg-slate-800 text-slate-100 border border-slate-700/80 shadow-xl flex items-center justify-center cursor-pointer active:scale-95 transition-all"
+                title={isAr ? 'تصغير' : 'Zoom out'}
+              >
+                <Minus className="w-4 h-4" />
+              </button>
             </div>
 
             {/* Primary "موقعي" + "مسار الشوارع النشط" Buttons at Bottom of the Map */}
@@ -1244,7 +1361,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
                       const map = mapInstanceRef.current;
                       if (isMapValid(map) && routeLatLngsRef.current.length > 0) {
                         try {
-                          map.fitBounds(L.polyline(routeLatLngsRef.current).getBounds(), { padding: [60, 60], maxZoom: 16 });
+                          map.fitBounds(L.polyline(routeLatLngsRef.current).getBounds(), { padding: getSafeFitPadding(), maxZoom: 16 });
                         } catch (e) {}
                       }
                     }}

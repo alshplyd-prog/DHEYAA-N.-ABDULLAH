@@ -208,7 +208,7 @@ export const ServerQueriesModal: React.FC<ServerQueriesModalProps> = ({
   const localRemainingAmount = appContracts.reduce((sum, c) => sum + (Number(c.remainingBalance) || 0), 0);
 
   const uniqueLocalCustomersCount = new Set(appContracts.map(c => c.customerName?.trim()).filter(Boolean)).size;
-  const displayLocalCustomersCount = Math.max(uniqueLocalCustomersCount, localContractsCount);
+  const displayLocalCustomersCount = uniqueLocalCustomersCount;
 
   const cleanAppPayments = appPayments.filter(p => p && p.id && (Number(p.amountPaid ?? p.amount) > 0) && !p.id.startsWith('contract_') && !p.id.startsWith('emp_') && !p.id.startsWith('item_'));
   const localPaymentsCount = cleanAppPayments.length;
@@ -228,7 +228,8 @@ export const ServerQueriesModal: React.FC<ServerQueriesModalProps> = ({
       c.longitude != null &&
       !isNaN(Number(c.latitude)) &&
       !isNaN(Number(c.longitude)) &&
-      Number(c.latitude) !== 0
+      Number(c.latitude) !== 0 &&
+      Number(c.longitude) !== 0
   );
   const localLocationsCount = localContractsWithLocation.length;
 

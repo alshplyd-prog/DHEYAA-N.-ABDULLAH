@@ -202,6 +202,8 @@ export const ContractFormModal: React.FC<ContractFormModalProps> = ({
     customerName,
     customerPhone,
     customerAddress,
+    latitude,
+    longitude,
     selectedListId,
     selectedItemId,
     itemQuantity,
@@ -427,15 +429,26 @@ export const ContractFormModal: React.FC<ContractFormModalProps> = ({
     const selectedItem = inventory.find(i => i.id === selectedItemId);
     const itemPurchasePrice = selectedItem?.purchasePrice || 0;
 
+    const wasLocationCleared = latitude === null || longitude === null;
+    const hadOriginalLocation = Boolean(editingContract?.latitude != null && Number(editingContract.latitude) !== 0);
+    const hasNewLocation = resolvedLatitude != null && resolvedLongitude != null && Number(resolvedLatitude) !== 0 && Number(resolvedLongitude) !== 0;
+    const nowIso = new Date().toISOString();
+    const resolvedLocUpdatedAt = hasNewLocation
+      ? ((latitude !== editingContract?.latitude || longitude !== editingContract?.longitude) ? nowIso : (editingContract?.locationUpdatedAt || nowIso))
+      : null;
+    const resolvedLocClearedAt = (wasLocationCleared || (hadOriginalLocation && !hasNewLocation)) ? nowIso : (hasNewLocation ? null : (editingContract?.locationClearedAt ?? null));
+
     clearDraft();
     onSave(
       {
         customerName: trimmedName,
         customerPhone: customerPhone.trim(),
         customerAddress: customerAddress.trim() || '',
-        latitude: resolvedLatitude != null ? resolvedLatitude : (resolvedLatitude === null ? null as any : undefined),
-        longitude: resolvedLongitude != null ? resolvedLongitude : (resolvedLongitude === null ? null as any : undefined),
-        locationAddress: resolvedLocationAddress || '',
+        latitude: hasNewLocation ? Number(resolvedLatitude) : (wasLocationCleared ? null : undefined),
+        longitude: hasNewLocation ? Number(resolvedLongitude) : (wasLocationCleared ? null : undefined),
+        locationAddress: hasNewLocation ? (resolvedLocationAddress || '') : (wasLocationCleared ? null : ''),
+        locationUpdatedAt: resolvedLocUpdatedAt,
+        locationClearedAt: resolvedLocClearedAt,
         itemId: selectedItemId || '',
         itemName: effectiveItemName || (isAr ? 'مادة مبيعات' : 'Sales Item'),
         itemQuantity: itemQuantity,

@@ -16,10 +16,11 @@ export interface InstallmentContract {
   customerName: string;
   customerPhone: string;
   customerAddress?: string;
-  latitude?: number;
-  longitude?: number;
-  locationAddress?: string;
-  locationUpdatedAt?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  locationAddress?: string | null;
+  locationUpdatedAt?: string | null;
+  locationClearedAt?: string | null;
   itemId?: string;
   itemName: string;
   itemQuantity?: number;
