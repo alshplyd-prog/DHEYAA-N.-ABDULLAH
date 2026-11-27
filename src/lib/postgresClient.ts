@@ -1848,7 +1848,14 @@ export async function reconcileAllLocalWithDatabase(options?: {
 
     if (res && res.ok) {
       const data = await res.json().catch(() => null);
-      if (data && data.success) {
+      const hasValidSyncAllData =
+        data &&
+        data.success &&
+        ((Array.isArray(data.contracts) && data.contracts.length > 0) ||
+          (Array.isArray(data.payments) && data.payments.length > 0) ||
+          getLocalCache<any>('contracts').length === 0);
+
+      if (hasValidSyncAllData) {
         // Sync deleted IDs
         if (Array.isArray(data.deletedRecordIds)) {
           markRecordAsDeleted(data.deletedRecordIds);
@@ -1918,6 +1925,9 @@ export async function reconcileAllLocalWithDatabase(options?: {
           totalInserted: cCount + pCount,
           message: `تمت المطابقة الشاملة بنجاح (${cCount} عقد، ${pCount} دفعة)`,
         };
+      } else if (data && data.success && canTrySyncAll) {
+        // /api/sync/all returned empty arrays while client expects data — fall through to batched table pulls
+        syncAllCooldownUntil = Date.now() + 3 * 60 * 1000;
       }
     } else if (canTrySyncAll) {
       // /api/sync/all timed out or failed — put on 3-minute cooldown so batched table pulls execute immediately
@@ -2617,8 +2627,9 @@ export const deleteContractFromDatabase = async (id: string | any, ..._rest: any
   const qPromise = addToPendingQueue('DELETE_CONTRACT', { id: docId });
   await Promise.race([
     saveToPostgres(`contracts/${docId}`, 'DELETE', undefined, qPromise),
-    new Promise((resolve) => setTimeout(resolve, 2000)),
+    new Promise((resolve) => setTimeout(resolve, 15000)),
   ]);
+  flushPendingQueue().catch(() => {});
 };
 export const deleteContractFromFirestore = deleteContractFromDatabase;
 
@@ -2632,8 +2643,9 @@ export const deleteCustomerFromDatabase = async (id: string | any, ..._rest: any
   const qPromise = addToPendingQueue('DELETE_CUSTOMER', { id: docId });
   await Promise.race([
     saveToPostgres(`customers/${docId}`, 'DELETE', undefined, qPromise),
-    new Promise((resolve) => setTimeout(resolve, 2000)),
+    new Promise((resolve) => setTimeout(resolve, 15000)),
   ]);
+  flushPendingQueue().catch(() => {});
 };
 export const deleteCustomerFromFirestore = deleteCustomerFromDatabase;
 
@@ -3010,8 +3022,9 @@ export const deletePaymentFromDatabase = async (id: string | any, _contracts?: a
 
   await Promise.race([
     Promise.all([delPayPromise, saveContractPromise]),
-    new Promise((resolve) => setTimeout(resolve, 2000)),
+    new Promise((resolve) => setTimeout(resolve, 15000)),
   ]);
+  flushPendingQueue().catch(() => {});
 
   notifySubscribersRefresh();
 };

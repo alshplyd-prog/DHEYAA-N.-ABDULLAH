@@ -13767,71 +13767,6 @@
     "isEdited": false
   },
   {
-    "id": "pay_d4c163ea-a49e-424e-8d82-7b443fc4a361",
-    "contractId": "contract-1",
-    "customerName": "أحمد محمد عبد الله",
-    "amountPaid": 5000,
-    "paymentDate": "2026-11-23",
-    "repName": "ضياء المحاسب",
-    "note": "",
-    "fundId": "fund-4",
-    "updatedAt": null,
-    "createdAt": "2026-11-23T08:17:55.530Z",
-    "isEdited": false
-  },
-  {
-    "id": "pay_257450b0-0094-475a-89d0-b9b998ec129f",
-    "contractId": "contract-1",
-    "customerName": "أحمد محمد عبد الله",
-    "amountPaid": 5000,
-    "paymentDate": "2026-11-24",
-    "repName": "ضياء المحاسب",
-    "note": "",
-    "fundId": "fund-4",
-    "updatedAt": null,
-    "createdAt": "2026-11-24T18:15:23.990Z",
-    "isEdited": false
-  },
-  {
-    "id": "pay_e14ce17a-6c91-4151-b18f-c9d7025ad57c",
-    "contractId": "contract-1",
-    "customerName": "أحمد محمد عبد الله",
-    "amountPaid": 5000,
-    "paymentDate": "2026-11-24",
-    "repName": "ضياء المحاسب",
-    "note": "",
-    "fundId": "fund-4",
-    "updatedAt": null,
-    "createdAt": "2026-11-24T19:05:20.388Z",
-    "isEdited": false
-  },
-  {
-    "id": "pay_9d86e30f-7640-4ce7-8960-45850c5a6e06",
-    "contractId": "contract-1",
-    "customerName": "أحمد محمد عبد الله",
-    "amountPaid": 5000,
-    "paymentDate": "2026-11-25",
-    "repName": "ضياء المحاسب",
-    "note": "",
-    "fundId": "fund-4",
-    "updatedAt": null,
-    "createdAt": "2026-11-25T17:30:37.483Z",
-    "isEdited": false
-  },
-  {
-    "id": "pay_0160995a-7cd9-4282-9593-5ebaef5e9d55",
-    "contractId": "contract-1",
-    "customerName": "أحمد محمد عبد الله",
-    "amountPaid": 5000,
-    "paymentDate": "2026-11-25",
-    "repName": "ضياء المحاسب",
-    "note": "",
-    "fundId": "fund-4",
-    "updatedAt": null,
-    "createdAt": "2026-11-25T18:12:50.193Z",
-    "isEdited": false
-  },
-  {
     "id": "pay_d2cd918f-b347-4a21-aba7-d69e422e8056",
     "contractId": "contract_1790065355001_6tpr7",
     "customerName": "محمد ليث علي",
@@ -15142,45 +15077,6 @@
     "fundId": "fund-4",
     "updatedAt": null,
     "createdAt": "2026-11-19T12:00:00.000Z",
-    "isEdited": false
-  },
-  {
-    "id": "pay_f445b0d4-519e-4aa7-9aff-14f8d3d3f7d2",
-    "contractId": "contract-1",
-    "customerName": "أحمد محمد عبد الله",
-    "amountPaid": 5000,
-    "paymentDate": "2026-11-26",
-    "repName": "ضياء المحاسب",
-    "note": "",
-    "fundId": "fund-4",
-    "updatedAt": null,
-    "createdAt": "2026-11-26T19:44:40.871Z",
-    "isEdited": false
-  },
-  {
-    "id": "pay_4b2ba13b-bea8-4738-862f-030bec5b1852",
-    "contractId": "contract_1790065355001_6tpr7",
-    "customerName": "محمد ليث علي",
-    "amountPaid": 10000,
-    "paymentDate": "2026-11-26",
-    "repName": "ضياء المحاسب",
-    "note": "",
-    "fundId": "fund-4",
-    "updatedAt": null,
-    "createdAt": "2026-11-26T19:45:15.894Z",
-    "isEdited": false
-  },
-  {
-    "id": "pay_53428a4a-e728-44e2-a3e7-da2dcfde2dc0",
-    "contractId": "contract_1790065790388_b80hu",
-    "customerName": "مصطفى رزاق مجهول",
-    "amountPaid": 12000,
-    "paymentDate": "2026-11-26",
-    "repName": "ضياء المحاسب",
-    "note": "",
-    "fundId": "fund-4",
-    "updatedAt": null,
-    "createdAt": "2026-11-26T19:45:49.117Z",
     "isEdited": false
   }
 ]

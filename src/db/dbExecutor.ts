@@ -43,12 +43,34 @@ export function isConnectionLevelError(err: any): boolean {
   );
 }
 
+export const hasPgEnvConfigured = (): boolean => {
+  const rawUrl = (process.env.DATABASE_URL || '').trim();
+  const lower = rawUrl.toLowerCase();
+  const isProd = process.env.NODE_ENV === 'production' || process.env.HOSTINGER === 'true';
+  // In development preview (AI Studio), ignore remote VPS database URLs unless running locally on loopback
+  if (!isProd && rawUrl && !lower.includes('127.0.0.1') && !lower.includes('localhost')) {
+    return false;
+  }
+  const hasRealUrl = Boolean(
+    rawUrl &&
+    !lower.includes('supabase.co') &&
+    !lower.includes('postgresql://user:password@') &&
+    !lower.includes('[password]') &&
+    !lower.includes('[your-password]') &&
+    !lower.includes('your-password') &&
+    !/\/database(\?|$)/i.test(rawUrl)
+  );
+  if (hasRealUrl) return true;
+  if (process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) return true;
+  if (process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_DB_NAME) return true;
+  return false;
+};
+
 export const isPgConfigured = (): boolean => {
   return pgReachable === true;
 };
 
 export async function probePgConnection(): Promise<boolean> {
-  if (pgReachable === true) return true;
   if (pgReachable === false && Date.now() - lastPgFailureAt < lastFailureCooldownMs) {
     return false;
   }

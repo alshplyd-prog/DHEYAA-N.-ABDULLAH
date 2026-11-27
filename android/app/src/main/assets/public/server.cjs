@@ -458,11 +458,25 @@ function isConnectionLevelError(err) {
   const code = String(err?.code || "").toUpperCase();
   return code === "ECONNREFUSED" || code === "ETIMEDOUT" || code === "ENOTFOUND" || code === "EHOSTUNREACH" || code === "ECONNRESET" || code === "28000" || code === "28P01" || msg.includes("pg_hba.conf") || msg.includes("rejects connection") || msg.includes("timeout") || msg.includes("connection terminated") || msg.includes("econnrefused") || msg.includes("etimedout") || msg.includes("ehostunreach") || msg.includes("postgresql unavailable") || msg.includes("connect");
 }
+var hasPgEnvConfigured = () => {
+  const rawUrl = (process.env.DATABASE_URL || "").trim();
+  const lower = rawUrl.toLowerCase();
+  const isProd = process.env.NODE_ENV === "production" || process.env.HOSTINGER === "true";
+  if (!isProd && rawUrl && !lower.includes("127.0.0.1") && !lower.includes("localhost")) {
+    return false;
+  }
+  const hasRealUrl = Boolean(
+    rawUrl && !lower.includes("supabase.co") && !lower.includes("postgresql://user:password@") && !lower.includes("[password]") && !lower.includes("[your-password]") && !lower.includes("your-password") && !/\/database(\?|$)/i.test(rawUrl)
+  );
+  if (hasRealUrl) return true;
+  if (process.env.DB_USER && process.env.DB_PASSWORD && process.env.DB_NAME) return true;
+  if (process.env.SQL_HOST && process.env.SQL_USER && process.env.SQL_DB_NAME) return true;
+  return false;
+};
 var isPgConfigured = () => {
   return pgReachable === true;
 };
 async function probePgConnection() {
-  if (pgReachable === true) return true;
   if (pgReachable === false && Date.now() - lastPgFailureAt < lastFailureCooldownMs) {
     return false;
   }
@@ -1983,8 +1997,8 @@ function isRunningOnUpstreamHost() {
     const parsed = new URL(UPSTREAM_SERVER_URL);
     const upHost = parsed.hostname.toLowerCase();
     const upPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
-    const localPort = String(process.env.PORT || 3e3);
-    if (upPort !== localPort) return false;
+    const localPorts = /* @__PURE__ */ new Set(["3000", String(process.env.PORT || "3000")]);
+    if (!localPorts.has(upPort)) return false;
     if (upHost === "localhost" || upHost === "127.0.0.1") return true;
     const nets = import_os2.default.networkInterfaces();
     for (const ifaceList of Object.values(nets)) {
@@ -3253,19 +3267,13 @@ async function startServer() {
   } catch (seedErr) {
     console.warn("[FileDB Seed] Notice:", seedErr);
   }
-  const pgOkAtStartup = await probePgConnection().catch(() => false);
-  if (!pgOkAtStartup) {
-    console.log("[DB] Direct PostgreSQL unreachable; syncing from upstream server / FileDB mode.");
-    syncFromUpstreamServer(true).catch(() => {
-    });
-    setInterval(() => {
-      if (!isPgConfigured()) {
-        flushUpstreamOutbox().catch(() => 0);
-        syncFromUpstreamServer(false).catch(() => false);
-      }
-    }, 2e4);
-  } else {
-    (async () => {
+  let pgSchemaInitInFlight = null;
+  let pgSchemaInitialized = false;
+  const ensurePgSchemaAndServices = () => {
+    if (pgSchemaInitialized || pgSchemaInitInFlight || !isPgConfigured()) {
+      return pgSchemaInitInFlight || Promise.resolve();
+    }
+    pgSchemaInitInFlight = (async () => {
       await initializeDatabaseSchema();
       if (isPgConfigured()) {
         await executePg(`
@@ -3304,14 +3312,84 @@ async function startServer() {
         `).catch(() => {
         });
         fileDb.delete("payment_conflicts", "__appointments_sync_master__");
+        pgSchemaInitialized = true;
       }
       await cleanupDuplicateEntities().catch((e) => console.warn("Deduplication cleanup notice:", e));
       await recalculateAllFundBalancesInPg().catch((e) => console.warn("Recalculate balances notice:", e));
       await initVapidKeys().catch((e) => console.warn("Vapid init notice:", e));
       await initPushSubscriptionsTable().catch((e) => console.warn("Push subs table notice:", e));
-    })().catch((err) => console.warn("Background DB initialization notice:", err));
+      if (isPgConfigured()) {
+        try {
+          const [salesCntRows, payCntRows] = await Promise.all([
+            executePg(`SELECT COUNT(*) as count FROM sales`).catch(() => []),
+            executePg(`SELECT COUNT(*) as count FROM payments`).catch(() => [])
+          ]);
+          const pgSalesCount = Number(salesCntRows?.[0]?.count || 0);
+          const pgPayCount = Number(payCntRows?.[0]?.count || 0);
+          const localContracts = fileDb.get("contracts") || [];
+          const localPayments = fileDb.get("payments") || [];
+          if (pgSalesCount < localContracts.length || pgPayCount < localPayments.length || pgSalesCount === 0 && (localContracts.length > 0 || localPayments.length > 0)) {
+            console.log(`[PG Auto-Seed] Synchronizing ${localContracts.length} contracts & ${localPayments.length} payments from FileDB into PostgreSQL (PG had ${pgSalesCount}/${pgPayCount})...`);
+            const seedCollections = [
+              { key: "reps", type: "CREATE_REP" },
+              { key: "cash_funds", type: "CREATE_FUND" },
+              { key: "customer_lists", type: "CREATE_CUSTOMER_LIST" },
+              { key: "inventory_items", type: "CREATE_INVENTORY" },
+              { key: "employees", type: "CREATE_EMPLOYEE" },
+              { key: "contracts", type: "CREATE_CONTRACT" },
+              { key: "payments", type: "CREATE_PAYMENT" },
+              { key: "fund_transactions", type: "CREATE_FUND_TRANSACTION" },
+              { key: "employee_transactions", type: "CREATE_EMPLOYEE_TRANSACTION" },
+              { key: "appointments", type: "CREATE_APPOINTMENT" }
+            ];
+            for (const col of seedCollections) {
+              const items = fileDb.get(col.key) || [];
+              for (const item of items) {
+                if (item?.id) {
+                  await processSingleSyncAction({ type: col.type, payload: item }, true).catch(() => false);
+                }
+              }
+            }
+            await syncContractBalancesInPgAndFileDb().catch(() => {
+            });
+            await recalculateAllFundBalancesInPg().catch(() => {
+            });
+            console.log("[PG Auto-Seed] Completed PostgreSQL migration from FileDB.");
+          }
+        } catch (seedPgErr) {
+          console.warn("[PG Auto-Seed] Notice:", seedPgErr);
+        }
+      }
+    })().catch((err) => console.warn("Background DB initialization notice:", err)).finally(() => {
+      pgSchemaInitInFlight = null;
+    });
+    return pgSchemaInitInFlight;
+  };
+  const pgOkAtStartup = await probePgConnection().catch(() => false);
+  if (!pgOkAtStartup) {
+    console.log("[DB] Direct PostgreSQL unreachable at startup; activating upstream bridge / FileDB mode.");
+    if (!hasPgEnvConfigured()) {
+      syncFromUpstreamServer(true).catch(() => {
+      });
+    }
+    setInterval(async () => {
+      if (!isPgConfigured()) {
+        if (hasPgEnvConfigured()) {
+          const recovered = await probePgConnection().catch(() => false);
+          if (recovered) {
+            console.log("[DB] Direct PostgreSQL connection recovered!");
+            void ensurePgSchemaAndServices();
+            return;
+          }
+        }
+        flushUpstreamOutbox().catch(() => 0);
+        syncFromUpstreamServer(false).catch(() => false);
+      }
+    }, 15e3);
+  } else {
+    void ensurePgSchemaAndServices();
   }
-  console.log("SERVER DB CONFIG:", isPgConfigured() ? "PostgreSQL + FileDB" : "Local FileDB Engine");
+  console.log("SERVER DB CONFIG:", isPgConfigured() ? "PostgreSQL + FileDB" : "Upstream Bridge + Local FileDB Engine");
   app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
@@ -3351,10 +3429,178 @@ async function startServer() {
     }
     next();
   });
+  app.use(async (req, res, next) => {
+    const cleanUrl = req.originalUrl || req.url || "";
+    if (isPgConfigured() || !UPSTREAM_SERVER_URL || process.env.DISABLE_UPSTREAM_SYNC === "true" || isRunningOnUpstreamHost() || isRequestMatchingUpstream(req) || !cleanUrl.startsWith("/api/") || req.path === "/api/health" || req.path.startsWith("/api/upstream/") || req.path.startsWith("/api/push/") || req.path.startsWith("/api/seed")) {
+      return next();
+    }
+    try {
+      const pendingOutbox = fileDb.get(UPSTREAM_OUTBOX_KEY) || [];
+      if (Array.isArray(pendingOutbox) && pendingOutbox.length > 0) {
+        await flushUpstreamOutbox().catch(() => 0);
+      }
+      const isHeavyRoute = req.path.startsWith("/api/sync/batch") || req.path.startsWith("/api/sync/reconcile") || req.path.startsWith("/api/sync/all") || req.path.startsWith("/api/sync/verify-match") || req.path.startsWith("/api/sync/beacon");
+      const timeoutMs = isHeavyRoute ? 28e3 : 15e3;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const method = (req.method || "GET").toUpperCase();
+      const hasBody = method !== "GET" && method !== "HEAD" && req.body !== void 0;
+      const forwardHeaders = {
+        Accept: "application/json",
+        "x-alkarrar-forwarded": "1",
+        "x-alkarrar-origin-id": SERVER_INSTANCE_ID
+      };
+      if (hasBody) {
+        forwardHeaders["Content-Type"] = "application/json";
+      }
+      if (typeof req.headers.authorization === "string" && req.headers.authorization) {
+        forwardHeaders["Authorization"] = req.headers.authorization;
+      }
+      const forwardPath = req.url && req.url.startsWith("/api/") ? req.url : cleanUrl;
+      const targetUrl = `${UPSTREAM_SERVER_URL}${forwardPath}`;
+      const upRes = await fetch(targetUrl, {
+        method,
+        signal: controller.signal,
+        headers: forwardHeaders,
+        body: hasBody ? typeof req.body === "string" ? req.body : JSON.stringify(req.body) : void 0
+      }).finally(() => clearTimeout(timer));
+      const ct = (upRes.headers.get("content-type") || "").toLowerCase();
+      if (ct.includes("text/html") || upRes.status >= 500) {
+        upstreamConnected = false;
+        return next();
+      }
+      const rawText = await upRes.text();
+      let parsedJson = null;
+      try {
+        parsedJson = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        upstreamConnected = false;
+        return next();
+      }
+      upstreamConnected = true;
+      res.locals.upstreamSynced = true;
+      if (upRes.ok && method === "GET" && req.path === "/api/sync/all" && parsedJson && (!Array.isArray(parsedJson.contracts) || parsedJson.contracts.length === 0) && (!Array.isArray(parsedJson.payments) || parsedJson.payments.length === 0)) {
+        const [
+          uContracts,
+          uPayments,
+          uCustomerLists,
+          uFunds,
+          uInventory,
+          uReps,
+          uEmployees,
+          uAppointments,
+          uFundTx,
+          uEmpTx,
+          uConflicts,
+          uDeleted
+        ] = await Promise.all([
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/contracts`, 18e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payments`, 18e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/customer-lists`, 12e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/funds`, 12e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/inventory`, 12e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/reps`, 12e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employees`, 12e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/appointments`, 12e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/fund-transactions`, 18e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/employee-transactions`, 12e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/payment-conflicts`, 12e3),
+          fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/deleted-records`, 1e4)
+        ]);
+        if (Array.isArray(uContracts) && uContracts.length > 0) parsedJson.contracts = uContracts;
+        if (Array.isArray(uPayments) && uPayments.length > 0) parsedJson.payments = uPayments;
+        if (Array.isArray(uCustomerLists) && uCustomerLists.length > 0) parsedJson.customerLists = uCustomerLists;
+        if (Array.isArray(uFunds) && uFunds.length > 0) parsedJson.funds = uFunds;
+        if (Array.isArray(uInventory) && uInventory.length > 0) parsedJson.inventory = uInventory;
+        if (Array.isArray(uReps) && uReps.length > 0) parsedJson.reps = preserveRealRepCodes(uReps);
+        if (Array.isArray(uEmployees) && uEmployees.length > 0) parsedJson.employees = uEmployees;
+        if (Array.isArray(uAppointments)) parsedJson.appointments = uAppointments;
+        if (Array.isArray(uFundTx) && uFundTx.length > 0) parsedJson.fundTransactions = uFundTx;
+        if (Array.isArray(uEmpTx)) parsedJson.employeeTransactions = uEmpTx;
+        if (Array.isArray(uConflicts)) parsedJson.paymentConflicts = uConflicts;
+        if (Array.isArray(uDeleted)) {
+          parsedJson.deletedRecordIds = uDeleted.map((d) => d?.record_id || d?.id || d).filter(Boolean);
+        }
+      }
+      if (upRes.ok && parsedJson && typeof parsedJson === "object") {
+        try {
+          if (method === "GET") {
+            if (req.path === "/api/contracts" && Array.isArray(parsedJson) && parsedJson.length > 0) {
+              fileDb.setAll("contracts", parsedJson);
+              const existingCustomers = fileDb.get("customers") || [];
+              fileDb.setAll("customers", buildCustomersFromContracts(parsedJson, existingCustomers));
+            } else if (req.path === "/api/payments" && Array.isArray(parsedJson) && parsedJson.length > 0) {
+              fileDb.setAll("payments", parsedJson);
+            } else if (req.path === "/api/funds" && Array.isArray(parsedJson) && parsedJson.length > 0) {
+              fileDb.setAll("cash_funds", parsedJson);
+              fileDb.setAll("funds", parsedJson);
+            } else if (req.path === "/api/reps" && Array.isArray(parsedJson) && parsedJson.length > 0) {
+              fileDb.setAll("reps", preserveRealRepCodes(parsedJson));
+            } else if (req.path === "/api/customer-lists" && Array.isArray(parsedJson) && parsedJson.length > 0) {
+              fileDb.setAll("customer_lists", parsedJson);
+            } else if (req.path === "/api/inventory" && Array.isArray(parsedJson) && parsedJson.length > 0) {
+              fileDb.setAll("inventory_items", parsedJson);
+            } else if (req.path === "/api/employees" && Array.isArray(parsedJson) && parsedJson.length > 0) {
+              fileDb.setAll("employees", parsedJson);
+            } else if (req.path === "/api/sync/all") {
+              if (Array.isArray(parsedJson.contracts) && parsedJson.contracts.length > 0) {
+                fileDb.setAll("contracts", parsedJson.contracts);
+                const existingCustomers = fileDb.get("customers") || [];
+                fileDb.setAll("customers", buildCustomersFromContracts(parsedJson.contracts, existingCustomers));
+              }
+              if (Array.isArray(parsedJson.payments) && parsedJson.payments.length > 0) {
+                fileDb.setAll("payments", parsedJson.payments);
+              }
+              if (Array.isArray(parsedJson.funds) && parsedJson.funds.length > 0) {
+                fileDb.setAll("cash_funds", parsedJson.funds);
+                fileDb.setAll("funds", parsedJson.funds);
+              }
+              if (Array.isArray(parsedJson.reps) && parsedJson.reps.length > 0) {
+                fileDb.setAll("reps", preserveRealRepCodes(parsedJson.reps));
+              }
+              if (Array.isArray(parsedJson.customerLists) && parsedJson.customerLists.length > 0) {
+                fileDb.setAll("customer_lists", parsedJson.customerLists);
+              }
+              if (Array.isArray(parsedJson.inventory) && parsedJson.inventory.length > 0) {
+                fileDb.setAll("inventory_items", parsedJson.inventory);
+              }
+              if (Array.isArray(parsedJson.employees) && parsedJson.employees.length > 0) {
+                fileDb.setAll("employees", parsedJson.employees);
+              }
+              if (Array.isArray(parsedJson.appointments)) {
+                fileDb.setAll("appointments", parsedJson.appointments);
+              }
+              if (Array.isArray(parsedJson.fundTransactions) && parsedJson.fundTransactions.length > 0) {
+                fileDb.setAll("fund_transactions", parsedJson.fundTransactions);
+              }
+              if (Array.isArray(parsedJson.employeeTransactions)) {
+                fileDb.setAll("employee_transactions", parsedJson.employeeTransactions);
+              }
+              if (Array.isArray(parsedJson.paymentConflicts)) {
+                fileDb.setAll("payment_conflicts", parsedJson.paymentConflicts);
+              }
+            } else if (req.path === "/api/sync/version" && parsedJson.syncVersion !== void 0) {
+              const v = Number(parsedJson.syncVersion);
+              if (!isNaN(v) && v > globalSyncVersion) {
+                globalSyncVersion = v;
+              }
+            }
+          } else {
+            globalSyncVersion = Date.now();
+          }
+        } catch (cacheErr) {
+        }
+      }
+      return res.status(upRes.status).json(parsedJson);
+    } catch {
+      upstreamConnected = false;
+      return next();
+    }
+  });
   app.use((req, res, next) => {
     if (req.path.startsWith("/api/") && ["POST", "PUT", "PATCH", "DELETE"].includes(req.method) && !req.path.startsWith("/api/push/") && !req.path.startsWith("/api/upstream/") && !req.path.startsWith("/api/seed")) {
       res.on("finish", () => {
-        if (!isPgConfigured() && UPSTREAM_SERVER_URL && process.env.DISABLE_UPSTREAM_SYNC !== "true" && res.statusCode >= 200 && res.statusCode < 300 && !isRequestMatchingUpstream(req)) {
+        if (!res.locals?.upstreamSynced && !isPgConfigured() && UPSTREAM_SERVER_URL && process.env.DISABLE_UPSTREAM_SYNC !== "true" && res.statusCode >= 200 && res.statusCode < 300 && !isRequestMatchingUpstream(req)) {
           enqueueAndForwardUpstreamMutation(req.method, req.originalUrl, req.body);
         }
       });
@@ -3363,18 +3609,34 @@ async function startServer() {
   });
   app.get("/api/health", async (req, res) => {
     let deletedCount = 0;
+    let upstreamDbType = null;
     try {
+      if (!isPgConfigured() && hasPgEnvConfigured()) {
+        const recovered = await probePgConnection().catch(() => false);
+        if (recovered) {
+          void ensurePgSchemaAndServices();
+        }
+      }
       if (isPgConfigured()) {
         const dRes = await Promise.race([
           executePg("SELECT COUNT(*) as count FROM deleted_records").catch(() => []),
           new Promise((resolve) => setTimeout(() => resolve([]), 2e3))
         ]);
         if (dRes && dRes[0]?.count) deletedCount = Number(dRes[0].count);
-      } else {
-        await Promise.race([
-          syncFromUpstreamServer(false).catch(() => false),
-          new Promise((resolve) => setTimeout(resolve, 4500))
-        ]);
+      } else if (UPSTREAM_SERVER_URL && process.env.DISABLE_UPSTREAM_SYNC !== "true" && !isRunningOnUpstreamHost()) {
+        const upHealth = await fetchJsonWithTimeout(`${UPSTREAM_SERVER_URL}/api/health`, 5500);
+        if (upHealth && upHealth.status === "ok") {
+          upstreamConnected = true;
+          upstreamDbType = upHealth.database || "postgresql";
+          if (upHealth.deletedCount !== void 0) deletedCount = Number(upHealth.deletedCount) || 0;
+          if (upHealth.syncVersion) {
+            const v = Number(upHealth.syncVersion);
+            if (!isNaN(v) && v > globalSyncVersion) globalSyncVersion = v;
+          }
+          void flushUpstreamOutbox().catch(() => 0);
+        } else {
+          upstreamConnected = false;
+        }
       }
     } catch (e) {
     }
@@ -3382,6 +3644,7 @@ async function startServer() {
       status: "ok",
       database: isPgConfigured() ? "postgresql" : upstreamConnected ? "upstream-postgresql" : "filedb",
       upstreamConnected,
+      upstreamDatabase: upstreamDbType,
       pgConfigured: isPgConfigured(),
       upstreamOutboxPending: (fileDb.get(UPSTREAM_OUTBOX_KEY) || []).length,
       persistent: true,
@@ -6902,7 +7165,8 @@ async function startServer() {
   });
   app.get("/api/reports/totals", async (req, res) => {
     try {
-      if (isPgConfigured()) {
+      const pgLive = await probePgConnection().catch(() => false);
+      if (pgLive) {
         await syncCustomersTableInPg().catch(() => {
         });
         const todayStr2 = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
@@ -7092,54 +7356,89 @@ async function startServer() {
         const fundTxStats = fundTxStatsRes[0] || {};
         const customerListsStats = customerListsStatsRes[0] || {};
         const locationsStats = locationsStatsRes[0] || {};
+        const fdContracts = fileDb.get("contracts") || [];
+        const fdPayments = fileDb.get("payments") || [];
+        const fdFunds = fileDb.get("cash_funds") || fileDb.get("funds") || [];
+        const fdReps = fileDb.get("reps") || [];
+        const fdInventory = fileDb.get("inventory_items") || fileDb.get("inventory") || [];
+        const fdEmployees = fileDb.get("employees") || [];
+        const pgTotalContracts = Number(salesStats.total_contracts || 0);
+        const pgTotalPayments = Number(paymentStats.total_payments_count || 0);
+        if (pgTotalContracts === 0 && fdContracts.length > 0) {
+          (async () => {
+            try {
+              for (const c of fdContracts) {
+                if (c?.id) await processSingleSyncAction({ type: "CREATE_CONTRACT", payload: c }, true).catch(() => {
+                });
+              }
+              for (const p of fdPayments) {
+                if (p?.id) await processSingleSyncAction({ type: "CREATE_PAYMENT", payload: p }, true).catch(() => {
+                });
+              }
+            } catch {
+            }
+          })();
+        }
+        const totalContracts = pgTotalContracts > 0 ? pgTotalContracts : fdContracts.length;
+        const totalPaymentsCount = pgTotalPayments > 0 ? pgTotalPayments : fdPayments.length;
+        const totalSalesAmount2 = Number(salesStats.total_sales_amount || 0) > 0 ? Number(salesStats.total_sales_amount) : fdContracts.reduce((s, c) => s + (Number(c.totalPrice) || 0), 0);
+        const totalPaidAmount2 = Number(salesStats.total_paid_amount || 0) > 0 ? Number(salesStats.total_paid_amount) : fdContracts.reduce((s, c) => s + (Number(c.totalPaid) || 0), 0);
+        const totalRemainingBalance2 = Number(salesStats.total_remaining_balance || 0) > 0 ? Number(salesStats.total_remaining_balance) : fdContracts.reduce((s, c) => s + (Number(c.remainingBalance) || 0), 0);
+        const totalAdvancePayment2 = Number(salesStats.total_advance_payment || 0) > 0 ? Number(salesStats.total_advance_payment) : fdContracts.reduce((s, c) => s + (Number(c.advancePayment) || 0), 0);
+        const totalPaymentsAmount2 = Number(paymentStats.total_payments_amount || 0) > 0 ? Number(paymentStats.total_payments_amount) : fdPayments.reduce((s, p) => s + (Number(p.amount ?? p.amountPaid) || 0), 0);
+        const totalFundsCount = Number(fundsStats.funds_count || 0) > 0 ? Number(fundsStats.funds_count) : fdFunds.length;
+        const totalFundsBalance2 = Number(fundsStats.total_funds_balance || 0) !== 0 ? Number(fundsStats.total_funds_balance) : fdFunds.reduce((s, f) => s + (Number(f.balance ?? f.current_balance) || 0), 0);
+        const totalRepsCount = Number(repsStats.total_reps || 0) > 0 ? Number(repsStats.total_reps) : fdReps.length;
+        const totalEmployeesCount = Number(employeesStats.total_employees || 0) > 0 ? Number(employeesStats.total_employees) : fdEmployees.length;
+        const totalCustomersCount = Number(customersStats.total_customers || 0) > 0 ? Number(customersStats.total_customers) : new Set(fdContracts.map((c) => c.customerName?.trim()).filter(Boolean)).size;
         return res.json({
           success: true,
           database: "postgresql",
           timestamp: (/* @__PURE__ */ new Date()).toISOString(),
           contracts: {
-            total: salesStats.total_contracts || 0,
-            active: salesStats.active_contracts || 0,
-            completed: salesStats.completed_contracts || 0,
-            totalSalesAmount: salesStats.total_sales_amount || 0,
-            totalPaidAmount: salesStats.total_paid_amount || 0,
-            totalRemainingBalance: salesStats.total_remaining_balance || 0,
-            totalAdvancePayment: salesStats.total_advance_payment || 0
+            total: totalContracts,
+            active: Math.max(salesStats.active_contracts || 0, fdContracts.filter((c) => c.status === "active" || !c.status).length),
+            completed: Math.max(salesStats.completed_contracts || 0, fdContracts.filter((c) => c.status === "completed").length),
+            totalSalesAmount: totalSalesAmount2,
+            totalPaidAmount: totalPaidAmount2,
+            totalRemainingBalance: totalRemainingBalance2,
+            totalAdvancePayment: totalAdvancePayment2
           },
           payments: {
-            totalCount: paymentStats.total_payments_count || 0,
-            totalAmount: paymentStats.total_payments_amount || 0,
+            totalCount: totalPaymentsCount,
+            totalAmount: totalPaymentsAmount2,
             todayAmount: paymentStats.today_payments_amount || 0,
             monthAmount: paymentStats.month_payments_amount || 0
           },
           funds: {
-            count: fundsStats.funds_count || 0,
-            totalBalance: fundsStats.total_funds_balance || 0,
+            count: totalFundsCount,
+            totalBalance: totalFundsBalance2,
             transactionsCount: fundTxStats.total_fund_transactions || 0
           },
           inventory: {
-            totalItems: inventoryStats.total_inventory_items || 0,
-            totalQuantity: inventoryStats.total_inventory_quantity || 0,
+            totalItems: Math.max(inventoryStats.total_inventory_items || 0, fdInventory.length),
+            totalQuantity: Math.max(inventoryStats.total_inventory_quantity || 0, fdInventory.reduce((s, i) => s + (Number(i.quantity) || 0), 0)),
             totalValue: inventoryStats.total_inventory_value || 0
           },
           employees: {
-            total: employeesStats.total_employees || 0,
-            active: employeesStats.active_employees || 0
+            total: totalEmployeesCount,
+            active: Math.max(employeesStats.active_employees || 0, totalEmployeesCount)
           },
           reps: {
-            total: repsStats.total_reps || 0,
-            active: repsStats.active_reps || 0
+            total: totalRepsCount,
+            active: Math.max(repsStats.active_reps || 0, totalRepsCount)
           },
           customers: {
-            total: customersStats.total_customers || 0,
-            totalPaid: customersStats.total_paid || 0,
-            totalRemaining: customersStats.total_remaining || 0
+            total: totalCustomersCount,
+            totalPaid: Math.max(customersStats.total_paid || 0, totalPaidAmount2),
+            totalRemaining: Math.max(customersStats.total_remaining || 0, totalRemainingBalance2)
           },
           lists: {
-            count: customerListsStats.total_lists || 0
+            count: Math.max(customerListsStats.total_lists || 0, new Set(fdContracts.map((c) => c.listId || c.listName).filter(Boolean)).size)
           },
           locations: {
-            total: locationsStats.total_locations || 0,
-            customerLocations: locationsStats.unique_customers_with_locations || locationsStats.total_locations || 0,
+            total: Math.max(locationsStats.total_locations || 0, fdContracts.filter((c) => c.latitude != null && c.longitude != null && Number(c.latitude) !== 0).length),
+            customerLocations: Math.max(locationsStats.unique_customers_with_locations || 0, fdContracts.filter((c) => c.latitude != null && c.longitude != null && Number(c.latitude) !== 0).length),
             repLocations: locationsStats.rep_locations_count || 0
           },
           diagnostics: {
@@ -8651,22 +8950,27 @@ async function startServer() {
         const deletedRecordIds = (deletedRows || []).map((r) => r.record_id).filter(
           (id) => !protectedEmpIds.has(String(id)) && !activeContractIds.has(String(id)) && !activePaymentIds.has(String(id)) && !activeItemIds.has(String(id)) && !activeRepIds.has(String(id)) && !activeFundIds.has(String(id)) && !activeListIds.has(String(id)) && !activeEmpIds.has(String(id))
         );
-        return res.json({
-          success: true,
-          serverTimestamp: (/* @__PURE__ */ new Date()).toISOString(),
-          contracts,
-          payments: payments2,
-          inventory,
-          reps: reps2,
-          funds,
-          customerLists: customerLists2,
-          employees: employees2,
-          fundTransactions: fundTransactions2,
-          employeeTransactions: employeeTransactions2,
-          paymentConflicts: paymentConflicts2,
-          appointments,
-          deletedRecordIds
-        });
+        const hasFileDbContracts = (fileDb.get("contracts") || []).length > 0;
+        const hasFileDbPayments = (fileDb.get("payments") || []).length > 0;
+        if (contracts.length > 0 || payments2.length > 0 || !hasFileDbContracts && !hasFileDbPayments) {
+          return res.json({
+            success: true,
+            serverTimestamp: (/* @__PURE__ */ new Date()).toISOString(),
+            contracts,
+            payments: payments2,
+            inventory,
+            reps: reps2,
+            funds,
+            customerLists: customerLists2,
+            employees: employees2,
+            fundTransactions: fundTransactions2,
+            employeeTransactions: employeeTransactions2,
+            paymentConflicts: paymentConflicts2,
+            appointments,
+            deletedRecordIds
+          });
+        }
+        console.warn("[Sync/All] PostgreSQL returned 0 contracts & 0 payments while FileDB has data; serving FileDB fallback.");
       }
       if (!isPgConfigured()) {
         await syncFromUpstreamServer(false).catch(() => {
@@ -9299,8 +9603,8 @@ async function startServer() {
       const missingEmployeeIds = clientEmployeeIds.filter((id) => !foundEmployeeSet.has(id) && !deletedSet.has(id));
       const totalMissing = missingContractIds.length + missingPaymentIds.length + missingInventoryIds.length + missingRepIds.length + missingFundIds.length + missingCustomerListIds.length + missingEmployeeIds.length;
       const matched = totalMissing === 0;
-      let serverContractCount = foundContractSet.size;
-      let serverPaymentCount = foundPaymentSet.size;
+      let serverContractCount = Math.max(foundContractSet.size, fileDbContracts.size);
+      let serverPaymentCount = Math.max(foundPaymentSet.size, fileDbPayments.size);
       try {
         const [cCountRes, pCountRes] = await Promise.all([
           executePg(`SELECT COUNT(*) as count FROM sales WHERE NOT EXISTS (SELECT 1 FROM deleted_records dr WHERE dr.record_id = sales.id AND (dr.table_name = 'sales' OR dr.table_name = 'contracts' OR dr.table_name = 'unknown'))`).catch(() => []),
