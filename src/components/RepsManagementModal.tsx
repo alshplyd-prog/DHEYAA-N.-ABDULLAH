@@ -22,12 +22,18 @@ import {
   Camera,
   Upload,
   User,
-  Image as ImageIcon
+  Image as ImageIcon,
+  MapPin,
+  Radio,
+  Wifi,
+  WifiOff,
+  RefreshCw
 } from 'lucide-react';
 import { SalesRepresentative, CustomerList, Language } from '../types';
 import { ActionMenu } from './ActionMenu';
 import { hasDuplicateName, deduplicateEntitiesByName } from '../lib/nameHelpers';
 import { normalizePin } from '../lib/pinUtils';
+import { RepLiveLocation, fetchRepLiveLocations, formatLastSeen } from '../lib/repLocationTracker';
 
 interface RepsManagementModalProps {
   isOpen: boolean;
@@ -39,6 +45,7 @@ interface RepsManagementModalProps {
   onAddRep: (rep: Omit<SalesRepresentative, 'id'>) => Promise<void>;
   onUpdateRep: (id: string, data: Partial<SalesRepresentative>) => Promise<void>;
   onDeleteRep: (id: string) => Promise<void>;
+  onOpenRepLiveMap?: (repId: string) => void;
   lang: Language;
 }
 
@@ -52,12 +59,16 @@ export const RepsManagementModal: React.FC<RepsManagementModalProps> = ({
   onAddRep,
   onUpdateRep,
   onDeleteRep,
+  onOpenRepLiveMap,
   lang,
 }) => {
   const isAr = lang === 'ar';
+  const canViewLiveLocations = currentRep?.role === 'admin' || currentRep?.role === 'supervisor';
 
   const [isAddFormOpen, setIsAddFormOpen] = useState(false);
   const [editingRep, setEditingRep] = useState<SalesRepresentative | null>(null);
+  const [repLocationsMap, setRepLocationsMap] = useState<Record<string, RepLiveLocation>>({});
+  const [isRefreshingLocations, setIsRefreshingLocations] = useState(false);
 
   // Form states
   const [name, setName] = useState('');
@@ -75,6 +86,30 @@ export const RepsManagementModal: React.FC<RepsManagementModalProps> = ({
   const [error, setError] = useState('');
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const refreshLiveLocations = React.useCallback(async () => {
+    if (!canViewLiveLocations) return;
+    setIsRefreshingLocations(true);
+    try {
+      const locs = await fetchRepLiveLocations(false, currentRep?.id);
+      const map: Record<string, RepLiveLocation> = {};
+      for (const l of locs) {
+        map[l.repId] = l;
+      }
+      setRepLocationsMap(map);
+    } finally {
+      setIsRefreshingLocations(false);
+    }
+  }, [canViewLiveLocations, currentRep?.id]);
+
+  useEffect(() => {
+    if (!isOpen || !canViewLiveLocations) return;
+    void refreshLiveLocations();
+    const timer = setInterval(() => {
+      void refreshLiveLocations();
+    }, 10000);
+    return () => clearInterval(timer);
+  }, [isOpen, canViewLiveLocations, refreshLiveLocations]);
 
   const showModalToast = (msg: string) => {
     setToastMessage(msg);
@@ -253,9 +288,27 @@ export const RepsManagementModal: React.FC<RepsManagementModalProps> = ({
             <span className="px-2 py-0.5 rounded-md bg-white/20 text-[11px] font-bold">
               {uniqueReps.length}
             </span>
+            {canViewLiveLocations && (
+              <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-black flex items-center gap-1">
+                <Radio className="w-3 h-3 animate-pulse" />
+                <span>
+                  {Object.values(repLocationsMap).filter((l) => l.isOnline).length} {isAr ? 'متصل الآن' : 'Online'}
+                </span>
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
+            {canViewLiveLocations && !isAddFormOpen && (
+              <button
+                type="button"
+                onClick={() => void refreshLiveLocations()}
+                className="p-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-emerald-300 transition-colors"
+                title={isAr ? 'تحديث مواقع المندوبين' : 'Refresh live locations'}
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingLocations ? 'animate-spin' : ''}`} />
+              </button>
+            )}
             {!isAddFormOpen && (
               <button
                 onClick={() => handleOpenForm()}
@@ -307,6 +360,7 @@ export const RepsManagementModal: React.FC<RepsManagementModalProps> = ({
                   const repCanEdit = rep.canEdit !== false;
                   const repCanDelete = Boolean(rep.canDelete) || rep.role === 'admin';
                   const repCanSell = rep.canSell !== false;
+                  const liveLoc = repLocationsMap[rep.id];
 
                   return (
                     <div
@@ -385,6 +439,26 @@ export const RepsManagementModal: React.FC<RepsManagementModalProps> = ({
                                 {isAr ? 'مندوب' : 'Sales Rep'}
                               </span>
                             )}
+                            {canViewLiveLocations && liveLoc && (
+                              <span
+                                className={`px-2 py-0.5 rounded-full text-[10px] font-black flex items-center gap-1 shrink-0 border ${
+                                  liveLoc.isOnline
+                                    ? 'bg-emerald-50 text-emerald-700 border-emerald-300 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-700'
+                                    : 'bg-slate-100 text-slate-600 border-slate-300 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700'
+                                }`}
+                              >
+                                {liveLoc.isOnline ? (
+                                  <Wifi className="w-3 h-3 text-emerald-500 animate-pulse" />
+                                ) : (
+                                  <WifiOff className="w-3 h-3 text-slate-400" />
+                                )}
+                                <span>
+                                  {liveLoc.isOnline
+                                    ? (isAr ? `متصل الآن • ${formatLastSeen(liveLoc.secondsAgo, true)}` : `Online • ${formatLastSeen(liveLoc.secondsAgo, false)}`)
+                                    : (isAr ? `غير متصل • ${formatLastSeen(liveLoc.secondsAgo, true)}` : `Offline • ${formatLastSeen(liveLoc.secondsAgo, false)}`)}
+                                </span>
+                              </span>
+                            )}
                           </div>
 
                           {rep.phone && (
@@ -433,7 +507,24 @@ export const RepsManagementModal: React.FC<RepsManagementModalProps> = ({
                       </div>
 
                       {/* Rep Card Actions */}
-                      <div className="flex items-center gap-2 border-t sm:border-t-0 pt-2 sm:pt-0 border-slate-200 dark:border-slate-700/60">
+                      <div className="flex items-center gap-2 flex-wrap border-t sm:border-t-0 pt-2 sm:pt-0 border-slate-200 dark:border-slate-700/60">
+                        {canViewLiveLocations && liveLoc && onOpenRepLiveMap && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onClose();
+                              onOpenRepLiveMap(rep.id);
+                            }}
+                            className={`px-3 py-1.5 rounded-xl text-xs font-black flex items-center gap-1.5 transition-all cursor-pointer ${
+                              liveLoc.isOnline
+                                ? 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm'
+                                : 'bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 text-slate-800 dark:text-slate-200'
+                            }`}
+                          >
+                            <MapPin className="w-3.5 h-3.5" />
+                            <span>{liveLoc.isOnline ? (isAr ? 'موقعه المباشر الآن' : 'View Live Map') : (isAr ? 'آخر موقع' : 'Last Location')}</span>
+                          </button>
+                        )}
                         {!isActive && (
                           <button
                             onClick={() => {

@@ -25,6 +25,11 @@ import {
   RefreshCw,
   Plus,
   Minus,
+  Users,
+  Battery,
+  Gauge,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
 import { InstallmentContract, CustomerList, SalesRepresentative, Language } from '../types';
 import { updateCustomerLocation, getLocalCache, reconcileAllLocalWithDatabase } from '../lib/postgresClient';
@@ -32,6 +37,12 @@ import { captureDeviceLocation } from '../lib/geolocationHelper';
 import { OfflineTileLayer, precacheMapTilesForLocations } from '../lib/offlineTileLayer';
 import { fetchStreetDrivingRoute } from '../lib/routingHelper';
 import { registerBackHandler } from '../lib/backButtonManager';
+import {
+  RepLiveLocation,
+  fetchRepLiveLocations,
+  formatLastSeen,
+  escapeHtml,
+} from '../lib/repLocationTracker';
 
 // Check if a Leaflet map instance is currently mounted, valid, and has its DOM panes intact
 const isMapValid = (map: L.Map | null | undefined): map is L.Map => {
@@ -56,6 +67,8 @@ interface CustomerMapsModalProps {
   initialCustomer?: InstallmentContract | null;
   autoDrawRoute?: boolean;
   onViewCustomerPayments?: (contract: InstallmentContract) => void;
+  initialRepId?: string | null;
+  initialShowOnlineReps?: boolean;
 }
 
 interface LocationSearchBarProps {
@@ -165,14 +178,20 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
   initialCustomer = null,
   autoDrawRoute = false,
   onViewCustomerPayments,
+  initialRepId = null,
+  initialShowOnlineReps = false,
 }) => {
   const isAr = lang === 'ar';
+  const canViewRepsLocations = Boolean(
+    isAdmin || currentRep?.role === 'admin' || currentRep?.role === 'supervisor'
+  );
   const mapViewportRef = useRef<HTMLDivElement | null>(null);
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRotationWrapperRef = useRef<HTMLDivElement | null>(null);
   const viewportSizeRef = useRef<{ width: number; height: number; diag: number }>({ width: 0, height: 0, diag: 0 });
   const mapInstanceRef = useRef<L.Map | null>(null);
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
+  const repsLayerRef = useRef<L.LayerGroup | null>(null);
   const routeLayerRef = useRef<L.LayerGroup | null>(null);
   const userMarkerRef = useRef<L.Marker | null>(null);
   const watchPositionIdRef = useRef<number | null>(null);
@@ -278,17 +297,36 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
   const [isUpdatingLocation, setIsUpdatingLocation] = useState<boolean>(false);
   const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
 
+  // Live Representative Locations state (Admin / Supervisor view)
+  const [repLocations, setRepLocations] = useState<RepLiveLocation[]>([]);
+  const [isLoadingReps, setIsLoadingReps] = useState<boolean>(false);
+  const [showRepMarkers, setShowRepMarkers] = useState<boolean>(true);
+  const [isRepsPanelOpen, setIsRepsPanelOpen] = useState<boolean>(false);
+  const [repFilterMode, setRepFilterMode] = useState<'online' | 'all'>('online');
+  const [selectedRepLoc, setSelectedRepLoc] = useState<RepLiveLocation | null>(null);
+  const [followingRepId, setFollowingRepId] = useState<string | null>(null);
+  const hasFocusedInitialRepRef = useRef<boolean>(false);
+
   // Register Hardware / Gesture Back Button handling for maps & bottom sheet
   useEffect(() => {
     if (!isOpen) return;
 
     const unregister = registerBackHandler(() => {
-      // 1. If sidebar list is open, close sidebar
+      // 1. If reps panel or sidebar list is open, close them
+      if (isRepsPanelOpen) {
+        setIsRepsPanelOpen(false);
+        return true;
+      }
       if (isSidebarOpen) {
         setIsSidebarOpen(false);
         return true;
       }
-      // 2. If customer details bottom sheet is open, close it
+      // 2. If selected rep or customer details bottom sheet is open, close it
+      if (selectedRepLoc) {
+        setSelectedRepLoc(null);
+        setFollowingRepId(null);
+        return true;
+      }
       if (selectedCustomer) {
         setSelectedCustomer(null);
         return true;
@@ -299,7 +337,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     });
 
     return unregister;
-  }, [isOpen, isSidebarOpen, selectedCustomer, onClose]);
+  }, [isOpen, isRepsPanelOpen, isSidebarOpen, selectedRepLoc, selectedCustomer, onClose]);
 
   // Check if rep is allowed to see a given list - strict access control
   const isListAllowed = (listId?: string | null): boolean => {
@@ -388,7 +426,8 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     }
 
     const scaleClass = isSelected ? 'scale-115 ring-4' : 'hover:scale-105';
-    const initialLetter = (contract.customerName || 'ز').trim().charAt(0);
+    const safeCustomerName = escapeHtml(contract.customerName);
+    const initialLetter = escapeHtml((contract.customerName || 'ز').trim().charAt(0));
 
     return L.divIcon({
       className: 'custom-customer-pin',
@@ -397,7 +436,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
           <!-- Customer Full Name Badge (Permanently Visible & Always Upright) -->
           <div class="px-2.5 py-1 mb-1 bg-slate-950/95 text-white text-[11px] font-black rounded-xl shadow-xl border border-slate-700/90 flex items-center justify-center gap-1.5 whitespace-nowrap pointer-events-none drop-shadow-md">
             <span class="w-2 h-2 rounded-full ${dotColor} shrink-0"></span>
-            <span class="max-w-[150px] truncate text-white">${contract.customerName}</span>
+            <span class="max-w-[150px] truncate text-white">${safeCustomerName}</span>
           </div>
           <!-- Pin Circle -->
           <div class="w-9 h-9 rounded-full ${bgClass} border-2 shadow-lg flex items-center justify-center font-black text-sm transition-transform duration-200 ${ringClass} ${scaleClass}">
@@ -411,6 +450,56 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
       popupAnchor: [0, -66],
     });
   }, []);
+
+  // Create custom live marker icon for Sales Representatives
+  const createRepPinIcon = useCallback((repLoc: RepLiveLocation, isSelected: boolean) => {
+    const safeName = escapeHtml(repLoc.repName || 'مندوب');
+    const initialLetter = escapeHtml((repLoc.repName || 'م').trim().charAt(0));
+    const speedKmh = repLoc.speed != null && repLoc.speed > 0.5 ? Math.round(repLoc.speed * 3.6) : null;
+    const statusLabel = repLoc.isOnline
+      ? speedKmh
+        ? `${speedKmh} كم/س`
+        : (isAr ? 'متصل الآن' : 'Online')
+      : formatLastSeen(repLoc.secondsAgo, isAr);
+
+    const badgeBg = repLoc.isOnline
+      ? 'bg-emerald-950/95 border-emerald-400/90 text-emerald-100'
+      : 'bg-slate-900/95 border-slate-600 text-slate-300';
+    const circleBg = repLoc.isOnline
+      ? 'bg-gradient-to-br from-emerald-500 to-teal-600 border-white text-white'
+      : 'bg-slate-600 border-slate-300 text-slate-100';
+    const ringClass = isSelected
+      ? 'ring-4 ring-amber-400/80 scale-115'
+      : repLoc.isOnline
+      ? 'ring-4 ring-emerald-400/40'
+      : '';
+
+    return L.divIcon({
+      className: 'custom-rep-live-pin',
+      html: `
+        <div class="custom-customer-pin-inner relative flex flex-col items-center cursor-pointer" style="transform: rotate(var(--counter-rotate, 0deg)); transform-origin: 110px 76px; will-change: transform;">
+          <div class="px-2.5 py-1 mb-1 ${badgeBg} text-[11px] font-black rounded-xl shadow-xl border flex items-center justify-center gap-1.5 whitespace-nowrap pointer-events-none">
+            <span class="relative flex h-2.5 w-2.5 shrink-0">
+              ${repLoc.isOnline ? '<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>' : ''}
+              <span class="relative inline-flex rounded-full h-2.5 w-2.5 ${repLoc.isOnline ? 'bg-emerald-400' : 'bg-slate-400'}"></span>
+            </span>
+            <span class="max-w-[120px] truncate">${safeName}</span>
+            <span class="text-[9px] font-bold opacity-85">• ${escapeHtml(statusLabel)}</span>
+          </div>
+          <div class="relative flex items-center justify-center">
+            ${repLoc.isOnline ? '<span class="absolute w-12 h-12 rounded-full bg-emerald-400/35 animate-ping"></span>' : ''}
+            <div class="relative w-10 h-10 rounded-full ${circleBg} border-2 shadow-xl flex items-center justify-center font-black text-sm transition-transform ${ringClass}">
+              ${initialLetter}
+            </div>
+          </div>
+          <div class="w-3 h-3 ${repLoc.isOnline ? 'bg-teal-600' : 'bg-slate-600'} rotate-45 -mt-1.5 border-r border-b border-white/70 shadow-sm"></div>
+        </div>
+      `,
+      iconSize: [220, 78],
+      iconAnchor: [110, 76],
+      popupAnchor: [0, -72],
+    });
+  }, [isAr]);
 
   // Update user marker with GPS Navigation Chevron (always pointing straight UP on screen)
   const updateUserMarker = useCallback((lat: number, lng: number, speedVal: number | null) => {
@@ -645,6 +734,9 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
         const markersLayer = L.layerGroup().addTo(map);
         markersLayerRef.current = markersLayer;
 
+        const repsLayer = L.layerGroup().addTo(map);
+        repsLayerRef.current = repsLayer;
+
         const routeLayer = L.layerGroup().addTo(map);
         routeLayerRef.current = routeLayer;
 
@@ -704,6 +796,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
 
       userMarkerRef.current = null;
       markersLayerRef.current = null;
+      repsLayerRef.current = null;
       routeLayerRef.current = null;
       continuousHeadingRef.current = 0;
       currentCourseRef.current = 0;
@@ -775,12 +868,128 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     }
   }, [isOpen, initialCustomer, autoDrawRoute, getCustomerCoords]);
 
-  // Reset initial bounds fitting when modal opens
+  // Reset initial bounds fitting & handle rep focus triggers when modal opens
   useEffect(() => {
     if (isOpen) {
       hasFittedInitialBoundsRef.current = false;
+      hasFocusedInitialRepRef.current = false;
+      if (initialShowOnlineReps && canViewRepsLocations) {
+        setIsRepsPanelOpen(true);
+      }
+    } else {
+      setSelectedRepLoc(null);
+      setFollowingRepId(null);
+      setIsRepsPanelOpen(false);
     }
-  }, [isOpen]);
+  }, [isOpen, initialShowOnlineReps, canViewRepsLocations]);
+
+  // Fetch & auto-poll live representative locations (Admin & Supervisor only)
+  const refreshRepLocations = useCallback(async () => {
+    if (!canViewRepsLocations) return;
+    setIsLoadingReps(true);
+    try {
+      const locs = await fetchRepLiveLocations(false, currentRep?.id);
+      setRepLocations(locs);
+
+      // Update selected rep details and follow if active
+      setSelectedRepLoc((prev) => {
+        if (!prev) return null;
+        return locs.find((l) => l.repId === prev.repId) || prev;
+      });
+    } finally {
+      setIsLoadingReps(false);
+    }
+  }, [canViewRepsLocations, currentRep?.id]);
+
+  useEffect(() => {
+    if (!isOpen || !canViewRepsLocations) return;
+    void refreshRepLocations();
+    const timer = setInterval(() => {
+      void refreshRepLocations();
+    }, 10000);
+    return () => clearInterval(timer);
+  }, [isOpen, canViewRepsLocations, refreshRepLocations]);
+
+  // Focus on initialRepId if requested from RepsManagementModal
+  useEffect(() => {
+    if (!isOpen || !initialRepId || hasFocusedInitialRepRef.current || repLocations.length === 0) return;
+    const match = repLocations.find((r) => r.repId === initialRepId);
+    if (match) {
+      hasFocusedInitialRepRef.current = true;
+      setShowRepMarkers(true);
+      if (!match.isOnline) {
+        setRepFilterMode('all');
+      }
+      setSelectedCustomer(null);
+      setSelectedRepLoc(match);
+      setFollowingRepId(match.repId);
+      isUserManuallyPanningRef.current = true;
+      if (isMapValid(mapInstanceRef.current)) {
+        try {
+          mapInstanceRef.current.flyTo([match.latitude, match.longitude], 16, { duration: 0.9 });
+        } catch (e) {}
+      }
+    }
+  }, [isOpen, initialRepId, repLocations]);
+
+  // Follow followed rep live as coordinates update
+  useEffect(() => {
+    if (!followingRepId || !isMapValid(mapInstanceRef.current)) return;
+    const target = repLocations.find((r) => r.repId === followingRepId);
+    if (target) {
+      try {
+        mapInstanceRef.current.panTo([target.latitude, target.longitude]);
+      } catch (e) {}
+    }
+  }, [repLocations, followingRepId]);
+
+  const onlineRepsCount = useMemo(
+    () => repLocations.filter((r) => r.isOnline).length,
+    [repLocations]
+  );
+
+  const visibleRepLocations = useMemo(
+    () => (repFilterMode === 'online' ? repLocations.filter((r) => r.isOnline) : repLocations),
+    [repLocations, repFilterMode]
+  );
+
+  // Render Live Representative Markers on dedicated repsLayerRef
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    const repsLayer = repsLayerRef.current;
+    if (!isMapValid(map) || !repsLayer) return;
+
+    try {
+      repsLayer.clearLayers();
+    } catch {
+      return;
+    }
+
+    if (!canViewRepsLocations || !showRepMarkers || visibleRepLocations.length === 0) {
+      return;
+    }
+
+    visibleRepLocations.forEach((repLoc) => {
+      const isSelected = selectedRepLoc?.repId === repLoc.repId;
+      const icon = createRepPinIcon(repLoc, isSelected);
+      try {
+        const marker = L.marker([repLoc.latitude, repLoc.longitude], {
+          icon,
+          zIndexOffset: repLoc.isOnline ? 900 : 500,
+        }).addTo(repsLayer);
+        marker.on('click', () => {
+          setSelectedCustomer(null);
+          setSelectedRepLoc(repLoc);
+          isUserManuallyPanningRef.current = true;
+          if (isMapValid(mapInstanceRef.current)) {
+            try {
+              mapInstanceRef.current.panTo([repLoc.latitude, repLoc.longitude]);
+            } catch {}
+          }
+        });
+      } catch {}
+    });
+  }, [canViewRepsLocations, showRepMarkers, visibleRepLocations, selectedRepLoc, createRepPinIcon]);
 
   // Display all customer locations on modal open or filter changes
   useEffect(() => {
@@ -812,6 +1021,8 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
       try {
         const marker = L.marker([coords.lat, coords.lng], { icon }).addTo(markersLayer);
         marker.on('click', () => {
+          setSelectedRepLoc(null);
+          setFollowingRepId(null);
           setSelectedCustomer(contract);
           if (isMapValid(mapInstanceRef.current)) {
             try {
@@ -1197,14 +1408,50 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
               </span>
             </div>
 
+            {/* Live Online Reps Button (Admin / Supervisor only) */}
+            {canViewRepsLocations && (
+              <button
+                type="button"
+                onClick={() => {
+                  setIsRepsPanelOpen((prev) => !prev);
+                  void refreshRepLocations();
+                }}
+                className={`px-2.5 py-2 rounded-2xl border transition-all cursor-pointer flex items-center gap-1.5 shrink-0 active:scale-95 text-xs font-black ${
+                  isRepsPanelOpen
+                    ? 'bg-emerald-600 text-white border-emerald-400 shadow-lg shadow-emerald-500/30'
+                    : onlineRepsCount > 0
+                    ? 'bg-emerald-950/80 text-emerald-300 border-emerald-500/60 hover:bg-emerald-900'
+                    : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'
+                }`}
+                title={isAr ? 'مواقع المندوبين المباشرة' : 'Live Rep Locations'}
+              >
+                <span className="relative flex h-2 w-2 shrink-0">
+                  {onlineRepsCount > 0 && (
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  )}
+                  <span className={`relative inline-flex rounded-full h-2 w-2 ${onlineRepsCount > 0 ? 'bg-emerald-400' : 'bg-slate-500'}`}></span>
+                </span>
+                <Users className="w-4 h-4" />
+                <span className="hidden xs:inline">{isAr ? 'المندوبون' : 'Reps'}</span>
+                <span className="px-1.5 py-0.2 rounded-full bg-black/30 text-[10px] font-mono">
+                  {onlineRepsCount}
+                </span>
+              </button>
+            )}
+
             {/* Live Sync Button */}
             <button
               type="button"
-              onClick={() => reconcileAllLocalWithDatabase({ force: true }).catch(() => {})}
+              onClick={() => {
+                reconcileAllLocalWithDatabase({ force: true }).catch(() => {});
+                if (canViewRepsLocations) {
+                  void refreshRepLocations();
+                }
+              }}
               className="p-2 rounded-2xl bg-slate-800 text-emerald-400 border border-slate-700 hover:bg-slate-700 transition-all cursor-pointer flex items-center justify-center shrink-0 active:scale-95"
               title={isAr ? 'تزامن مباشر مع السيرفر' : 'Live Sync'}
             >
-              <RefreshCw className="w-4 h-4 animate-spin-hover" />
+              <RefreshCw className={`w-4 h-4 ${isLoadingReps ? 'animate-spin' : ''}`} />
             </button>
 
             {/* Toggle Drawer */}
@@ -1417,8 +1664,307 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
               </button>
             </div>
 
+            {/* Floating Live Online Representatives Panel (Admin / Supervisor) */}
+            {isRepsPanelOpen && canViewRepsLocations && (
+              <div className="absolute top-3 left-3 right-3 sm:left-auto sm:right-3 sm:w-88 z-30 bg-slate-900/95 backdrop-blur-md border-2 border-emerald-500/80 rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[65vh] animate-in slide-in-from-top-3 duration-200">
+                <div className="px-4 py-3 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Radio className="w-4 h-4 text-emerald-400 animate-pulse shrink-0" />
+                    <div className="min-w-0">
+                      <h4 className="text-xs sm:text-sm font-black text-white truncate">
+                        {isAr ? 'المواقع المباشرة للمندوبين' : 'Live Representative Tracking'}
+                      </h4>
+                      <p className="text-[10px] text-emerald-400 font-bold">
+                        {isAr
+                          ? `${onlineRepsCount} متصل الآن من أصل ${repLocations.length}`
+                          : `${onlineRepsCount} online of ${repLocations.length}`}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setShowRepMarkers((p) => !p)}
+                      className={`px-2 py-1 rounded-xl text-[10px] font-bold border transition-colors cursor-pointer ${
+                        showRepMarkers
+                          ? 'bg-emerald-600/20 text-emerald-300 border-emerald-500/40'
+                          : 'bg-slate-800 text-slate-400 border-slate-700'
+                      }`}
+                      title={isAr ? 'إظهار/إخفاء علامات المندوبين' : 'Toggle pins'}
+                    >
+                      <Eye className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void refreshRepLocations()}
+                      className="p-1.5 rounded-xl bg-slate-800 text-emerald-400 hover:bg-slate-700 cursor-pointer"
+                      title={isAr ? 'تحديث الآن' : 'Refresh'}
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isLoadingReps ? 'animate-spin' : ''}`} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIsRepsPanelOpen(false)}
+                      className="p-1.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Online / All filter toggle */}
+                <div className="px-3 py-2 bg-slate-900 border-b border-slate-800 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setRepFilterMode('online')}
+                    className={`flex-1 py-1.5 px-2.5 rounded-xl text-[11px] font-black transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                      repFilterMode === 'online'
+                        ? 'bg-emerald-600 text-white shadow-sm'
+                        : 'bg-slate-800 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Wifi className="w-3.5 h-3.5" />
+                    <span>{isAr ? `المتصلون الآن (${onlineRepsCount})` : `Online (${onlineRepsCount})`}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRepFilterMode('all')}
+                    className={`flex-1 py-1.5 px-2.5 rounded-xl text-[11px] font-black transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                      repFilterMode === 'all'
+                        ? 'bg-indigo-600 text-white shadow-sm'
+                        : 'bg-slate-800 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    <Users className="w-3.5 h-3.5" />
+                    <span>{isAr ? `الكل (${repLocations.length})` : `All (${repLocations.length})`}</span>
+                  </button>
+                </div>
+
+                {/* Rep List */}
+                <div className="overflow-y-auto p-2.5 space-y-2 max-h-[42vh]">
+                  {visibleRepLocations.length === 0 ? (
+                    <div className="py-8 text-center text-slate-400 space-y-1.5">
+                      <WifiOff className="w-7 h-7 mx-auto opacity-50" />
+                      <p className="text-xs font-bold">
+                        {repFilterMode === 'online'
+                          ? isAr
+                            ? 'لا يوجد مندوب متصل بالإنترنت ومُفعل للموقع حالياً'
+                            : 'No representatives online with live GPS right now'
+                          : isAr
+                          ? 'لم يرسل أي مندوب موقعه الجغرافي بعد'
+                          : 'No representative locations recorded yet'}
+                      </p>
+                    </div>
+                  ) : (
+                    visibleRepLocations.map((repLoc) => {
+                      const isSel = selectedRepLoc?.repId === repLoc.repId;
+                      const speedKmh = repLoc.speed != null && repLoc.speed > 0.5 ? Math.round(repLoc.speed * 3.6) : null;
+                      return (
+                        <button
+                          key={repLoc.repId}
+                          type="button"
+                          onClick={() => {
+                            setShowRepMarkers(true);
+                            setSelectedCustomer(null);
+                            setSelectedRepLoc(repLoc);
+                            setFollowingRepId(repLoc.repId);
+                            isUserManuallyPanningRef.current = true;
+                            if (isMapValid(mapInstanceRef.current)) {
+                              try {
+                                mapInstanceRef.current.flyTo([repLoc.latitude, repLoc.longitude], 16, { duration: 0.9 });
+                              } catch {}
+                            }
+                            if (typeof window !== 'undefined' && window.innerWidth < 640) {
+                              setIsRepsPanelOpen(false);
+                            }
+                          }}
+                          className={`w-full p-2.5 rounded-2xl border text-right transition-all cursor-pointer flex items-center justify-between gap-2.5 ${
+                            isSel
+                              ? 'bg-emerald-950/60 border-emerald-400 shadow-md'
+                              : 'bg-slate-800/80 border-slate-700/80 hover:border-emerald-500/60 hover:bg-slate-800'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2.5 min-w-0">
+                            <div
+                              className={`w-10 h-10 rounded-xl flex items-center justify-center font-black text-sm shrink-0 border ${
+                                repLoc.isOnline
+                                  ? 'bg-emerald-600 text-white border-emerald-400'
+                                  : 'bg-slate-700 text-slate-300 border-slate-600'
+                              }`}
+                            >
+                              {(repLoc.repName || 'م').trim().charAt(0)}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-xs font-black text-white truncate">{repLoc.repName}</span>
+                                <span
+                                  className={`px-1.5 py-0.2 rounded-full text-[9px] font-black shrink-0 ${
+                                    repLoc.isOnline
+                                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                      : 'bg-slate-700 text-slate-400'
+                                  }`}
+                                >
+                                  {repLoc.isOnline ? (isAr ? 'متصل' : 'Online') : (isAr ? 'غير متصل' : 'Offline')}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2 text-[10px] text-slate-400 font-semibold mt-0.5 flex-wrap">
+                                <span>{formatLastSeen(repLoc.secondsAgo, isAr)}</span>
+                                {speedKmh !== null && (
+                                  <span className="text-sky-300 font-bold">{speedKmh} {isAr ? 'كم/س' : 'km/h'}</span>
+                                )}
+                                {repLoc.battery != null && (
+                                  <span className="text-amber-300 font-bold">{repLoc.battery}%</span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                          <LocateFixed className="w-4 h-4 text-emerald-400 shrink-0" />
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Floating Live Card for Selected Representative (Admin / Supervisor) */}
+            {selectedRepLoc && canViewRepsLocations && (
+              <div className="absolute bottom-16 left-3 right-3 sm:bottom-auto sm:top-28 sm:left-3 sm:right-auto sm:w-84 z-30 bg-slate-900/95 backdrop-blur-md border-2 border-emerald-400/90 rounded-3xl p-4 shadow-2xl animate-in slide-in-from-bottom-4 sm:slide-in-from-top-4 duration-200">
+                <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-slate-800">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="relative flex h-3 w-3 shrink-0">
+                      {selectedRepLoc.isOnline && (
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                      )}
+                      <span
+                        className={`relative inline-flex rounded-full h-3 w-3 ${
+                          selectedRepLoc.isOnline ? 'bg-emerald-400' : 'bg-slate-500'
+                        }`}
+                      ></span>
+                    </span>
+                    <div className="min-w-0">
+                      <h3 className="text-sm sm:text-base font-black text-white truncate">
+                        {selectedRepLoc.repName}
+                      </h3>
+                      <span className={`text-[10px] font-bold ${selectedRepLoc.isOnline ? 'text-emerald-400' : 'text-slate-400'}`}>
+                        {selectedRepLoc.isOnline
+                          ? (isAr ? `متصل بالإنترنت • ${formatLastSeen(selectedRepLoc.secondsAgo, true)}` : `Online • ${formatLastSeen(selectedRepLoc.secondsAgo, false)}`)
+                          : (isAr ? `غير متصل • آخر ظهور ${formatLastSeen(selectedRepLoc.secondsAgo, true)}` : `Offline • Last seen ${formatLastSeen(selectedRepLoc.secondsAgo, false)}`)}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedRepLoc(null);
+                      setFollowingRepId(null);
+                    }}
+                    className="p-1 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="py-2.5 space-y-2">
+                  <div className="grid grid-cols-3 gap-2 p-2.5 bg-slate-800/90 rounded-2xl border border-slate-700/70 text-center">
+                    <div>
+                      <span className="text-[10px] text-slate-400 font-bold flex items-center justify-center gap-1">
+                        <Gauge className="w-3 h-3 text-sky-400" />
+                        <span>{isAr ? 'السرعة' : 'Speed'}</span>
+                      </span>
+                      <span className="text-xs font-black text-slate-100 font-mono">
+                        {selectedRepLoc.speed != null && selectedRepLoc.speed > 0.5
+                          ? `${Math.round(selectedRepLoc.speed * 3.6)} ${isAr ? 'كم/س' : 'km/h'}`
+                          : (isAr ? 'متوقف' : 'Idle')}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-slate-400 font-bold flex items-center justify-center gap-1">
+                        <Crosshair className="w-3 h-3 text-emerald-400" />
+                        <span>{isAr ? 'الدقة' : 'Accuracy'}</span>
+                      </span>
+                      <span className="text-xs font-black text-slate-100 font-mono">
+                        {selectedRepLoc.accuracy != null ? `±${Math.round(selectedRepLoc.accuracy)} م` : '—'}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-slate-400 font-bold flex items-center justify-center gap-1">
+                        <Battery className="w-3 h-3 text-amber-400" />
+                        <span>{isAr ? 'البطارية' : 'Battery'}</span>
+                      </span>
+                      <span className="text-xs font-black text-slate-100 font-mono">
+                        {selectedRepLoc.battery != null ? `${selectedRepLoc.battery}%` : '—'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {selectedRepLoc.phone && (
+                    <div className="flex items-center justify-between bg-slate-800/90 px-3 py-2 rounded-2xl border border-slate-700/70">
+                      <span className="text-xs text-slate-400 font-bold">{isAr ? 'الهاتف:' : 'Phone:'}</span>
+                      <div className="flex items-center gap-2">
+                        <a
+                          href={`tel:${selectedRepLoc.phone}`}
+                          className="text-xs font-black text-emerald-400 hover:underline flex items-center gap-1 dir-ltr"
+                        >
+                          <Phone className="w-3.5 h-3.5" />
+                          <span>{selectedRepLoc.phone}</span>
+                        </a>
+                        <a
+                          href={`https://wa.me/${selectedRepLoc.phone.replace(/[^0-9]/g, '')}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="p-1 bg-teal-600 hover:bg-teal-500 text-white rounded-lg transition-colors shadow-xs"
+                          title="WhatsApp"
+                        >
+                          <MessageCircle className="w-3 h-3" />
+                        </a>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="pt-2 flex flex-wrap items-center gap-2 border-t border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextFollow = followingRepId === selectedRepLoc.repId ? null : selectedRepLoc.repId;
+                      setFollowingRepId(nextFollow);
+                      if (nextFollow && isMapValid(mapInstanceRef.current)) {
+                        isUserManuallyPanningRef.current = true;
+                        try {
+                          mapInstanceRef.current.flyTo([selectedRepLoc.latitude, selectedRepLoc.longitude], 16, { duration: 0.7 });
+                        } catch {}
+                      }
+                    }}
+                    className={`flex-1 py-2.5 px-3 rounded-2xl text-xs font-black flex items-center justify-center gap-1.5 transition-all cursor-pointer active:scale-95 ${
+                      followingRepId === selectedRepLoc.repId
+                        ? 'bg-emerald-600 text-white ring-2 ring-emerald-400/60 shadow-md'
+                        : 'bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-emerald-500/40'
+                    }`}
+                  >
+                    <LocateFixed className={`w-4 h-4 ${followingRepId === selectedRepLoc.repId ? 'animate-pulse' : ''}`} />
+                    <span>
+                      {followingRepId === selectedRepLoc.repId
+                        ? (isAr ? 'جاري التتبع المباشر' : 'Following Live')
+                        : (isAr ? 'تتبع على الخريطة' : 'Follow Live')}
+                    </span>
+                  </button>
+
+                  <a
+                    href={`https://www.google.com/maps?q=${selectedRepLoc.latitude},${selectedRepLoc.longitude}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="py-2.5 px-3 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl text-xs font-black flex items-center justify-center gap-1.5 transition-colors active:scale-95 cursor-pointer shadow-md"
+                  >
+                    <ExternalLink className="w-4 h-4" />
+                    <span>{isAr ? 'خرائط جوجل' : 'Google Maps'}</span>
+                  </a>
+                </div>
+              </div>
+            )}
+
             {/* Floating Card for Selected Customer (فقط اسمه ورقمه والقسط مع زر مسار إلى) */}
-            {selectedCustomer && (
+            {selectedCustomer && !selectedRepLoc && (
               <div className="absolute bottom-16 left-3 right-3 sm:bottom-auto sm:top-28 sm:left-3 sm:right-auto sm:w-80 z-30 bg-slate-900/95 backdrop-blur-md border-2 border-emerald-500/90 rounded-3xl p-4 shadow-2xl animate-in slide-in-from-bottom-4 sm:slide-in-from-top-4 duration-200">
                 {/* 1. Header: Customer Name (اسمه) & Close */}
                 <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-slate-800">

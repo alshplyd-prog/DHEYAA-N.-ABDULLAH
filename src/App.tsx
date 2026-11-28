@@ -84,6 +84,7 @@ import { App as CapApp } from '@capacitor/app';
 import { Network } from '@capacitor/network';
 import { initBackgroundSync, registerBackgroundSyncWorker, sendBeaconOnExit, runBackgroundExitSync, enableForegroundService, syncToNativeAndroid, requestAllBackgroundAndSyncPermissions } from './lib/offlineQueue';
 import { fetchWithFallback } from './lib/apiConfig';
+import { startRepLiveLocationBroadcast, markRepOffline, fetchRepLiveLocations } from './lib/repLocationTracker';
 import {
   subscribeToContracts,
   subscribeToCustomers,
@@ -323,6 +324,9 @@ export default function App() {
   const [isCustomerMapsModalOpen, setIsCustomerMapsModalOpen] = useState(false);
   const [customerMapsInitialContract, setCustomerMapsInitialContract] = useState<InstallmentContract | null>(null);
   const [customerMapsAutoDrawRoute, setCustomerMapsAutoDrawRoute] = useState<boolean>(false);
+  const [customerMapsInitialRepId, setCustomerMapsInitialRepId] = useState<string | null>(null);
+  const [customerMapsShowOnlineReps, setCustomerMapsShowOnlineReps] = useState<boolean>(false);
+  const [onlineRepsCount, setOnlineRepsCount] = useState<number>(0);
   const [isAddAppointmentModalOpen, setIsAddAppointmentModalOpen] = useState(false);
   const [selectedContractForAppointment, setSelectedContractForAppointment] = useState<InstallmentContract | null>(null);
   const [isPrinterSettingsOpen, setIsPrinterSettingsOpen] = useState(false);
@@ -670,6 +674,40 @@ export default function App() {
     };
   }, []);
 
+  // Broadcast logged-in representative's live GPS location whenever connected to the internet
+  useEffect(() => {
+    if (!isPinUnlocked || !currentRep?.id) return;
+    const stopBroadcast = startRepLiveLocationBroadcast(currentRep);
+    return () => {
+      stopBroadcast();
+    };
+  }, [isPinUnlocked, currentRep?.id, currentRep?.name]);
+
+  // For Admin/Supervisor: periodically fetch count of online representatives for dashboard badge
+  useEffect(() => {
+    if (!isPinUnlocked || !currentRep?.id) return;
+    if (currentRep.role !== 'admin' && currentRep.role !== 'supervisor') return;
+
+    let cancelled = false;
+    const updateCount = async () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      const onlineLocs = await fetchRepLiveLocations(true, currentRep.id);
+      if (!cancelled) {
+        setOnlineRepsCount(onlineLocs.length);
+      }
+    };
+
+    void updateCount();
+    const timer = setInterval(() => {
+      void updateCount();
+    }, 20000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [isPinUnlocked, currentRep?.id, currentRep?.role]);
+
   // Push initial history state once on app boot to support popstate interception
   useEffect(() => {
     try {
@@ -773,6 +811,8 @@ export default function App() {
         setIsCustomerMapsModalOpen(false);
         setCustomerMapsInitialContract(null);
         setCustomerMapsAutoDrawRoute(false);
+        setCustomerMapsInitialRepId(null);
+        setCustomerMapsShowOnlineReps(false);
         return true;
       }
       if (isAppointmentsBoxModalOpen) {
@@ -3777,6 +3817,9 @@ export default function App() {
         onViewSplash={() => setShowSplash(true)}
         onUpdateRep={handleUpdateRep}
         onLogoutRep={async () => {
+          if (currentRep?.id) {
+            void markRepOffline(currentRep.id);
+          }
           setIsPinUnlocked(false);
           try {
             localStorage.removeItem('sami_app_pin_unlocked');
@@ -4203,32 +4246,54 @@ export default function App() {
                   </div>
                 </button>
 
-                {/* Customer Maps Box Card (صندوق خرائط الزبائن والمواقع) - Visible to Admin */}
+                {/* Customer Maps Box Card (صندوق خرائط الزبائن والمواقع ومراقبة المندوبين) - Visible to Admin */}
                 <button
                   type="button"
-                  onClick={() => setIsCustomerMapsModalOpen(true)}
+                  onClick={() => {
+                    setCustomerMapsInitialContract(null);
+                    setCustomerMapsAutoDrawRoute(false);
+                    setCustomerMapsInitialRepId(null);
+                    setCustomerMapsShowOnlineReps(onlineRepsCount > 0);
+                    setIsCustomerMapsModalOpen(true);
+                  }}
                   className="bg-emerald-50/70 dark:bg-slate-800/90 border-2 border-emerald-200/80 dark:border-slate-700 hover:border-emerald-400 dark:hover:border-emerald-500 rounded-2xl sm:rounded-3xl p-3 sm:p-4 md:p-5 text-right transition-all shadow-xs hover:shadow-md group flex flex-col justify-between cursor-pointer"
                 >
-                  <div className="flex items-center justify-between mb-2 sm:mb-3">
+                  <div className="flex items-center justify-between gap-1.5 mb-2 sm:mb-3 flex-wrap">
                     <div className="p-2 sm:p-3 md:p-3.5 rounded-xl sm:rounded-2xl bg-emerald-100 dark:bg-emerald-900/50 text-emerald-600 dark:text-emerald-300 group-hover:scale-105 transition-transform shadow-2xs">
                       <MapPinned className="w-5 h-5 sm:w-7 sm:h-7 md:w-8 md:h-8" />
                     </div>
-                    <span className="text-[11px] xs:text-xs sm:text-sm font-extrabold bg-emerald-200/80 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-200 px-2 sm:px-3 py-0.5 sm:py-1 rounded-full">
-                      {accessibleContractsWithLocationCount} {isAr ? 'علامة ع الخريطة' : 'on Map'}
-                    </span>
+                    <div className="flex flex-col items-end gap-1">
+                      <span className="text-[11px] xs:text-xs sm:text-sm font-extrabold bg-emerald-200/80 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-200 px-2 sm:px-3 py-0.5 sm:py-1 rounded-full">
+                        {accessibleContractsWithLocationCount} {isAr ? 'علامة ع الخريطة' : 'on Map'}
+                      </span>
+                      <span
+                        className={`text-[10px] sm:text-xs font-black px-2 py-0.5 rounded-full flex items-center gap-1 ${
+                          onlineRepsCount > 0
+                            ? 'bg-emerald-600 text-white shadow-xs'
+                            : 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
+                        }`}
+                      >
+                        <span className={`w-1.5 h-1.5 rounded-full ${onlineRepsCount > 0 ? 'bg-white animate-pulse' : 'bg-slate-400'}`} />
+                        <span>
+                          {onlineRepsCount > 0
+                            ? (isAr ? `${onlineRepsCount} مندوب متصل الآن` : `${onlineRepsCount} rep online`)
+                            : (isAr ? '0 مندوب متصل' : '0 rep online')}
+                        </span>
+                      </span>
+                    </div>
                   </div>
                   <div className="space-y-1 my-1">
                     <h3 className="text-sm sm:text-base md:text-lg font-black text-slate-900 dark:text-slate-100">
-                      {isAr ? 'صندوق خرائط الزبائن' : 'Customer Maps Box'}
+                      {isAr ? 'صندوق خرائط الزبائن والمندوبين' : 'Customer & Rep Live Maps'}
                     </h3>
                     <p className="text-xs sm:text-sm md:text-base text-slate-500 dark:text-slate-400 font-semibold line-clamp-2">
                       {isAr
-                        ? 'عرض مواقع الزبائن على الخريطة وتتبعهم والتوجيه المباشر'
-                        : 'View customer pins on map & direct GPS navigation'}
+                        ? 'عرض مواقع الزبائن وموقع المندوبين المباشر عند الاتصال بالإنترنت'
+                        : 'View customer pins & live online representative GPS locations'}
                     </p>
                   </div>
                   <div className="pt-2 sm:pt-3 border-t border-emerald-200/60 dark:border-slate-700/80 flex items-center justify-between text-xs sm:text-sm md:text-base font-black text-emerald-700 dark:text-emerald-300">
-                    <span>{isAr ? 'فتح الخريطة' : 'Open Map'}</span>
+                    <span>{isAr ? 'فتح الخريطة المباشرة' : 'Open Live Map'}</span>
                     <ChevronLeft className="w-3.5 h-3.5 sm:w-4 sm:h-4 rtl:rotate-0 ltr:rotate-180 group-hover:-translate-x-1 transition-transform" />
                   </div>
                 </button>
@@ -4728,6 +4793,13 @@ export default function App() {
         onAddRep={handleAddRep}
         onUpdateRep={handleUpdateRep}
         onDeleteRep={handleDeleteRep}
+        onOpenRepLiveMap={(repId) => {
+          setCustomerMapsInitialContract(null);
+          setCustomerMapsAutoDrawRoute(false);
+          setCustomerMapsInitialRepId(repId);
+          setCustomerMapsShowOnlineReps(false);
+          setIsCustomerMapsModalOpen(true);
+        }}
         lang={lang}
       />
 
@@ -4847,13 +4919,15 @@ export default function App() {
         }}
       />
 
-      {/* Customer Maps Modal (صندوق خرائط الزبائن) */}
+      {/* Customer Maps Modal (صندوق خرائط الزبائن ومواقع المندوبين المباشرة) */}
       <CustomerMapsModal
         isOpen={isCustomerMapsModalOpen}
         onClose={() => {
           setIsCustomerMapsModalOpen(false);
           setCustomerMapsInitialContract(null);
           setCustomerMapsAutoDrawRoute(false);
+          setCustomerMapsInitialRepId(null);
+          setCustomerMapsShowOnlineReps(false);
         }}
         contracts={contractsWithLiveBalances}
         customerLists={customerLists}
@@ -4863,6 +4937,8 @@ export default function App() {
         lang={lang}
         initialCustomer={customerMapsInitialContract}
         autoDrawRoute={customerMapsAutoDrawRoute}
+        initialRepId={customerMapsInitialRepId}
+        initialShowOnlineReps={customerMapsShowOnlineReps}
         onSelectCustomer={(contract) => {
           setSelectedContract(contract);
           setIsCustomerMapsModalOpen(false);

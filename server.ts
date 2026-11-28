@@ -5244,8 +5244,74 @@ async function startServer() {
   });
 
   // --- Representatives Live Location API ---
+  const ONLINE_REP_TTL_SECONDS = 120;
+
+  const formatRepLocationRecord = (row: any) => {
+    const lat = Number(row?.latitude);
+    const lng = Number(row?.longitude);
+    const updatedAt = String(row?.updated_at || row?.updatedAt || "");
+    const parsedMs = Date.parse(updatedAt);
+    const secondsAgo = Number.isFinite(parsedMs)
+      ? Math.max(0, Math.round((Date.now() - parsedMs) / 1000))
+      : 999999;
+    const explicitOnline = row?.is_online !== false && row?.isOnline !== false;
+    const isOnline = explicitOnline && secondsAgo <= ONLINE_REP_TTL_SECONDS;
+    const repId = String(row?.rep_id || row?.repId || row?.id || "");
+    const repName = String(row?.current_rep_name || row?.rep_name || row?.repName || "مندوب");
+
+    return {
+      id: repId,
+      repId,
+      rep_id: repId,
+      repName,
+      rep_name: repName,
+      current_rep_name: row?.current_rep_name || repName,
+      latitude: Number.isFinite(lat) ? lat : 0,
+      longitude: Number.isFinite(lng) ? lng : 0,
+      accuracy: row?.accuracy != null && Number.isFinite(Number(row.accuracy)) ? Number(row.accuracy) : null,
+      speed: row?.speed != null && Number.isFinite(Number(row.speed)) ? Number(row.speed) : null,
+      battery: row?.battery != null && Number.isFinite(Number(row.battery)) ? Number(row.battery) : null,
+      address: row?.address || null,
+      updatedAt,
+      updated_at: updatedAt,
+      secondsAgo,
+      isOnline,
+      is_online: isOnline,
+      phone: row?.rep_phone || row?.phone || null,
+      rep_phone: row?.rep_phone || row?.phone || null,
+      avatarUrl: row?.avatar_url || row?.avatarUrl || null,
+      avatar_url: row?.avatar_url || row?.avatarUrl || null,
+      role: row?.rep_role || row?.role || null,
+    };
+  };
+
   app.get("/api/reps/locations", async (req, res) => {
     try {
+      const requesterRepId = String(req.headers["x-rep-id"] || req.query.requesterRepId || "").trim();
+      if (requesterRepId) {
+        let requesterRole: string | null = null;
+        if (isPgConfigured()) {
+          try {
+            const repRows = await executePg(`SELECT role FROM reps WHERE id = $1 LIMIT 1`, [requesterRepId]);
+            if (repRows && repRows.length > 0) {
+              requesterRole = String(repRows[0].role || "rep");
+            }
+          } catch {}
+        }
+        if (!requesterRole) {
+          const localReps = fileDb.get<any>("reps") || [];
+          const found = localReps.find((r: any) => String(r?.id) === requesterRepId);
+          if (found) {
+            requesterRole = String(found.role || "rep");
+          }
+        }
+        if (requesterRole && requesterRole !== "admin" && requesterRole !== "supervisor") {
+          return res.status(403).json({ error: "Access restricted to administrators and supervisors" });
+        }
+      }
+
+      const onlineOnly = String(req.query.onlineOnly || "").toLowerCase() === "true";
+
       if (isPgConfigured()) {
         try {
           await executePg(`
@@ -5258,24 +5324,51 @@ async function startServer() {
               speed DOUBLE PRECISION,
               battery INTEGER,
               address TEXT,
+              is_online BOOLEAN DEFAULT TRUE,
               updated_at TEXT NOT NULL
             );
+            ALTER TABLE rep_locations ADD COLUMN IF NOT EXISTS is_online BOOLEAN DEFAULT TRUE;
           `).catch(() => {});
 
           const rows = await executePg(`
-            SELECT rl.*, r.name as current_rep_name, r.phone as rep_phone, r.avatar_url 
+            SELECT rl.*, r.name as current_rep_name, r.phone as rep_phone, r.avatar_url, r.role as rep_role
             FROM rep_locations rl
             LEFT JOIN reps r ON r.id = rl.rep_id
             ORDER BY rl.updated_at DESC
           `);
-          return res.json(rows || []);
+          const formatted = (rows || [])
+            .map(formatRepLocationRecord)
+            .filter((r: any) => r.repId && Number.isFinite(r.latitude) && Number.isFinite(r.longitude) && (r.latitude !== 0 || r.longitude !== 0))
+            .filter((r: any) => !onlineOnly || r.isOnline)
+            .sort((a: any, b: any) => {
+              if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
+              return a.secondsAgo - b.secondsAgo;
+            });
+          return res.json(formatted);
         } catch (pgErr) {
           if (!isConnectionLevelError(pgErr) && isPgConfigured()) {
             console.warn("Postgres fetch rep_locations error:", pgErr);
           }
         }
       }
-      const locs = fileDb.get<any>("rep_locations") || [];
+      const localReps = fileDb.get<any>("reps") || [];
+      const locs = (fileDb.get<any>("rep_locations") || [])
+        .map((row: any) => {
+          const matchedRep = localReps.find((r: any) => String(r?.id) === String(row?.rep_id || row?.repId));
+          return formatRepLocationRecord({
+            ...row,
+            current_rep_name: matchedRep?.name || row?.rep_name,
+            rep_phone: matchedRep?.phone || row?.rep_phone,
+            avatar_url: matchedRep?.avatarUrl || matchedRep?.avatar_url || row?.avatar_url,
+            rep_role: matchedRep?.role || row?.rep_role,
+          });
+        })
+        .filter((r: any) => r.repId && Number.isFinite(r.latitude) && Number.isFinite(r.longitude) && (r.latitude !== 0 || r.longitude !== 0))
+        .filter((r: any) => !onlineOnly || r.isOnline)
+        .sort((a: any, b: any) => {
+          if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
+          return a.secondsAgo - b.secondsAgo;
+        });
       res.json(locs);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -5284,22 +5377,65 @@ async function startServer() {
 
   app.post("/api/reps/location", async (req, res) => {
     try {
-      const { repId, repName, latitude, longitude, accuracy, speed, battery, address } = req.body;
-      if (!repId || latitude === undefined || longitude === undefined) {
-        return res.status(400).json({ error: "Missing required coordinates or repId" });
+      const { repId, repName, latitude, longitude, accuracy, speed, battery, address } = req.body || {};
+      const cleanRepId = typeof repId === "string" || typeof repId === "number" ? String(repId).trim() : "";
+      if (!cleanRepId || cleanRepId.length > 120) {
+        return res.status(400).json({ error: "Invalid or missing repId" });
+      }
+
+      const lat = Number(latitude);
+      const lng = Number(longitude);
+      if (
+        !Number.isFinite(lat) ||
+        !Number.isFinite(lng) ||
+        lat < -90 ||
+        lat > 90 ||
+        lng < -180 ||
+        lng > 180 ||
+        (lat === 0 && lng === 0)
+      ) {
+        return res.status(400).json({ error: "Invalid latitude or longitude coordinates" });
+      }
+
+      const parsedAccuracy = accuracy != null && Number.isFinite(Number(accuracy)) && Number(accuracy) >= 0
+        ? Math.round(Number(accuracy) * 10) / 10
+        : null;
+      const parsedSpeed = speed != null && Number.isFinite(Number(speed)) && Number(speed) >= 0
+        ? Math.round(Number(speed) * 100) / 100
+        : null;
+      const parsedBattery = battery != null && Number.isFinite(Number(battery))
+        ? Math.max(0, Math.min(100, Math.round(Number(battery))))
+        : null;
+      const cleanAddress = typeof address === "string" ? address.trim().slice(0, 200) || null : null;
+
+      let resolvedRepName = typeof repName === "string" && repName.trim() ? repName.trim().slice(0, 120) : "مندوب";
+      if (isPgConfigured()) {
+        try {
+          const repRow = await executePg(`SELECT name FROM reps WHERE id = $1 LIMIT 1`, [cleanRepId]);
+          if (repRow && repRow.length > 0 && repRow[0].name) {
+            resolvedRepName = String(repRow[0].name).trim().slice(0, 120);
+          }
+        } catch {}
+      } else {
+        const localReps = fileDb.get<any>("reps") || [];
+        const found = localReps.find((r: any) => String(r?.id) === cleanRepId);
+        if (found?.name) {
+          resolvedRepName = String(found.name).trim().slice(0, 120);
+        }
       }
 
       const now = new Date().toISOString();
       const locationData = {
-        id: String(repId),
-        rep_id: String(repId),
-        rep_name: repName || "مندوب",
-        latitude: Number(latitude),
-        longitude: Number(longitude),
-        accuracy: accuracy != null ? Number(accuracy) : null,
-        speed: speed != null ? Number(speed) : null,
-        battery: battery != null ? Number(battery) : null,
-        address: address || null,
+        id: cleanRepId,
+        rep_id: cleanRepId,
+        rep_name: resolvedRepName,
+        latitude: lat,
+        longitude: lng,
+        accuracy: parsedAccuracy,
+        speed: parsedSpeed,
+        battery: parsedBattery,
+        address: cleanAddress,
+        is_online: true,
         updated_at: now
       };
 
@@ -5317,8 +5453,10 @@ async function startServer() {
               speed DOUBLE PRECISION,
               battery INTEGER,
               address TEXT,
+              is_online BOOLEAN DEFAULT TRUE,
               updated_at TEXT NOT NULL
             );
+            ALTER TABLE rep_locations ADD COLUMN IF NOT EXISTS is_online BOOLEAN DEFAULT TRUE;
             CREATE TABLE IF NOT EXISTS rep_location_logs (
               id TEXT PRIMARY KEY,
               rep_id TEXT NOT NULL,
@@ -5333,8 +5471,8 @@ async function startServer() {
           `).catch(() => {});
 
           await executePg(`
-            INSERT INTO rep_locations (rep_id, rep_name, latitude, longitude, accuracy, speed, battery, address, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            INSERT INTO rep_locations (rep_id, rep_name, latitude, longitude, accuracy, speed, battery, address, is_online, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (rep_id) DO UPDATE SET
               rep_name = EXCLUDED.rep_name,
               latitude = EXCLUDED.latitude,
@@ -5343,6 +5481,7 @@ async function startServer() {
               speed = EXCLUDED.speed,
               battery = EXCLUDED.battery,
               address = EXCLUDED.address,
+              is_online = TRUE,
               updated_at = EXCLUDED.updated_at
           `, [
             locationData.rep_id,
@@ -5353,6 +5492,7 @@ async function startServer() {
             locationData.speed,
             locationData.battery,
             locationData.address,
+            true,
             now
           ]);
 
@@ -5376,7 +5516,45 @@ async function startServer() {
         }
       }
 
-      res.json({ success: true, location: locationData });
+      res.json({ success: true, location: formatRepLocationRecord(locationData) });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/reps/location/offline", async (req, res) => {
+    try {
+      let body = req.body;
+      if (typeof body === "string") {
+        try { body = JSON.parse(body); } catch { body = {}; }
+      }
+      const cleanRepId = typeof body?.repId === "string" || typeof body?.repId === "number"
+        ? String(body.repId).trim()
+        : "";
+      if (!cleanRepId || cleanRepId.length > 120) {
+        return res.status(400).json({ error: "Invalid or missing repId" });
+      }
+
+      const existing = (fileDb.get<any>("rep_locations") || []).find(
+        (r: any) => String(r?.rep_id || r?.id) === cleanRepId
+      );
+      if (existing) {
+        fileDb.upsert("rep_locations", {
+          ...existing,
+          id: cleanRepId,
+          rep_id: cleanRepId,
+          is_online: false,
+        });
+      }
+
+      if (isPgConfigured()) {
+        await executePg(
+          `UPDATE rep_locations SET is_online = FALSE WHERE rep_id = $1`,
+          [cleanRepId]
+        ).catch(() => {});
+      }
+
+      res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
