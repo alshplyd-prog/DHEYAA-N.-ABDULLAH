@@ -17,6 +17,7 @@ interface PaymentsHistoryModalProps {
   lang: Language;
   currentRep?: SalesRepresentative | null;
   onUpdatePayment?: (payment: PaymentRecord, newAmount: number, newNote?: string, newPaymentDate?: string, newRepName?: string) => Promise<void> | void;
+  onUpdateMultiplePaymentsDate?: (payments: PaymentRecord[], newPaymentDate: string) => Promise<void> | void;
   onDeletePayment?: (payment: PaymentRecord) => void;
   onDeleteMultiplePayments?: (payments: PaymentRecord[]) => Promise<void> | void;
   onPrintReceipt?: (receiptData: any) => void;
@@ -33,6 +34,7 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
   lang,
   currentRep,
   onUpdatePayment,
+  onUpdateMultiplePaymentsDate,
   onDeletePayment,
   onDeleteMultiplePayments,
   onPrintReceipt,
@@ -100,12 +102,14 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
   const [selectedPaymentIds, setSelectedPaymentIds] = useState<string[]>([]);
   const [confirmBulkDelete, setConfirmBulkDelete] = useState<boolean>(false);
   const [isBulkDeleting, setIsBulkDeleting] = useState<boolean>(false);
+  const [isBulkUpdatingDate, setIsBulkUpdatingDate] = useState<boolean>(false);
 
   useEffect(() => {
     if (!isOpen) {
       setSelectedPaymentIds([]);
       setConfirmBulkDelete(false);
       setIsBulkDeleting(false);
+      setIsBulkUpdatingDate(false);
       setEditingPayment(null);
     }
   }, [isOpen]);
@@ -116,6 +120,7 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
   const isAdmin = currentRep?.role === 'admin';
   const canEditPayment = isAdmin;
   const canDelete = isAdmin || currentRep?.canDelete === true;
+  const canSelectPayments = canDelete || canEditPayment;
 
   // Map contract to fast lookup
   const contractMap = new Map<string, InstallmentContract>();
@@ -197,6 +202,35 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
       console.error('Failed to save edited payment:', err);
     } finally {
       setIsSavingEdit(false);
+    }
+  };
+
+  const handleBulkDateChange = async (newDate: string) => {
+    const cleanDate = newDate.trim();
+    if (!cleanDate || !/^\d{4}-\d{2}-\d{2}$/.test(cleanDate)) return;
+    if (!onUpdateMultiplePaymentsDate && !onUpdatePayment) return;
+
+    const toUpdate = filtered.filter((p) => selectedPaymentIds.includes(p.id));
+    if (toUpdate.length === 0) return;
+
+    setIsBulkUpdatingDate(true);
+    try {
+      if (onUpdateMultiplePaymentsDate) {
+        await onUpdateMultiplePaymentsDate(toUpdate, cleanDate);
+      } else if (onUpdatePayment) {
+        for (const p of toUpdate) {
+          const amt = Number(p.amountPaid ?? (p as any).amount ?? 0) || 0;
+          await onUpdatePayment(p, amt, p.note, cleanDate, p.repName);
+        }
+      }
+      // Keep updated records visible inside active date filters
+      if (startDate && cleanDate < startDate) setStartDate(cleanDate);
+      if (endDate && cleanDate > endDate) setEndDate(cleanDate);
+      setSelectedPaymentIds([]);
+    } catch (err) {
+      console.error('Failed to bulk update payment dates:', err);
+    } finally {
+      setIsBulkUpdatingDate(false);
     }
   };
 
@@ -408,7 +442,7 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
                 </button>
               )}
 
-              {canDelete && filtered.length > 0 && (
+              {canSelectPayments && filtered.length > 0 && (
                 <button
                   type="button"
                   onClick={() => {
@@ -438,6 +472,32 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
                 </button>
               )}
 
+              {canEditPayment && (onUpdateMultiplePaymentsDate || onUpdatePayment) && selectedPaymentIds.length > 0 && !confirmBulkDelete && (
+                <div
+                  className="relative px-2 py-1 rounded-xl font-black text-[10px] sm:text-[11px] bg-blue-600 hover:bg-blue-700 text-white transition-colors flex items-center gap-1 shadow-2xs cursor-pointer shrink-0 whitespace-nowrap animate-in fade-in"
+                  title={isAr ? 'تغيير تاريخ جميع التسديدات المحددة' : 'Change date for selected payments'}
+                >
+                  {isBulkUpdatingDate ? (
+                    <span className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <Calendar className="w-3.5 h-3.5" />
+                  )}
+                  <span>{isAr ? 'تاريخ' : 'Date'}</span>
+                  <input
+                    type="date"
+                    value=""
+                    disabled={isBulkUpdatingDate}
+                    onChange={(e) => {
+                      if (e.target.value) {
+                        handleBulkDateChange(e.target.value);
+                      }
+                    }}
+                    className="absolute inset-0 opacity-0 w-full h-full cursor-pointer z-10"
+                    title={isAr ? 'اختر تاريخاً لتطبيقه على المحدد' : 'Pick date for selected'}
+                  />
+                </div>
+              )}
+
               {canDelete && selectedPaymentIds.length > 0 && !confirmBulkDelete && (
                 <button
                   type="button"
@@ -454,8 +514,8 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
 
         {/* Table Content */}
         <div className="p-4 overflow-y-auto flex-1">
-          {canDelete && selectedPaymentIds.length > 0 && (
-            <div className="mb-3 p-3 bg-rose-500/10 dark:bg-rose-950/20 border border-rose-300 dark:border-rose-800 rounded-2xl flex items-center justify-between gap-3 animate-in fade-in duration-200">
+          {canSelectPayments && selectedPaymentIds.length > 0 && (
+            <div className="mb-3 p-3 bg-rose-500/10 dark:bg-rose-950/20 border border-rose-300 dark:border-rose-800 rounded-2xl flex flex-wrap items-center justify-between gap-3 animate-in fade-in duration-200">
               <div className="flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-rose-600 animate-pulse" />
                 <p className="text-xs font-black text-rose-800 dark:text-rose-200">
@@ -464,15 +524,43 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
                     : `Selected (${selectedPaymentIds.length}) payments`}
                 </p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={() => setSelectedPaymentIds([])}
+                  disabled={isBulkUpdatingDate || isBulkDeleting}
                   className="px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 dark:bg-slate-800 dark:hover:bg-slate-700 dark:text-slate-300"
                 >
                   {isAr ? 'إلغاء التحديد' : 'Deselect All'}
                 </button>
-                {confirmBulkDelete ? (
+
+                {canEditPayment && (onUpdateMultiplePaymentsDate || onUpdatePayment) && !confirmBulkDelete && (
+                  <div
+                    className="relative px-3 py-1.5 rounded-xl text-xs font-black bg-blue-600 hover:bg-blue-700 text-white shadow-md flex items-center gap-1.5 cursor-pointer"
+                    title={isAr ? 'اختيار تاريخ لتغيير جميع التسديدات المحددة' : 'Pick a date to update all selected payments'}
+                  >
+                    {isBulkUpdatingDate ? (
+                      <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    ) : (
+                      <Calendar className="w-3.5 h-3.5" />
+                    )}
+                    <span>{isAr ? 'تغيير التاريخ' : 'Change Date'}</span>
+                    <input
+                      type="date"
+                      value=""
+                      disabled={isBulkUpdatingDate || isBulkDeleting}
+                      onChange={(e) => {
+                        if (e.target.value) {
+                          handleBulkDateChange(e.target.value);
+                        }
+                      }}
+                      className="absolute inset-0 opacity-0 w-full h-full cursor-pointer z-10"
+                      title={isAr ? 'اختيار تاريخ جديد للمحدد' : 'Pick new date for selected'}
+                    />
+                  </div>
+                )}
+
+                {canDelete && (confirmBulkDelete ? (
                   <div className="flex items-center gap-1.5">
                     <span className="text-[11px] font-extrabold text-rose-700 dark:text-rose-300">
                       {isAr ? 'تأكيد حذف الكل بشكل نهائي؟' : 'Confirm bulk deletion?'}
@@ -529,7 +617,7 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
                     <Trash2 className="w-3.5 h-3.5" />
                     <span>{isAr ? 'حذف المحدد' : 'Delete Selected'}</span>
                   </button>
-                )}
+                ))}
               </div>
             </div>
           )}
@@ -539,7 +627,7 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
               <table className="w-full text-right text-xs min-w-[760px] border-collapse">
                 <thead className="sticky top-0 z-20 bg-slate-100 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-700 shadow-xs">
                   <tr className="text-slate-700 dark:text-slate-300 font-black text-xs">
-                    {canDelete && (
+                    {canSelectPayments && (
                       <th className="py-3 px-3 text-center w-10 sticky top-0 bg-slate-100 dark:bg-slate-900">
                         <input
                           type="checkbox"
@@ -627,7 +715,7 @@ export const PaymentsHistoryModal: React.FC<PaymentsHistoryModalProps> = ({
                         key={p.id}
                         className="hover:bg-slate-50/90 dark:hover:bg-slate-850 transition-colors whitespace-nowrap"
                       >
-                        {canDelete && (
+                        {canSelectPayments && (
                           <td className="py-2.5 px-3 text-center w-10">
                             <input
                               type="checkbox"

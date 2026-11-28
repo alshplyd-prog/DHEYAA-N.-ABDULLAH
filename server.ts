@@ -4156,6 +4156,106 @@ async function startServer() {
     }
   });
 
+  app.post("/api/payments/bulk-date", async (req, res) => {
+    try {
+      const ids: string[] = Array.isArray(req.body?.ids)
+        ? req.body.ids.map((v: any) => String(v || '').trim()).filter(Boolean)
+        : [];
+      const rawDate = typeof req.body?.paymentDate === 'string' ? req.body.paymentDate.trim() : '';
+
+      if (ids.length === 0) {
+        return res.json({ success: true, updatedCount: 0 });
+      }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+        return res.status(400).json({ error: "Invalid paymentDate format. Expected YYYY-MM-DD." });
+      }
+
+      const nowIso = new Date().toISOString();
+      const idSet = new Set(ids);
+      const affectedContractIds = new Set<string>();
+
+      const currentPayments = fileDb.get<any>("payments") || [];
+      const updatedFilePayments = currentPayments.map((p: any) => {
+        if (!p || !idSet.has(String(p.id))) return p;
+        const cId = p.contractId || p.contract_id;
+        if (cId) affectedContractIds.add(String(cId));
+        const oldCreated = String(p.createdAt || p.created_at || '');
+        const timePart = oldCreated.includes('T') ? oldCreated.split('T')[1] : '12:00:00.000Z';
+        return {
+          ...p,
+          paymentDate: rawDate,
+          createdAt: `${rawDate}T${timePart}`,
+          isEdited: true,
+          updatedAt: nowIso,
+        };
+      });
+      fileDb.setAll("payments", updatedFilePayments);
+
+      const ftPayIdSet = new Set(ids.map((id) => `ft_pay_${id}`));
+      const currentFts = fileDb.get<any>("fund_transactions") || [];
+      const updatedFts = currentFts.map((ft: any) => {
+        if (!ft || !ftPayIdSet.has(String(ft.id))) return ft;
+        const oldCreated = String(ft.createdAt || ft.created_at || '');
+        const timePart = oldCreated.includes('T') ? oldCreated.split('T')[1] : '12:00:00.000Z';
+        return {
+          ...ft,
+          createdAt: `${rawDate}T${timePart}`,
+        };
+      });
+      fileDb.setAll("fund_transactions", updatedFts);
+
+      if (isPgConfigured()) {
+        const pgRows = await executePg(
+          `SELECT id, contract_id FROM payments WHERE id = ANY($1)`,
+          [ids]
+        ).catch(() => []);
+        for (const r of (pgRows || [])) {
+          if (r?.contract_id) affectedContractIds.add(String(r.contract_id));
+        }
+
+        await executePg(
+          `UPDATE payments
+           SET payment_date = $1,
+               created_at = CASE
+                 WHEN POSITION('T' IN COALESCE(created_at, '')) > 0
+                 THEN $1 || 'T' || SPLIT_PART(created_at, 'T', 2)
+                 ELSE $1 || 'T12:00:00.000Z'
+               END,
+               is_edited = true,
+               updated_at = $2
+           WHERE id = ANY($3)`,
+          [rawDate, nowIso, ids]
+        ).catch(() => {});
+
+        const ftPayIds = Array.from(ftPayIdSet);
+        await executePg(
+          `UPDATE fund_transactions
+           SET created_at = CASE
+             WHEN POSITION('T' IN COALESCE(created_at, '')) > 0
+             THEN $1 || 'T' || SPLIT_PART(created_at, 'T', 2)
+             ELSE $1 || 'T12:00:00.000Z'
+           END
+           WHERE id = ANY($2)`,
+          [rawDate, ftPayIds]
+        ).catch(() => {});
+
+        if (affectedContractIds.size > 0) {
+          await syncContractBalancesInPgAndFileDb(Array.from(affectedContractIds));
+        } else {
+          await syncContractBalancesInPgAndFileDb();
+        }
+      } else {
+        await syncContractBalancesInPgAndFileDb();
+      }
+
+      bumpSyncVersion();
+      res.json({ success: true, updatedCount: ids.length, paymentDate: rawDate });
+    } catch (err: any) {
+      console.error('[POST /api/payments/bulk-date] Error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.delete("/api/payments/:id", async (req, res) => {
     try {
       const { id } = req.params;
@@ -7363,10 +7463,44 @@ async function startServer() {
             await recordPaymentFundAdjustment(payload.id, resolvedFundId, amt, cName, rName, pDate, false);
           }
 
-          fileDb.update("payments", payload.id, { ...payload, amount: amt, amountPaid: amt, fundId: resolvedFundId || payload.fundId });
+          const pDate = payload.paymentDate ?? payload.payment_date ?? null;
+          const nextCreatedAt = payload.createdAt ?? payload.created_at ?? null;
+          const nextIsEdited = payload.isEdited ?? payload.is_edited ?? true;
+          const nextUpdatedAt = payload.updatedAt ?? payload.updated_at ?? new Date().toISOString();
+
+          fileDb.update("payments", payload.id, {
+            ...payload,
+            amount: amt,
+            amountPaid: amt,
+            fundId: resolvedFundId || payload.fundId,
+            ...(pDate ? { paymentDate: pDate } : {}),
+            ...(nextCreatedAt ? { createdAt: nextCreatedAt } : {}),
+            isEdited: nextIsEdited,
+            updatedAt: nextUpdatedAt,
+          });
           await executePg(
-            `UPDATE payments SET amount = COALESCE($1, amount), amount_paid = COALESCE($1, amount_paid), note = COALESCE($2, note), payment_date = COALESCE($3, payment_date), rep_name = COALESCE($4, rep_name), fund_id = COALESCE($5, fund_id) WHERE id = $6`,
-            [amt, payload.note ?? payload.notes ?? null, payload.paymentDate ?? payload.payment_date ?? null, payload.repName ?? payload.rep_name ?? null, resolvedFundId ?? null, payload.id]
+            `UPDATE payments
+             SET amount = COALESCE($1, amount),
+                 amount_paid = COALESCE($1, amount_paid),
+                 note = COALESCE($2, note),
+                 payment_date = COALESCE($3, payment_date),
+                 rep_name = COALESCE($4, rep_name),
+                 fund_id = COALESCE($5, fund_id),
+                 created_at = COALESCE($6, created_at),
+                 is_edited = COALESCE($7, is_edited),
+                 updated_at = COALESCE($8, updated_at)
+             WHERE id = $9`,
+            [
+              amt,
+              payload.note ?? payload.notes ?? null,
+              pDate,
+              payload.repName ?? payload.rep_name ?? null,
+              resolvedFundId ?? null,
+              nextCreatedAt,
+              nextIsEdited,
+              nextUpdatedAt,
+              payload.id,
+            ]
           ).catch((err) => console.warn("Error updating payment in sync:", err));
           if (cId && !skipBalanceRecalc) {
             await syncContractBalancesInPgAndFileDb([cId]).catch(() => {});

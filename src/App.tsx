@@ -98,6 +98,7 @@ import {
   addContractToFirestore,
   recordPaymentInFirestore,
   updatePaymentInFirestore,
+  updateMultiplePaymentsDateInFirestore,
   deletePaymentFromFirestore,
   deleteMultiplePaymentsFromFirestore,
   updateContractInFirestore,
@@ -2151,6 +2152,86 @@ export default function App() {
     } catch (err) {
       console.error('Failed to update payment:', err);
       showToast(isAr ? 'حدث خطأ أثناء تعديل الدفعة' : 'Error updating payment');
+    }
+  };
+
+  // Bulk Update Payment Date (for selected payments in Payments History Modal)
+  const handleUpdateMultiplePaymentsDate = async (paymentsToUpdate: PaymentRecord[], newPaymentDate: string) => {
+    if (currentRep?.role !== 'admin') {
+      showToast(isAr ? 'عفواً، تعديل تواريخ الدفعات متاح للمدير العام فقط' : 'Editing payment dates is restricted to Admin only');
+      return;
+    }
+    const cleanDate = typeof newPaymentDate === 'string' ? newPaymentDate.trim() : '';
+    if (!paymentsToUpdate || paymentsToUpdate.length === 0 || !/^\d{4}-\d{2}-\d{2}$/.test(cleanDate)) return;
+
+    try {
+      const nowIso = new Date().toISOString();
+      const targetIds = new Set(paymentsToUpdate.map((p) => String(p.id)));
+
+      const nextPayments = payments.map((p) => {
+        if (!targetIds.has(String(p.id))) return p;
+        const oldCreated = String(p.createdAt || '');
+        const timePart = oldCreated.includes('T') ? oldCreated.split('T')[1] : '12:00:00.000Z';
+        return {
+          ...p,
+          paymentDate: cleanDate,
+          createdAt: `${cleanDate}T${timePart}`,
+          isEdited: true,
+          updatedAt: nowIso,
+        };
+      });
+      setPayments(nextPayments);
+
+      const ftTargetIds = new Set(paymentsToUpdate.map((p) => `ft_pay_${p.id}`));
+      setFundTransactions((prev) =>
+        prev.map((ft) => {
+          if (!ftTargetIds.has(String(ft.id))) return ft;
+          const oldCreated = String(ft.createdAt || '');
+          const timePart = oldCreated.includes('T') ? oldCreated.split('T')[1] : '12:00:00.000Z';
+          return {
+            ...ft,
+            createdAt: `${cleanDate}T${timePart}`,
+          };
+        })
+      );
+
+      setContracts((prev) =>
+        prev.map((c) => {
+          const cIdTrim = String(c.id || '').trim();
+          const cNameNorm = normalizeEntityName(c.customerName);
+          const touched = nextPayments.some(
+            (p) =>
+              targetIds.has(String(p.id)) &&
+              ((p.contractId && String(p.contractId).trim() === cIdTrim) ||
+                (!p.contractId && p.customerName && cNameNorm && normalizeEntityName(p.customerName) === cNameNorm))
+          );
+          if (!touched) return c;
+          const cPayments = nextPayments.filter(
+            (p) =>
+              (p.contractId && String(p.contractId).trim() === cIdTrim) ||
+              (!p.contractId && p.customerName && cNameNorm && normalizeEntityName(p.customerName) === cNameNorm)
+          );
+          const sorted = [...cPayments].sort((a, b) => new Date(b.paymentDate).getTime() - new Date(a.paymentDate).getTime());
+          const newLastDate = sorted[0]?.paymentDate ? getLocalDateString(sorted[0].paymentDate) : c.lastPaymentDate;
+          return {
+            ...c,
+            lastPaymentDate: newLastDate,
+          };
+        })
+      );
+
+      await updateMultiplePaymentsDateInFirestore(paymentsToUpdate, cleanDate, contracts).catch((dbErr) => {
+        console.warn('updateMultiplePaymentsDateInFirestore offline fallback:', dbErr);
+      });
+
+      showToast(
+        isAr
+          ? `تم تغيير تاريخ (${paymentsToUpdate.length}) تسديد إلى ${cleanDate.replace(/-/g, '/')}`
+          : `Updated date for ${paymentsToUpdate.length} payments to ${cleanDate}`
+      );
+    } catch (err) {
+      console.error('Failed to bulk update payment dates:', err);
+      showToast(isAr ? 'حدث خطأ أثناء تغيير تواريخ التسديدات' : 'Error updating payment dates');
     }
   };
 
@@ -4619,6 +4700,7 @@ export default function App() {
         lang={lang}
         currentRep={effectiveRep}
         onUpdatePayment={handleUpdatePayment}
+        onUpdateMultiplePaymentsDate={handleUpdateMultiplePaymentsDate}
         onDeletePayment={handleDeletePayment}
         onDeleteMultiplePayments={handleDeleteMultiplePayments}
         onSettleExcessPayment={handleSettleExcessPayment}

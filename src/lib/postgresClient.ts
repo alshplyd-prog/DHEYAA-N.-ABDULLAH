@@ -3434,6 +3434,140 @@ export const deleteMultiplePaymentsFromDatabase = async (payments: any[], _contr
 };
 export const deleteMultiplePaymentsFromFirestore = deleteMultiplePaymentsFromDatabase;
 
+export const updateMultiplePaymentsDateInDatabase = async (
+  paymentsToUpdate: any[],
+  newPaymentDate: string,
+  _contracts: any[] = []
+) => {
+  if (!Array.isArray(paymentsToUpdate) || paymentsToUpdate.length === 0) return;
+  const cleanDate = typeof newPaymentDate === 'string' ? newPaymentDate.trim() : '';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(cleanDate)) return;
+
+  const nowIso = new Date().toISOString();
+  const docIds: string[] = [];
+  const docIdSet = new Set<string>();
+  for (const item of paymentsToUpdate) {
+    const id = typeof item === 'string' ? item : item?.id;
+    if (id && !docIdSet.has(String(id))) {
+      docIdSet.add(String(id));
+      docIds.push(String(id));
+    }
+  }
+  if (docIds.length === 0) return;
+
+  const paymentsCache = getLocalCache<any>('payments');
+  const affectedContractIds = new Set<string>();
+
+  const updatedPaymentsCache = paymentsCache.map((p: any) => {
+    if (!p || !docIdSet.has(String(p.id))) return p;
+    if (p.contractId) affectedContractIds.add(String(p.contractId));
+    const oldCreated = String(p.createdAt || p.created_at || '');
+    const timePart = oldCreated.includes('T') ? oldCreated.split('T')[1] : '12:00:00.000Z';
+    return {
+      ...p,
+      paymentDate: cleanDate,
+      createdAt: `${cleanDate}T${timePart}`,
+      isEdited: true,
+      updatedAt: nowIso,
+    };
+  });
+  setLocalCache('payments', updatedPaymentsCache);
+
+  const ftIdSet = new Set(docIds.map((id) => `ft_pay_${id}`));
+  const ftCache = getLocalCache<any>('fund_transactions');
+  if (ftCache.length > 0) {
+    const updatedFtCache = ftCache.map((ft: any) => {
+      if (!ft || !ftIdSet.has(String(ft.id))) return ft;
+      const oldCreated = String(ft.createdAt || ft.created_at || '');
+      const timePart = oldCreated.includes('T') ? oldCreated.split('T')[1] : '12:00:00.000Z';
+      return {
+        ...ft,
+        createdAt: `${cleanDate}T${timePart}`,
+      };
+    });
+    setLocalCache('fund_transactions', updatedFtCache);
+  }
+
+  const allContracts = Array.isArray(_contracts) && _contracts.length > 0 ? _contracts : getLocalCache<any>('contracts');
+  if (allContracts.length > 0) {
+    const updatedContractsCache = allContracts.map((c: any) => {
+      if (!c) return c;
+      const cIdTrim = String(c.id || '').trim();
+      const cNameNorm = normName(c.customerName);
+      const hasAffectedPayment = updatedPaymentsCache.some(
+        (p: any) =>
+          p &&
+          docIdSet.has(String(p.id)) &&
+          ((p.contractId && String(p.contractId).trim() === cIdTrim) ||
+            (!p.contractId && p.customerName && cNameNorm && normName(p.customerName) === cNameNorm))
+      );
+      if (!hasAffectedPayment && !affectedContractIds.has(cIdTrim)) return c;
+
+      const cPayments = updatedPaymentsCache.filter(
+        (p: any) =>
+          p &&
+          ((p.contractId && String(p.contractId).trim() === cIdTrim) ||
+            (!p.contractId && p.customerName && cNameNorm && normName(p.customerName) === cNameNorm))
+      );
+      const sorted = [...cPayments].sort((a: any, b: any) => new Date(b.paymentDate).getTime() - new Date(a.paymentDate).getTime());
+      const newLastPaymentDate = sorted[0]?.paymentDate || c.lastPaymentDate || null;
+      return {
+        ...c,
+        lastPaymentDate: newLastPaymentDate,
+      };
+    });
+    setLocalCache('contracts', updatedContractsCache);
+  }
+
+  // Queue offline fallback items in case device is currently offline
+  const pendingActionIds: string[] = [];
+  for (const id of docIds) {
+    const pObj = updatedPaymentsCache.find((p: any) => String(p.id) === id) ||
+      paymentsToUpdate.find((p: any) => String(p?.id || p) === id);
+    const oldCreated = String(pObj?.createdAt || pObj?.created_at || '');
+    const timePart = oldCreated.includes('T') ? oldCreated.split('T')[1] : '12:00:00.000Z';
+    const act = await addToPendingQueue('UPDATE_PAYMENT', {
+      id,
+      contractId: pObj?.contractId,
+      amountPaid: Number(pObj?.amountPaid ?? pObj?.amount) || 0,
+      paymentDate: cleanDate,
+      createdAt: `${cleanDate}T${timePart}`,
+      isEdited: true,
+      updatedAt: nowIso,
+    }).catch(() => null);
+    if (act?.id) pendingActionIds.push(act.id);
+  }
+
+  // Emit immediately to UI subscribers
+  emitCacheToSubscribersImmediate();
+
+  // Execute single atomic bulk-date API request
+  try {
+    const res = await fetchWithFallback(
+      '/api/payments/bulk-date',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: docIds, paymentDate: cleanDate }),
+        keepalive: true,
+      },
+      15000
+    ).catch(() => null);
+
+    const ct = res?.headers?.get('content-type') || '';
+    if (res && res.ok && !ct.includes('text/html')) {
+      for (const actId of pendingActionIds) {
+        await removeFromPendingQueue(actId).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.warn('Batch update date call notice:', err);
+  }
+
+  notifySubscribersRefresh();
+};
+export const updateMultiplePaymentsDateInFirestore = updateMultiplePaymentsDateInDatabase;
+
 // --- Inventory ---
 export const addInventoryItemToDatabase = async (item: any, ..._rest: any[]) => {
   if (!item) return;
