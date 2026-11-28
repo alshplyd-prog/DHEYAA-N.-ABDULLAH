@@ -37,6 +37,45 @@ export function escapeHtml(input: string | null | undefined): string {
     .replace(/'/g, '&#39;');
 }
 
+export function normalizeRepName(name?: string | null): string {
+  return String(name ?? '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
+export function isExcludedAdminOrSelfRep(
+  candidate: { repId?: string | null; repName?: string | null; role?: string | null },
+  currentRep?: Pick<SalesRepresentative, 'id' | 'name' | 'role'> | null,
+  allReps?: SalesRepresentative[]
+): boolean {
+  const cleanId = String(candidate?.repId ?? '').trim();
+  const normName = normalizeRepName(candidate?.repName);
+
+  if (candidate?.role === 'admin') return true;
+  if (cleanId === 'rep-1') return true;
+  if (normName && (normName === 'ضياء المحاسب' || normName.includes('ضياء المحاسب'))) {
+    return true;
+  }
+
+  if (currentRep) {
+    if (currentRep.id && cleanId && String(currentRep.id).trim() === cleanId) return true;
+    const currNorm = normalizeRepName(currentRep.name);
+    if (currNorm && normName && currNorm === normName) return true;
+  }
+
+  if (Array.isArray(allReps)) {
+    for (const r of allReps) {
+      if (!r || r.role !== 'admin') continue;
+      if (r.id && cleanId && String(r.id).trim() === cleanId) return true;
+      const rNorm = normalizeRepName(r.name);
+      if (rNorm && normName && rNorm === normName) return true;
+    }
+  }
+
+  return false;
+}
+
 function calcDistanceMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371000;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -129,13 +168,21 @@ export function formatLastSeen(secondsAgo: number, isAr: boolean): string {
 
 export async function fetchRepLiveLocations(
   onlineOnly: boolean = false,
-  requesterRepId?: string
+  requesterRepId?: string,
+  options?: {
+    currentRep?: Pick<SalesRepresentative, 'id' | 'name' | 'role'> | null;
+    reps?: SalesRepresentative[];
+  }
 ): Promise<RepLiveLocation[]> {
   try {
     const connected = await isNetworkConnected();
     if (!connected) return [];
 
-    const query = onlineOnly ? '?onlineOnly=true' : '';
+    const params = new URLSearchParams();
+    if (onlineOnly) params.set('onlineOnly', 'true');
+    if (requesterRepId) params.set('requesterRepId', requesterRepId);
+    const queryStr = params.toString();
+    const query = queryStr ? `?${queryStr}` : '';
     const headers: Record<string, string> = {};
     if (requesterRepId) {
       headers['x-rep-id'] = requesterRepId;
@@ -153,6 +200,8 @@ export async function fetchRepLiveLocations(
     return data
       .map(normalizeRepLiveLocation)
       .filter((item): item is RepLiveLocation => item !== null)
+      .filter((item) => !requesterRepId || item.repId !== requesterRepId)
+      .filter((item) => !isExcludedAdminOrSelfRep(item, options?.currentRep, options?.reps))
       .filter((item) => !onlineOnly || item.isOnline)
       .sort((a, b) => {
         if (a.isOnline !== b.isOnline) return a.isOnline ? -1 : 1;
@@ -178,7 +227,7 @@ async function readDeviceBatteryPercent(): Promise<number | null> {
 }
 
 export async function sendRepLiveLocation(
-  rep: Pick<SalesRepresentative, 'id' | 'name'>,
+  rep: Pick<SalesRepresentative, 'id' | 'name' | 'role'>,
   coords: {
     latitude: number;
     longitude: number;
@@ -186,7 +235,9 @@ export async function sendRepLiveLocation(
     speed?: number | null;
   }
 ): Promise<boolean> {
-  if (!rep?.id) return false;
+  if (!rep?.id || isExcludedAdminOrSelfRep({ repId: rep.id, repName: rep.name, role: rep.role })) {
+    return false;
+  }
   const lat = Number(coords.latitude);
   const lng = Number(coords.longitude);
   if (
@@ -260,7 +311,9 @@ export async function markRepOffline(repId: string, useBeacon = false): Promise<
  * strictly while internet connectivity is active. Returns a cleanup function.
  */
 export function startRepLiveLocationBroadcast(rep: SalesRepresentative): () => void {
-  if (!rep?.id) return () => {};
+  if (!rep?.id || isExcludedAdminOrSelfRep({ repId: rep.id, repName: rep.name, role: rep.role })) {
+    return () => {};
+  }
 
   let stopped = false;
   let lastUploadedAt = 0;

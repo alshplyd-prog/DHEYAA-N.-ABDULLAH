@@ -348,20 +348,12 @@ export async function initializeDatabaseSchema() {
           speed DOUBLE PRECISION,
           battery INTEGER,
           address TEXT,
+          is_online BOOLEAN DEFAULT TRUE,
           updated_at TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS rep_location_logs (
-          id TEXT PRIMARY KEY,
-          rep_id TEXT NOT NULL,
-          rep_name TEXT,
-          latitude DOUBLE PRECISION NOT NULL,
-          longitude DOUBLE PRECISION NOT NULL,
-          accuracy DOUBLE PRECISION,
-          speed DOUBLE PRECISION,
-          battery INTEGER,
-          created_at TEXT NOT NULL
-        );
+        ALTER TABLE rep_locations ADD COLUMN IF NOT EXISTS is_online BOOLEAN DEFAULT TRUE;
+        DROP TABLE IF EXISTS rep_location_logs;
 
         -- Ensure Row Level Security is disabled across all tables for direct sync
         ALTER TABLE IF EXISTS sales DISABLE ROW LEVEL SECURITY;
@@ -378,7 +370,6 @@ export async function initializeDatabaseSchema() {
         ALTER TABLE IF EXISTS deleted_records DISABLE ROW LEVEL SECURITY;
         ALTER TABLE IF EXISTS system_settings DISABLE ROW LEVEL SECURITY;
         ALTER TABLE IF EXISTS rep_locations DISABLE ROW LEVEL SECURITY;
-        ALTER TABLE IF EXISTS rep_location_logs DISABLE ROW LEVEL SECURITY;
 
         -- Create High-Performance Indexes for Ultra-Fast Synchronization and Calculations
         CREATE INDEX IF NOT EXISTS idx_payments_contract_id ON payments (contract_id);

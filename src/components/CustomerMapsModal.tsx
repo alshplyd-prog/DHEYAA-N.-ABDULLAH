@@ -42,6 +42,7 @@ import {
   fetchRepLiveLocations,
   formatLastSeen,
   escapeHtml,
+  isExcludedAdminOrSelfRep,
 } from '../lib/repLocationTracker';
 
 // Check if a Leaflet map instance is currently mounted, valid, and has its DOM panes intact
@@ -69,6 +70,7 @@ interface CustomerMapsModalProps {
   onViewCustomerPayments?: (contract: InstallmentContract) => void;
   initialRepId?: string | null;
   initialShowOnlineReps?: boolean;
+  reps?: SalesRepresentative[];
 }
 
 interface LocationSearchBarProps {
@@ -180,11 +182,10 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
   onViewCustomerPayments,
   initialRepId = null,
   initialShowOnlineReps = false,
+  reps = [],
 }) => {
   const isAr = lang === 'ar';
-  const canViewRepsLocations = Boolean(
-    isAdmin || currentRep?.role === 'admin' || currentRep?.role === 'supervisor'
-  );
+  const canViewRepsLocations = Boolean(isAdmin && currentRep?.role === 'admin');
   const mapViewportRef = useRef<HTMLDivElement | null>(null);
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRotationWrapperRef = useRef<HTMLDivElement | null>(null);
@@ -302,7 +303,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
   const [isLoadingReps, setIsLoadingReps] = useState<boolean>(false);
   const [showRepMarkers, setShowRepMarkers] = useState<boolean>(true);
   const [isRepsPanelOpen, setIsRepsPanelOpen] = useState<boolean>(false);
-  const [repFilterMode, setRepFilterMode] = useState<'online' | 'all'>('online');
+  const [repFilterMode, setRepFilterMode] = useState<'online' | 'all'>('all');
   const [selectedRepLoc, setSelectedRepLoc] = useState<RepLiveLocation | null>(null);
   const [followingRepId, setFollowingRepId] = useState<string | null>(null);
   const hasFocusedInitialRepRef = useRef<boolean>(false);
@@ -880,26 +881,29 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
       setSelectedRepLoc(null);
       setFollowingRepId(null);
       setIsRepsPanelOpen(false);
+      setRepLocations([]);
     }
   }, [isOpen, initialShowOnlineReps, canViewRepsLocations]);
 
-  // Fetch & auto-poll live representative locations (Admin & Supervisor only)
+  // Fetch & auto-poll live representative locations (Admin only, strictly excluding admin/account-owner pin since they use the arrow)
   const refreshRepLocations = useCallback(async () => {
     if (!canViewRepsLocations) return;
     setIsLoadingReps(true);
     try {
-      const locs = await fetchRepLiveLocations(false, currentRep?.id);
+      const rawLocs = await fetchRepLiveLocations(false, currentRep?.id, { currentRep, reps });
+      const locs = rawLocs.filter((l) => !isExcludedAdminOrSelfRep(l, currentRep, reps));
       setRepLocations(locs);
 
       // Update selected rep details and follow if active
       setSelectedRepLoc((prev) => {
         if (!prev) return null;
+        if (isExcludedAdminOrSelfRep(prev, currentRep, reps)) return null;
         return locs.find((l) => l.repId === prev.repId) || prev;
       });
     } finally {
       setIsLoadingReps(false);
     }
-  }, [canViewRepsLocations, currentRep?.id]);
+  }, [canViewRepsLocations, currentRep, reps]);
 
   useEffect(() => {
     if (!isOpen || !canViewRepsLocations) return;
@@ -943,14 +947,19 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
     }
   }, [repLocations, followingRepId]);
 
+  const filteredNonSelfReps = useMemo(
+    () => repLocations.filter((r) => !isExcludedAdminOrSelfRep(r, currentRep, reps)),
+    [repLocations, currentRep, reps]
+  );
+
   const onlineRepsCount = useMemo(
-    () => repLocations.filter((r) => r.isOnline).length,
-    [repLocations]
+    () => filteredNonSelfReps.filter((r) => r.isOnline).length,
+    [filteredNonSelfReps]
   );
 
   const visibleRepLocations = useMemo(
-    () => (repFilterMode === 'online' ? repLocations.filter((r) => r.isOnline) : repLocations),
-    [repLocations, repFilterMode]
+    () => (repFilterMode === 'online' ? filteredNonSelfReps.filter((r) => r.isOnline) : filteredNonSelfReps),
+    [filteredNonSelfReps, repFilterMode]
   );
 
   // Render Live Representative Markers on dedicated repsLayerRef
@@ -1434,7 +1443,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
                 <Users className="w-4 h-4" />
                 <span className="hidden xs:inline">{isAr ? 'المندوبون' : 'Reps'}</span>
                 <span className="px-1.5 py-0.2 rounded-full bg-black/30 text-[10px] font-mono">
-                  {onlineRepsCount}
+                  {onlineRepsCount}/{filteredNonSelfReps.length}
                 </span>
               </button>
             )}
@@ -1676,8 +1685,8 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
                       </h4>
                       <p className="text-[10px] text-emerald-400 font-bold">
                         {isAr
-                          ? `${onlineRepsCount} متصل الآن من أصل ${repLocations.length}`
-                          : `${onlineRepsCount} online of ${repLocations.length}`}
+                          ? `${onlineRepsCount} متصل الآن من أصل ${filteredNonSelfReps.length}`
+                          : `${onlineRepsCount} online of ${filteredNonSelfReps.length}`}
                       </p>
                     </div>
                   </div>
@@ -1736,7 +1745,7 @@ export const CustomerMapsModal: React.FC<CustomerMapsModalProps> = ({
                     }`}
                   >
                     <Users className="w-3.5 h-3.5" />
-                    <span>{isAr ? `الكل (${repLocations.length})` : `All (${repLocations.length})`}</span>
+                    <span>{isAr ? `الكل (${filteredNonSelfReps.length})` : `All (${filteredNonSelfReps.length})`}</span>
                   </button>
                 </div>
 

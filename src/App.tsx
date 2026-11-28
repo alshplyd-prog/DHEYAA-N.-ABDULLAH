@@ -84,7 +84,7 @@ import { App as CapApp } from '@capacitor/app';
 import { Network } from '@capacitor/network';
 import { initBackgroundSync, registerBackgroundSyncWorker, sendBeaconOnExit, runBackgroundExitSync, enableForegroundService, syncToNativeAndroid, requestAllBackgroundAndSyncPermissions } from './lib/offlineQueue';
 import { fetchWithFallback } from './lib/apiConfig';
-import { startRepLiveLocationBroadcast, markRepOffline, fetchRepLiveLocations } from './lib/repLocationTracker';
+import { startRepLiveLocationBroadcast, markRepOffline } from './lib/repLocationTracker';
 import {
   subscribeToContracts,
   subscribeToCustomers,
@@ -326,7 +326,6 @@ export default function App() {
   const [customerMapsAutoDrawRoute, setCustomerMapsAutoDrawRoute] = useState<boolean>(false);
   const [customerMapsInitialRepId, setCustomerMapsInitialRepId] = useState<string | null>(null);
   const [customerMapsShowOnlineReps, setCustomerMapsShowOnlineReps] = useState<boolean>(false);
-  const [onlineRepsCount, setOnlineRepsCount] = useState<number>(0);
   const [isAddAppointmentModalOpen, setIsAddAppointmentModalOpen] = useState(false);
   const [selectedContractForAppointment, setSelectedContractForAppointment] = useState<InstallmentContract | null>(null);
   const [isPrinterSettingsOpen, setIsPrinterSettingsOpen] = useState(false);
@@ -675,38 +674,20 @@ export default function App() {
   }, []);
 
   // Broadcast logged-in representative's live GPS location whenever connected to the internet
+  // Account owner/admin does not broadcast as a rep pin since they already see their own GPS arrow ("موقعي")
   useEffect(() => {
     if (!isPinUnlocked || !currentRep?.id) return;
+    if (currentRep.role === 'admin' || currentRep.id === 'rep-1') {
+      void markRepOffline(currentRep.id);
+      return;
+    }
+    const repIdToStop = currentRep.id;
     const stopBroadcast = startRepLiveLocationBroadcast(currentRep);
     return () => {
       stopBroadcast();
+      void markRepOffline(repIdToStop, true);
     };
-  }, [isPinUnlocked, currentRep?.id, currentRep?.name]);
-
-  // For Admin/Supervisor: periodically fetch count of online representatives for dashboard badge
-  useEffect(() => {
-    if (!isPinUnlocked || !currentRep?.id) return;
-    if (currentRep.role !== 'admin' && currentRep.role !== 'supervisor') return;
-
-    let cancelled = false;
-    const updateCount = async () => {
-      if (typeof document !== 'undefined' && document.hidden) return;
-      const onlineLocs = await fetchRepLiveLocations(true, currentRep.id);
-      if (!cancelled) {
-        setOnlineRepsCount(onlineLocs.length);
-      }
-    };
-
-    void updateCount();
-    const timer = setInterval(() => {
-      void updateCount();
-    }, 20000);
-
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [isPinUnlocked, currentRep?.id, currentRep?.role]);
+  }, [isPinUnlocked, currentRep?.id, currentRep?.name, currentRep?.role]);
 
   // Push initial history state once on app boot to support popstate interception
   useEffect(() => {
@@ -4253,7 +4234,7 @@ export default function App() {
                     setCustomerMapsInitialContract(null);
                     setCustomerMapsAutoDrawRoute(false);
                     setCustomerMapsInitialRepId(null);
-                    setCustomerMapsShowOnlineReps(onlineRepsCount > 0);
+                    setCustomerMapsShowOnlineReps(true);
                     setIsCustomerMapsModalOpen(true);
                   }}
                   className="bg-emerald-50/70 dark:bg-slate-800/90 border-2 border-emerald-200/80 dark:border-slate-700 hover:border-emerald-400 dark:hover:border-emerald-500 rounded-2xl sm:rounded-3xl p-3 sm:p-4 md:p-5 text-right transition-all shadow-xs hover:shadow-md group flex flex-col justify-between cursor-pointer"
@@ -4262,25 +4243,9 @@ export default function App() {
                     <div className="p-2 sm:p-3 md:p-3.5 rounded-xl sm:rounded-2xl bg-emerald-100 dark:bg-emerald-900/50 text-emerald-600 dark:text-emerald-300 group-hover:scale-105 transition-transform shadow-2xs">
                       <MapPinned className="w-5 h-5 sm:w-7 sm:h-7 md:w-8 md:h-8" />
                     </div>
-                    <div className="flex flex-col items-end gap-1">
-                      <span className="text-[11px] xs:text-xs sm:text-sm font-extrabold bg-emerald-200/80 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-200 px-2 sm:px-3 py-0.5 sm:py-1 rounded-full">
-                        {accessibleContractsWithLocationCount} {isAr ? 'علامة ع الخريطة' : 'on Map'}
-                      </span>
-                      <span
-                        className={`text-[10px] sm:text-xs font-black px-2 py-0.5 rounded-full flex items-center gap-1 ${
-                          onlineRepsCount > 0
-                            ? 'bg-emerald-600 text-white shadow-xs'
-                            : 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
-                        }`}
-                      >
-                        <span className={`w-1.5 h-1.5 rounded-full ${onlineRepsCount > 0 ? 'bg-white animate-pulse' : 'bg-slate-400'}`} />
-                        <span>
-                          {onlineRepsCount > 0
-                            ? (isAr ? `${onlineRepsCount} مندوب متصل الآن` : `${onlineRepsCount} rep online`)
-                            : (isAr ? '0 مندوب متصل' : '0 rep online')}
-                        </span>
-                      </span>
-                    </div>
+                    <span className="text-[11px] xs:text-xs sm:text-sm font-extrabold bg-emerald-200/80 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-200 px-2 sm:px-3 py-0.5 sm:py-1 rounded-full">
+                      {accessibleContractsWithLocationCount} {isAr ? 'علامة ع الخريطة' : 'on Map'}
+                    </span>
                   </div>
                   <div className="space-y-1 my-1">
                     <h3 className="text-sm sm:text-base md:text-lg font-black text-slate-900 dark:text-slate-100">
@@ -4288,8 +4253,8 @@ export default function App() {
                     </h3>
                     <p className="text-xs sm:text-sm md:text-base text-slate-500 dark:text-slate-400 font-semibold line-clamp-2">
                       {isAr
-                        ? 'عرض مواقع الزبائن وموقع المندوبين المباشر عند الاتصال بالإنترنت'
-                        : 'View customer pins & live online representative GPS locations'}
+                        ? 'عرض مواقع الزبائن وموقع المندوبين المباشر عند الدخول للخريطة'
+                        : 'View customer pins & live online representative locations on map'}
                     </p>
                   </div>
                   <div className="pt-2 sm:pt-3 border-t border-emerald-200/60 dark:border-slate-700/80 flex items-center justify-between text-xs sm:text-sm md:text-base font-black text-emerald-700 dark:text-emerald-300">
@@ -4939,6 +4904,7 @@ export default function App() {
         autoDrawRoute={customerMapsAutoDrawRoute}
         initialRepId={customerMapsInitialRepId}
         initialShowOnlineReps={customerMapsShowOnlineReps}
+        reps={reps}
         onSelectCustomer={(contract) => {
           setSelectedContract(contract);
           setIsCustomerMapsModalOpen(false);
